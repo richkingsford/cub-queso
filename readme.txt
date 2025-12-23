@@ -1,38 +1,45 @@
-This app lets you manually control a robot to do a specific job. Our generation
-1 robot uses a single micro servo motor on an Arduino Uno (pin 5) to sweep a
-camera across a set of colored dots.
+Manual camera sweep utility for the dot-seeking robot prototype.
 
-### Job definition
+## Requirements
 
-* **Start**: hold the camera on the **green** dot for 2 seconds.
-* **Targets**: find the **purple**, **red**, and **dark blue** dots—in that
-  order. For each dot, hold for 1 second, jiggle briefly, and hold for another
-  second.
-* **End**: hold on the **pink** dot for 2 seconds.
+* Python 3.9+
+* `pip install opencv-python numpy pyserial`
+* Arduino-compatible continuous servo setup wired the same way as the original project (pin 5 handled by `robot_controller/servo.py`).
 
-The Python app logs what color the camera is centered on and key transitions
-like start, panning direction while searching, dot hits, jiggling, and end
-signals.
+## Manual sweep capture (main.py)
 
-### Running the orchestrator
+Run the interactive capture loop:
 
-1. Install Python 3.9+.
-2. Run a simulated job timeline:
+```
+python main.py --camera 1 --photos-dir photos --interval 1.0
+```
 
-   ```bash
-   python main.py --mode demo
-   ```
+Controls:
 
-3. Or run interactively, typing the observed color names as you manually pan
-   the camera:
+* Left arrow  – pan left (hold to keep moving)
+* Right arrow – pan right
+* Space       – stop the servo immediately
+* ESC         – stop the loop and exit
 
-   ```bash
-   python main.py --mode live
-   ```
+Every time the loop starts it empties the target photos folder, then saves one JPEG per second (or whatever interval you pass). Filenames include timestamps for easy sorting.
 
-Every run executes quick smoke tests and attempts to open **camera 1** (USB),
-printing a warning if it cannot be reached. If the OpenCV dependency is not
-installed, the camera check is skipped.
+## Camera smoke test (test_camera.py)
 
-Replace the default servo transport in `robot_controller/servo.py` with calls
-to your Arduino library when you are ready to drive real hardware.
+Capture a single frame to verify wiring and drivers:
+
+```
+python test_camera.py --camera 1 --output camera_test.jpg
+```
+
+The image is written next to `main.py`. Use this before the full sweep to make sure the camera index is correct.
+
+## Annotating saved photos
+
+If you need to draw circles/labels around colored dots after capturing, use the helpers in `robot_controller/vision.py`. For example, inside a Python shell:
+
+```python
+from robot_controller.vision import annotate_photo_directory
+annotate_photo_directory("photos", "annotated")
+```
+
+This produces annotated copies in the `annotated` folder. Adjust HSV ranges in `robot_controller/vision.py` if your lighting conditions differ.

@@ -1,0 +1,45 @@
+// Arduino sketch for the Cub Queso servo bridge.
+// Paste into the Arduino IDE, select your board/port, and upload.
+//
+// The Python ServoController sends newline-terminated integers that
+// represent microsecond pulse widths (e.g., "1500\n", "1700\n").
+// This sketch applies those pulses to a continuous-rotation servo on pin 5.
+
+#include <Servo.h>
+
+constexpr uint8_t kServoPin = 9;
+constexpr int kMinPulse = 1000;   // safety clamp
+constexpr int kMaxPulse = 2000;
+constexpr int kStopPulse = 1500;  // neutral / stop
+
+Servo servo;
+
+void setup() {
+  Serial.begin(115200);
+  servo.attach(kServoPin);
+  servo.writeMicroseconds(kStopPulse);
+  Serial.println("[bridge] Ready for PWM microseconds on Serial.");
+}
+
+void loop() {
+  if (!Serial.available()) {
+    return;
+  }
+
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) {
+    return;
+  }
+
+  int pulse = line.toInt();
+  if (pulse == 0 && line != "0") {
+    Serial.println("[bridge] Ignored non-numeric input: " + line);
+    return;
+  }
+
+  pulse = constrain(pulse, kMinPulse, kMaxPulse);
+  servo.writeMicroseconds(pulse);
+  Serial.print("[bridge] PWM -> ");
+  Serial.println(pulse);
+}
