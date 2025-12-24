@@ -1,12 +1,9 @@
 """
-Brick Vision V26 - "Trust The Green Line"
-1. HSV Masking (Standard).
-2. Green Outline (Standard).
-3. Notch Logic: Strictly extracts points from the bottom edge of the Green Outline.
-   - Filters points in the lower 40% of the bounding box.
-   - Sorts them Left-to-Right.
-   - Removes the first (Leftmost) and last (Rightmost).
-   - Draws whatever remains as the Notch.
+Brick Vision V27 - "The Perfect Notch"
+1. Extracts raw notch points from the bottom of the Green Outline.
+2. Analyzes height changes to find the "Left Wall" (Up) and "Right Wall" (Down).
+3. Selects exactly 4 Corner Points.
+4. "Snaps" the vertical walls to be perfectly straight for a clean UI.
 """
 import cv2
 import numpy as np
@@ -57,43 +54,88 @@ def load_references():
             })
     print(f"Loaded {len(reference_data)} references.")
 
-def extract_notch_points(contour):
+def get_four_notch_corners(contour):
     """
-    1. Get Bounding Box.
-    2. Keep only points in the bottom 40% of height.
-    3. Sort by X.
-    4. Remove First (Left Edge) and Last (Right Edge).
-    5. Return the rest.
+    Analyzes the contour to find exactly 4 points representing the notch.
+    Returns list of 4 points: [BottomLeft, TopLeft, TopRight, BottomRight]
     """
     x, y, w, h = cv2.boundingRect(contour)
     cutoff_y = y + (h * 0.60) # Only look at bottom 40%
     
-    # Extract points from contour (shape is N, 1, 2)
+    # Extract raw points
     points = [pt[0] for pt in contour]
-    
-    # Filter: Must be low enough (Y > cutoff)
+    # Filter for bottom section
     bottom_points = [pt for pt in points if pt[1] > cutoff_y]
-    
     # Sort Left to Right
     bottom_points.sort(key=lambda p: p[0])
     
-    # We need at least 3 points to trim edges and have something left
-    if len(bottom_points) < 3:
+    # Need enough points to find jumps
+    if len(bottom_points) < 4:
+        return []
+
+    # Trim outer edges (feet)
+    notch_candidates = bottom_points[1:-1]
+    
+    if len(notch_candidates) < 2: return []
+
+    # --- Find the Vertical Walls ---
+    # We look for the biggest change in Y between consecutive points
+    
+    best_up_idx = -1
+    max_up_jump = 0
+    
+    best_down_idx = -1
+    max_down_jump = 0
+    
+    # 1. Find Left Wall (Jump UP -> Y decreases)
+    # We only search the first half of the points to avoid confusion
+    mid_index = len(notch_candidates) // 2
+    
+    for i in range(mid_index):
+        # Current point Y - Next point Y
+        jump = notch_candidates[i][1] - notch_candidates[i+1][1] 
+        if jump > max_up_jump:
+            max_up_jump = jump
+            best_up_idx = i
+            
+    # 2. Find Right Wall (Jump DOWN -> Y increases)
+    # We search the second half
+    for i in range(mid_index, len(notch_candidates) - 1):
+        # Next point Y - Current point Y
+        jump = notch_candidates[i+1][1] - notch_candidates[i][1]
+        if jump > max_down_jump:
+            max_down_jump = jump
+            best_down_idx = i
+            
+    if best_up_idx == -1 or best_down_idx == -1:
         return []
         
-    # Trim the Leftmost and Rightmost (The "Feet")
-    notch_points = bottom_points[1:-1]
+    # Extract the raw 4 corners
+    p1 = notch_candidates[best_up_idx]      # Bottom Left
+    p2 = notch_candidates[best_up_idx + 1]  # Top Left
+    p3 = notch_candidates[best_down_idx]    # Top Right
+    p4 = notch_candidates[best_down_idx + 1]# Bottom Right
     
-    return notch_points
+    # --- Force Vertical Alignment (The "Snap") ---
+    # Average the X for the left wall
+    avg_x_left = int((p1[0] + p2[0]) / 2)
+    p1 = (avg_x_left, p1[1])
+    p2 = (avg_x_left, p2[1])
+    
+    # Average the X for the right wall
+    avg_x_right = int((p3[0] + p4[0]) / 2)
+    p3 = (avg_x_right, p3[1])
+    p4 = (avg_x_right, p4[1])
+    
+    return [p1, p2, p3, p4]
 
 def main():
     load_references()
     cap = cv2.VideoCapture(CAMERA_INDEX)
-    cv2.namedWindow("Master V26")
+    cv2.namedWindow("Master V27")
     
-    # Settings
-    cv2.createTrackbar("Sat Max", "Master V26", 52, 255, lambda x: None)
-    cv2.createTrackbar("Val Min", "Master V26", 168, 255, lambda x: None)
+    cv2.createTrackbar("Sat Max", "Master V27", 52, 255, lambda x: None)
+    cv2.createTrackbar("Val Min", "Master V27", 168, 255, lambda x: None)
 
     while True:
         ret, frame = cap.read()
@@ -102,20 +144,15 @@ def main():
         display = frame.copy()
         h, w = display.shape[:2]
         
-        # 1. HSV FILTER
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        s_max = cv2.getTrackbarPos("Sat Max", "Master V26")
-        v_min = cv2.getTrackbarPos("Val Min", "Master V26")
+        s_max = cv2.getTrackbarPos("Sat Max", "Master V27")
+        v_min = cv2.getTrackbarPos("Val Min", "Master V27")
         
-        lower_white = np.array([0, 0, v_min])
-        upper_white = np.array([180, s_max, 255])
-        mask = cv2.inRange(hsv, lower_white, upper_white)
-        
+        mask = cv2.inRange(hsv, np.array([0, 0, v_min]), np.array([180, s_max, 255]))
         kernel = np.ones((5,5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.dilate(mask, kernel, iterations=1)
 
-        # 2. GREEN OUTLINE
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         live_cnt = None
@@ -138,31 +175,25 @@ def main():
         
         draw_bar(display, "IS BRICK?", brick_conf, 20, 30, (0, 255, 0) if brick_conf > 60 else (0, 165, 255))
 
-        # 3. NOTCH EXTRACTION
         if live_cnt is not None:
-            # Draw Green Outline
             cv2.drawContours(display, [live_cnt], -1, (0, 255, 0), 2)
             
-            # --- THE NEW LOGIC ---
-            notch_pts = extract_notch_points(live_cnt)
+            # --- NOTCH 4 CORNERS ---
+            corners = get_four_notch_corners(live_cnt)
             
-            # Draw the extracted points
-            if len(notch_pts) > 0:
-                for i, pt in enumerate(notch_pts):
-                    # Draw Yellow Dot for each notch point
-                    cv2.circle(display, tuple(pt), 6, (0, 255, 255), -1)
-                    
-                    # Connect them with Red Line
-                    if i > 0:
-                        prev_pt = notch_pts[i-1]
-                        cv2.line(display, tuple(prev_pt), tuple(pt), (0, 0, 255), 3)
+            if len(corners) == 4:
+                p1, p2, p3, p4 = corners
+                
+                # Draw Lines (Red)
+                cv2.line(display, p1, p2, (0, 0, 255), 3) # Left Wall
+                cv2.line(display, p2, p3, (0, 0, 255), 3) # Roof
+                cv2.line(display, p3, p4, (0, 0, 255), 3) # Right Wall
+                
+                # Draw Dots (Yellow, no text)
+                for pt in corners:
+                    cv2.circle(display, pt, 6, (0, 255, 255), -1)
 
-                # Count points for debugging
-                text_pt = notch_pts[0]
-                cv2.putText(display, f"Notch Pts: {len(notch_pts)}", (text_pt[0], text_pt[1]-20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-            # Match Angle (Background task)
+            # --- ANGLE MATCHING ---
             best_match = None
             best_score = 100.0
             for ref in reference_data:
@@ -184,7 +215,7 @@ def main():
         display[h-150:h, w-200:w] = cv2.cvtColor(thumb, cv2.COLOR_GRAY2BGR)
         cv2.rectangle(display, (w-200, h-150), (w, h), (255,255,0), 1)
 
-        cv2.imshow("Master V26", display)
+        cv2.imshow("Master V27", display)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     cap.release()
