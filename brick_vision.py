@@ -1,9 +1,11 @@
 """
-Brick Vision V27 - "The Perfect Notch"
-1. Extracts raw notch points from the bottom of the Green Outline.
-2. Analyzes height changes to find the "Left Wall" (Up) and "Right Wall" (Down).
-3. Selects exactly 4 Corner Points.
-4. "Snaps" the vertical walls to be perfectly straight for a clean UI.
+Brick Vision V29 - "Anchored & Snapped"
+1. STRICT SUBSET: Finds the 4 raw corners strictly on the Green Outline (inside the feet).
+2. ANCHORING: Treats the bottom two points (P1, P4) as the "True Anchors".
+3. SNAPPING: Forces the top two points (P2, P3) to align vertically with the anchors.
+   - P2.x becomes P1.x
+   - P3.x becomes P4.x
+   - P2.y and P3.y remain "true" to the green outline height.
 """
 import cv2
 import numpy as np
@@ -54,88 +56,80 @@ def load_references():
             })
     print(f"Loaded {len(reference_data)} references.")
 
-def get_four_notch_corners(contour):
+def get_anchored_notch(contour):
     """
-    Analyzes the contour to find exactly 4 points representing the notch.
-    Returns list of 4 points: [BottomLeft, TopLeft, TopRight, BottomRight]
+    1. Find raw points on contour (Strict Subset).
+    2. Identify P1 (BottomLeft) and P4 (BottomRight) as ANCHORS.
+    3. Find P2 (TopLeft) and P3 (TopRight) from contour.
+    4. Snap P2.x -> P1.x and P3.x -> P4.x to enforce verticality.
     """
     x, y, w, h = cv2.boundingRect(contour)
-    cutoff_y = y + (h * 0.60) # Only look at bottom 40%
+    cutoff_y = y + (h * 0.60) 
     
-    # Extract raw points
+    # 1. Flatten and Filter
     points = [pt[0] for pt in contour]
-    # Filter for bottom section
     bottom_points = [pt for pt in points if pt[1] > cutoff_y]
-    # Sort Left to Right
     bottom_points.sort(key=lambda p: p[0])
     
-    # Need enough points to find jumps
-    if len(bottom_points) < 4:
-        return []
+    if len(bottom_points) < 4: return []
 
-    # Trim outer edges (feet)
-    notch_candidates = bottom_points[1:-1]
-    
-    if len(notch_candidates) < 2: return []
+    # 2. Trim Feet (Rule: Horizontal Interior)
+    candidates = bottom_points[1:-1]
+    if len(candidates) < 2: return []
 
-    # --- Find the Vertical Walls ---
-    # We look for the biggest change in Y between consecutive points
-    
+    # 3. Find Walls (Big Jumps)
     best_up_idx = -1
-    max_up_jump = 0
+    max_up_step = 0
     
-    best_down_idx = -1
-    max_down_jump = 0
-    
-    # 1. Find Left Wall (Jump UP -> Y decreases)
-    # We only search the first half of the points to avoid confusion
-    mid_index = len(notch_candidates) // 2
-    
-    for i in range(mid_index):
-        # Current point Y - Next point Y
-        jump = notch_candidates[i][1] - notch_candidates[i+1][1] 
-        if jump > max_up_jump:
-            max_up_jump = jump
+    search_limit = len(candidates) - 1
+    for i in range(search_limit):
+        step = candidates[i][1] - candidates[i+1][1] # Current Y - Next Y
+        if step > max_up_step:
+            max_up_step = step
             best_up_idx = i
             
-    # 2. Find Right Wall (Jump DOWN -> Y increases)
-    # We search the second half
-    for i in range(mid_index, len(notch_candidates) - 1):
-        # Next point Y - Current point Y
-        jump = notch_candidates[i+1][1] - notch_candidates[i][1]
-        if jump > max_down_jump:
-            max_down_jump = jump
+    best_down_idx = -1
+    max_down_step = 0
+    start_search = best_up_idx + 1 if best_up_idx != -1 else 0
+    
+    for i in range(start_search, search_limit):
+        step = candidates[i+1][1] - candidates[i][1] # Next Y - Current Y
+        if step > max_down_step:
+            max_down_step = step
             best_down_idx = i
-            
-    if best_up_idx == -1 or best_down_idx == -1:
+
+    threshold = h * 0.05
+    if max_up_step < threshold or max_down_step < threshold:
         return []
         
-    # Extract the raw 4 corners
-    p1 = notch_candidates[best_up_idx]      # Bottom Left
-    p2 = notch_candidates[best_up_idx + 1]  # Top Left
-    p3 = notch_candidates[best_down_idx]    # Top Right
-    p4 = notch_candidates[best_down_idx + 1]# Bottom Right
+    # 4. Extract Raw Candidates
+    raw_p1 = candidates[best_up_idx]      # Bottom Left
+    raw_p2 = candidates[best_up_idx + 1]  # Top Left
+    raw_p3 = candidates[best_down_idx]    # Top Right
+    raw_p4 = candidates[best_down_idx + 1]# Bottom Right
     
-    # --- Force Vertical Alignment (The "Snap") ---
-    # Average the X for the left wall
-    avg_x_left = int((p1[0] + p2[0]) / 2)
-    p1 = (avg_x_left, p1[1])
-    p2 = (avg_x_left, p2[1])
+    # 5. Apply Vertical Snapping (The "Notch Rule")
+    # We trust the bottom points (p1, p4) as the anchors because they are on the ground.
     
-    # Average the X for the right wall
-    avg_x_right = int((p3[0] + p4[0]) / 2)
-    p3 = (avg_x_right, p3[1])
-    p4 = (avg_x_right, p4[1])
+    final_p1 = raw_p1
+    final_p4 = raw_p4
     
-    return [p1, p2, p3, p4]
+    # Force P2 to be directly above P1
+    final_p2 = [raw_p1[0], raw_p2[1]] 
+    
+    # Force P3 to be directly above P4
+    final_p3 = [raw_p4[0], raw_p3[1]]
+    
+    # Convert to tuples for OpenCV
+    return [tuple(final_p1), tuple(final_p2), tuple(final_p3), tuple(final_p4)]
 
 def main():
     load_references()
     cap = cv2.VideoCapture(CAMERA_INDEX)
-    cv2.namedWindow("Master V27")
+    cv2.namedWindow("Master V29")
     
-    cv2.createTrackbar("Sat Max", "Master V27", 52, 255, lambda x: None)
-    cv2.createTrackbar("Val Min", "Master V27", 168, 255, lambda x: None)
+    cv2.createTrackbar("Sat Max", "Master V29", 52, 255, lambda x: None)
+    cv2.createTrackbar("Val Min", "Master V29", 168, 255, lambda x: None)
 
     while True:
         ret, frame = cap.read()
@@ -144,11 +138,12 @@ def main():
         display = frame.copy()
         h, w = display.shape[:2]
         
+        # HSV + Morphology
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        s_max = cv2.getTrackbarPos("Sat Max", "Master V27")
-        v_min = cv2.getTrackbarPos("Val Min", "Master V27")
-        
+        s_max = cv2.getTrackbarPos("Sat Max", "Master V29")
+        v_min = cv2.getTrackbarPos("Val Min", "Master V29")
         mask = cv2.inRange(hsv, np.array([0, 0, v_min]), np.array([180, s_max, 255]))
+        
         kernel = np.ones((5,5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.dilate(mask, kernel, iterations=1)
@@ -178,22 +173,22 @@ def main():
         if live_cnt is not None:
             cv2.drawContours(display, [live_cnt], -1, (0, 255, 0), 2)
             
-            # --- NOTCH 4 CORNERS ---
-            corners = get_four_notch_corners(live_cnt)
+            # --- ANCHORED & SNAPPED NOTCH ---
+            corners = get_anchored_notch(live_cnt)
             
             if len(corners) == 4:
                 p1, p2, p3, p4 = corners
                 
-                # Draw Lines (Red)
-                cv2.line(display, p1, p2, (0, 0, 255), 3) # Left Wall
-                cv2.line(display, p2, p3, (0, 0, 255), 3) # Roof
-                cv2.line(display, p3, p4, (0, 0, 255), 3) # Right Wall
+                # Draw Perfect Lines (Red)
+                cv2.line(display, p1, p2, (0, 0, 255), 3) # Left Wall (Vertical)
+                cv2.line(display, p2, p3, (0, 0, 255), 3) # Roof (Horizontal-ish)
+                cv2.line(display, p3, p4, (0, 0, 255), 3) # Right Wall (Vertical)
                 
-                # Draw Dots (Yellow, no text)
+                # Draw Dots (Yellow)
                 for pt in corners:
                     cv2.circle(display, pt, 6, (0, 255, 255), -1)
 
-            # --- ANGLE MATCHING ---
+            # Match Angle
             best_match = None
             best_score = 100.0
             for ref in reference_data:
@@ -215,7 +210,7 @@ def main():
         display[h-150:h, w-200:w] = cv2.cvtColor(thumb, cv2.COLOR_GRAY2BGR)
         cv2.rectangle(display, (w-200, h-150), (w, h), (255,255,0), 1)
 
-        cv2.imshow("Master V27", display)
+        cv2.imshow("Master V29", display)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     cap.release()
