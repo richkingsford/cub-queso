@@ -1,8 +1,8 @@
 """
-Brick Vision V44 - "Confidence & UI Clean-up"
-1. MATH: Calculates 'Reprojection Error' to determine Confidence %.
-2. UI: Moves all data (Yaw, Confidence) to the top-right Info Box.
-3. LOGIC: Filters out 'wild' results where the notch is too squashed to be reliable.
+Brick Vision V45 - "Range Finder"
+1. MATH: Calculates Distance in mm using the PnP translation vector.
+2. UI: Adds "Dist: X mm" to the top-right Info Box.
+3. CORE: Retains V44 Reprojection Error for confidence.
 """
 import cv2
 import numpy as np
@@ -26,7 +26,7 @@ def load_world_model():
 
 def init_camera_matrix(w, h):
     global camera_matrix
-    # Approximation: Focal length is usually close to image width for webcams
+    # Approximation: Standard webcams have a focal length roughly equal to width
     focal_length = w 
     center = (w / 2, h / 2)
     camera_matrix = np.array([
@@ -47,7 +47,6 @@ def get_notch_2d_points(contour):
     candidates = bottom_points[1:-1]
     if len(candidates) < 2: return None
 
-    # Find Step Up/Down
     best_up_idx = -1; max_up = 0
     best_down_idx = -1; max_down = 0
     
@@ -69,11 +68,9 @@ def get_notch_2d_points(contour):
     
     p1 = raw_p1 
     p4 = raw_p4 
-    # Vertical snapping for stability
     p2 = [raw_p1[0], raw_p2[1]] 
     p3 = [raw_p4[0], raw_p3[1]] 
     
-    # Sanity Check: If notch width is tiny, it's unstable (steep angle or noise)
     notch_width = p4[0] - p1[0]
     if notch_width < 10: return None
 
@@ -86,29 +83,19 @@ def calculate_yaw(rvec):
     return math.degrees(y)
 
 def calculate_confidence(object_points, image_points, rvec, tvec):
-    """
-    Projects the 3D model back onto the 2D image using the calculated pose.
-    Measures the distance (error) between the actual yellow dots and the math's prediction.
-    """
     projected_points, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
     projected_points = projected_points.reshape(-1, 2)
-    
-    # Calculate average distance error in pixels
     error = cv2.norm(image_points, projected_points, cv2.NORM_L2) / len(image_points)
-    
-    # Convert error to percentage. 
-    # 0px error = 100%. 20px error = 0%.
     confidence = max(0, 100 - (error * 5))
     return int(confidence)
 
-def draw_3d_axes(img, rvec, tvec, start_point):
+def draw_3d_axes(img, rvec, tvec):
     len_mm = 25.0
     axis_pts = np.float32([[0,0,0], [len_mm,0,0], [0,-len_mm,0], [0,0,-len_mm]]).reshape(-1,3)
     imgpts, _ = cv2.projectPoints(axis_pts, rvec, tvec, camera_matrix, dist_coeffs)
     imgpts = imgpts.astype(int)
     
     origin = tuple(imgpts[0].ravel())
-    # Ensure lines are thick enough to see
     cv2.line(img, origin, tuple(imgpts[1].ravel()), (0,0,255), 3) # X Red
     cv2.line(img, origin, tuple(imgpts[2].ravel()), (0,255,0), 3) # Y Green
     cv2.line(img, origin, tuple(imgpts[3].ravel()), (255,0,0), 3) # Z Blue
@@ -118,7 +105,6 @@ def main():
     
     hsv_settings = model['brick'].get('hsv_thresholds', {'sat_max': 52, 'val_min': 168})
     
-    # Map 3D points
     pts_map = {p['label']: [p['x'], p['y'], p['z']] for p in model['brick']['notch']['points_3d']}
     object_points = np.array([
         pts_map['bottom_left'], pts_map['top_left'],
@@ -126,10 +112,10 @@ def main():
     ], dtype="double")
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
-    cv2.namedWindow("Master V44")
+    cv2.namedWindow("Master V45")
     
-    cv2.createTrackbar("Sat Max", "Master V44", hsv_settings['sat_max'], 255, lambda x: None)
-    cv2.createTrackbar("Val Min", "Master V44", hsv_settings['val_min'], 255, lambda x: None)
+    cv2.createTrackbar("Sat Max", "Master V45", hsv_settings['sat_max'], 255, lambda x: None)
+    cv2.createTrackbar("Val Min", "Master V45", hsv_settings['val_min'], 255, lambda x: None)
 
     while True:
         ret, frame = cap.read()
@@ -141,8 +127,8 @@ def main():
             
         display = frame.copy()
         
-        s_max = cv2.getTrackbarPos("Sat Max", "Master V44")
-        v_min = cv2.getTrackbarPos("Val Min", "Master V44")
+        s_max = cv2.getTrackbarPos("Sat Max", "Master V45")
+        v_min = cv2.getTrackbarPos("Val Min", "Master V45")
         
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, np.array([0, 0, v_min]), np.array([180, s_max, 255]))
@@ -163,9 +149,9 @@ def main():
                     max_area = area
                     live_cnt = approx
 
-        # Default Info Box Values
         final_yaw = 0.0
         final_conf = 0
+        final_dist = 0.0
         is_tracking = False
 
         if live_cnt is not None:
@@ -176,7 +162,6 @@ def main():
             if image_points is not None:
                 is_tracking = True
                 
-                # Solve PnP
                 success, rvec, tvec = cv2.solvePnP(
                     object_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
                 )
@@ -185,63 +170,63 @@ def main():
                     final_yaw = calculate_yaw(rvec)
                     final_conf = calculate_confidence(object_points, image_points, rvec, tvec)
                     
-                    # Color-code based on confidence
-                    color = (0, 255, 0) # Green
-                    if final_conf < 70: color = (0, 255, 255) # Yellow
-                    if final_conf < 40: color = (0, 0, 255)   # Red
+                    # --- NEW: DISTANCE CALCULATION ---
+                    # tvec is [x, y, z] in mm. Norm gives straight line distance.
+                    final_dist = np.linalg.norm(tvec)
 
-                    # Draw Visuals
+                    color = (0, 255, 0)
+                    if final_conf < 70: color = (0, 255, 255)
+                    if final_conf < 40: color = (0, 0, 255)
+
                     for pt in image_points:
                         cv2.circle(display, (int(pt[0]), int(pt[1])), 5, color, -1)
                     
-                    draw_3d_axes(display, rvec, tvec, image_points[0])
+                    draw_3d_axes(display, rvec, tvec)
 
-        # --- DRAW INFO BOX (Top Right) ---
-        box_w, box_h = 240, 110
+        # --- DRAW INFO BOX ---
+        # Increased height to 135 to fit Distance
+        box_w, box_h = 240, 135
         h, w = display.shape[:2]
         overlay = display[0:box_h, w-box_w:w]
         
-        # Background
         cv2.rectangle(overlay, (0,0), (box_w, box_h), (30,30,30), -1)
         
-        # Title
         cv2.putText(overlay, "BRICK TRACKER", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
         cv2.line(overlay, (10, 32), (box_w-10, 32), (100,100,100), 1)
 
         if is_tracking:
-            # Yaw Text
-            cv2.putText(overlay, f"Yaw: {final_yaw:.1f} deg", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+            # Yaw
+            cv2.putText(overlay, f"Yaw : {final_yaw:.1f} deg", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
+            
+            # Distance (NEW)
+            cv2.putText(overlay, f"Dist: {int(final_dist)} mm", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
             
             # Confidence Bar
             bar_x = 10
-            bar_y = 75
+            bar_y = 100
             bar_w = 150
-            bar_h = 12
+            bar_h = 10
             
-            # Determine Color
             conf_color = (0, 255, 0)
             if final_conf < 70: conf_color = (0, 255, 255)
             if final_conf < 40: conf_color = (0, 0, 255)
 
-            # Draw Bar
             cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50,50,50), -1)
             fill_w = int(bar_w * (final_conf / 100.0))
             cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), conf_color, -1)
             
-            # Text %
             cv2.putText(overlay, f"{final_conf}%", (bar_x + bar_w + 10, bar_y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
         else:
-            cv2.putText(overlay, "NO NOTCH DETECTED", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+            cv2.putText(overlay, "NO NOTCH DETECTED", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
 
         display[0:box_h, w-box_w:w] = overlay
 
-        # Robot View (Bottom Left)
         thumb = cv2.resize(mask, (200, 150))
         h, w = display.shape[:2]
         display[h-150:h, 0:200] = cv2.cvtColor(thumb, cv2.COLOR_GRAY2BGR)
         cv2.rectangle(display, (0, h-150), (200, h), (255,255,0), 1)
 
-        cv2.imshow("Master V44", display)
+        cv2.imshow("Master V45", display)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     cap.release()
