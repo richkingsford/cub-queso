@@ -1,0 +1,40 @@
+{
+  "brick": {
+    "description": "Standard Angled Brick (White)",
+    "boundingBox": {
+      "height_mm": 49,
+      "width_mm": 66,
+      "depth_mm": 51
+    },
+    "facePolygon": [
+      {"x": 23, "y": 0},
+      {"x": 23, "y": -7},
+      {"x": 42, "y": -7},
+      {"x": 42, "y": 0},
+      {"x": 65, "y": 0},
+      {"x": 65, "y": 41},
+      {"x": 50, "y": 41},
+      {"x": 50, "y": 33},
+      {"x": 16, "y": 33},
+      {"x": 16, "y": 41},
+      {"x": 0, "y": 41},
+      {"x": 0, "y": 0}
+    ],
+    "notch": {
+      "dimensions": {
+        "width": 34,
+        "height": 8
+      },
+      "points_3d": [
+        {"label": "bottom_left",  "x": 16, "y": 41, "z": 0},
+        {"label": "top_left",     "x": 16, "y": 33, "z": 0},
+        {"label": "top_right",    "x": 50, "y": 33, "z": 0},
+        {"label": "bottom_right", "x": 50, "y": 41, "z": 0}
+      ]
+    },
+    "hsv_thresholds": {
+      "sat_max": 52,
+      "val_min": 168
+    }
+  }
+}
