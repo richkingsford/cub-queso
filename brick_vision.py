@@ -1,236 +1,297 @@
 """
-Brick Vision V45 - "Range Finder"
-1. MATH: Calculates Distance in mm using the PnP translation vector.
-2. UI: Adds "Dist: X mm" to the top-right Info Box.
-3. CORE: Retains V44 Reprojection Error for confidence.
+Brick Vision V105 - "The 2D Alignment Lock"
+-------------------------------------------
+1. 2D ANGLE CALCULATION: 
+   - Angle is now strictly the 2D slope of the bottom notch line.
+   - Flat horizontal line = 0 degrees.
+   - Directly maps to robot roll/alignment needs.
+2. DUAL-ZONE SCANNERS (From V104):
+   - Strict Left/Right search zones to ignore the vertical groove.
+   - Width constraints (>35%) to ensure valid notch lock.
+3. PNP FOR DISTANCE:
+   - Uses 3D solver only for Z-distance (mm).
 """
 import cv2
 import numpy as np
 import json
-import sys
 import math
+import sys
+import os
+import time
 from pathlib import Path
 
 # --- CONFIG ---
 CAMERA_INDEX = 0
 WORLD_MODEL_FILE = Path(__file__).parent / "world_model.json"
+MIN_AREA_THRESHOLD = 1000 
+SHADOW_CUT_THRESHOLD = 80  
 
-camera_matrix = None
-dist_coeffs = np.zeros((4,1))
-
-def load_world_model():
-    if not WORLD_MODEL_FILE.exists():
-        sys.exit(f"Error: {WORLD_MODEL_FILE} not found.")
-    with open(WORLD_MODEL_FILE, 'r') as f:
-        return json.load(f)
-
-def init_camera_matrix(w, h):
-    global camera_matrix
-    # Approximation: Standard webcams have a focal length roughly equal to width
-    focal_length = w 
-    center = (w / 2, h / 2)
-    camera_matrix = np.array([
-        [focal_length, 0, center[0]],
-        [0, focal_length, center[1]],
-        [0, 0, 1]
-    ], dtype="double")
-
-def get_notch_2d_points(contour):
-    x, y, w, h = cv2.boundingRect(contour)
-    cutoff_y = y + (h * 0.60) 
-    
-    points = [pt[0] for pt in contour]
-    bottom_points = [pt for pt in points if pt[1] > cutoff_y]
-    bottom_points.sort(key=lambda p: p[0])
-    
-    if len(bottom_points) < 4: return None
-    candidates = bottom_points[1:-1]
-    if len(candidates) < 2: return None
-
-    best_up_idx = -1; max_up = 0
-    best_down_idx = -1; max_down = 0
-    
-    for i in range(len(candidates) - 1):
-        step_up = candidates[i][1] - candidates[i+1][1]
-        if step_up > max_up: max_up = step_up; best_up_idx = i
-            
-    start_search = best_up_idx + 1 if best_up_idx != -1 else 0
-    for i in range(start_search, len(candidates) - 1):
-        step_down = candidates[i+1][1] - candidates[i][1]
-        if step_down > max_down: max_down = step_down; best_down_idx = i
-
-    if max_up < h*0.05 or max_down < h*0.05: return None
+class BrickDetector:
+    def __init__(self, debug=True, save_folder=None, speed_optimize=False):
+        self.debug = debug
+        self.speed_optimize = speed_optimize
+        self.headless = False 
+        self.save_folder = save_folder
+        self.current_frame = None
         
-    raw_p1 = candidates[best_up_idx]      
-    raw_p2 = candidates[best_up_idx + 1]  
-    raw_p3 = candidates[best_down_idx]    
-    raw_p4 = candidates[best_down_idx + 1]
-    
-    p1 = raw_p1 
-    p4 = raw_p4 
-    p2 = [raw_p1[0], raw_p2[1]] 
-    p3 = [raw_p4[0], raw_p3[1]] 
-    
-    notch_width = p4[0] - p1[0]
-    if notch_width < 10: return None
+        if self.save_folder and not os.path.exists(self.save_folder):
+            try: os.makedirs(self.save_folder)
+            except: pass
 
-    return np.array([p1, p2, p3, p4], dtype="double")
-
-def calculate_yaw(rvec):
-    R, _ = cv2.Rodrigues(rvec)
-    sy = math.sqrt(R[0,0] * R[0,0] +  R[1,0] * R[1,0])
-    y = math.atan2(-R[2,0], sy)
-    return math.degrees(y)
-
-def calculate_confidence(object_points, image_points, rvec, tvec):
-    projected_points, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
-    projected_points = projected_points.reshape(-1, 2)
-    error = cv2.norm(image_points, projected_points, cv2.NORM_L2) / len(image_points)
-    confidence = max(0, 100 - (error * 5))
-    return int(confidence)
-
-def draw_3d_axes(img, rvec, tvec):
-    len_mm = 25.0
-    axis_pts = np.float32([[0,0,0], [len_mm,0,0], [0,-len_mm,0], [0,0,-len_mm]]).reshape(-1,3)
-    imgpts, _ = cv2.projectPoints(axis_pts, rvec, tvec, camera_matrix, dist_coeffs)
-    imgpts = imgpts.astype(int)
-    
-    origin = tuple(imgpts[0].ravel())
-    cv2.line(img, origin, tuple(imgpts[1].ravel()), (0,0,255), 3) # X Red
-    cv2.line(img, origin, tuple(imgpts[2].ravel()), (0,255,0), 3) # Y Green
-    cv2.line(img, origin, tuple(imgpts[3].ravel()), (255,0,0), 3) # Z Blue
-
-def main():
-    model = load_world_model()
-    
-    hsv_settings = model['brick'].get('hsv_thresholds', {'sat_max': 52, 'val_min': 168})
-    
-    pts_map = {p['label']: [p['x'], p['y'], p['z']] for p in model['brick']['notch']['points_3d']}
-    object_points = np.array([
-        pts_map['bottom_left'], pts_map['top_left'],
-        pts_map['top_right'], pts_map['bottom_right']
-    ], dtype="double")
-
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    cv2.namedWindow("Master V45")
-    
-    cv2.createTrackbar("Sat Max", "Master V45", hsv_settings['sat_max'], 255, lambda x: None)
-    cv2.createTrackbar("Val Min", "Master V45", hsv_settings['val_min'], 255, lambda x: None)
-
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
+        self.cap = cv2.VideoCapture(CAMERA_INDEX)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3) 
         
-        if camera_matrix is None:
-            h, w = frame.shape[:2]
-            init_camera_matrix(w, h)
-            
-        display = frame.copy()
+        self.camera_matrix = None
+        self.dist_coeffs = np.zeros((4,1))
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        self.hsv_ranges = []
+        self.object_points, self.template_contour = self.load_world_model()
         
-        s_max = cv2.getTrackbarPos("Sat Max", "Master V45")
-        v_min = cv2.getTrackbarPos("Val Min", "Master V45")
+        self.debug_search_zones = []
+
+        if self.debug and not self.speed_optimize:
+            try: cv2.namedWindow("Brick Vision Debug")
+            except: self.headless = True
+
+    def hex_to_hsv_ranges(self, hex_str, h_margin, s_margin, v_margin):
+        hex_str = hex_str.lstrip('#')
+        r, g, b = int(hex_str[0:2], 16), int(hex_str[2:4], 16), int(hex_str[4:6], 16)
+        pixel = np.uint8([[[b, g, r]]])
+        hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0][0]
+        h, s, v = int(hsv[0]), int(hsv[1]), int(hsv[2])
+        l_bound = np.array([max(0, h - h_margin), max(0, s - s_margin), max(0, v - v_margin)])
+        u_bound = np.array([min(180, h + h_margin), min(255, s + s_margin), min(255, v + v_margin)])
+        return [(l_bound, u_bound)]
+
+    def load_world_model(self):
+        pts_3d = np.zeros((4,3), dtype="double")
+        if WORLD_MODEL_FILE.exists():
+            with open(WORLD_MODEL_FILE, 'r') as f:
+                model = json.load(f)
+                c = model['brick']['color']
+                self.hsv_ranges = self.hex_to_hsv_ranges(
+                    c.get('hex', '#AE363E'), c.get('hue_margin', 15),
+                    c.get('sat_margin', 100), c.get('val_margin', 100)
+                )
+                notch_pts = model['brick']['notch']['points_3d']
+                p_map = {p['label']: [p['x'], p['y'], p['z']] for p in notch_pts}
+                pts_3d = np.array([
+                    p_map['bottom_left'], p_map['top_left'],
+                    p_map['top_right'], p_map['bottom_right']
+                ], dtype="double")
+        return pts_3d, None
+
+    def init_camera_matrix(self, w, h):
+        focal_length = w 
+        center = (w / 2, h / 2)
+        self.camera_matrix = np.array([[focal_length, 0, center[0]],[0, focal_length, center[1]],[0, 0, 1]], dtype="double")
+
+    def find_vertical_boundary(self, mask, x, y_start, y_end, direction):
+        if x < 0 or x >= mask.shape[1]: return None
+        y1 = max(0, min(y_start, y_end))
+        y2 = min(mask.shape[0], max(y_start, y_end))
+        col = mask[y1:y2, x]
+        if direction == -1: # Scanning UP
+            scan_col = col[::-1] 
+            hits = np.where(scan_col == 255)[0]
+            if len(hits) == 0: return None
+            return (y2 - 1) - hits[0]
+        else: # Scanning DOWN
+            hits = np.where(col == 0)[0]
+            if len(hits) == 0: return y2 
+            return y1 + hits[0]
+
+    def get_notch_from_mask_scan(self, mask, contour):
+        x_box, y_box, w_box, h_box = cv2.boundingRect(contour)
+        
+        # Dual Zones (V104 Logic)
+        zone_l_start = x_box + int(w_box * 0.10)
+        zone_l_end   = x_box + int(w_box * 0.45)
+        
+        zone_r_start = x_box + int(w_box * 0.55)
+        zone_r_end   = x_box + int(w_box * 0.90)
+        
+        scan_y = int(y_box + (h_box * 0.90)) 
+        if scan_y >= mask.shape[0]: return None
+
+        self.debug_search_zones = [
+            (zone_l_start, scan_y - 10, zone_l_end - zone_l_start, 20),
+            (zone_r_start, scan_y - 10, zone_r_end - zone_r_start, 20)
+        ]
+
+        # 1. Find Left Edge
+        row_l = mask[scan_y, zone_l_start:zone_l_end]
+        zero_indices_l = np.where(row_l == 0)[0]
+        if len(zero_indices_l) == 0: return None 
+        x_notch_start = zone_l_start + zero_indices_l[0]
+
+        # 2. Find Right Edge
+        row_r = mask[scan_y, zone_r_start:zone_r_end]
+        white_indices_r = np.where(row_r == 255)[0]
+        if len(white_indices_r) == 0: return None 
+        x_notch_end = zone_r_start + white_indices_r[0] 
+
+        # 3. Width Constraint
+        notch_width = x_notch_end - x_notch_start
+        min_required_width = w_box * 0.35 
+        if notch_width < min_required_width: return None 
+
+        # 4. Geometry & Slope
+        mid_y = y_box + int(h_box * 0.5)
+        bottom_y = y_box + h_box
+        
+        # Get Floor Heights
+        y_bl = self.find_vertical_boundary(mask, max(x_box, x_notch_start - 5), mid_y, bottom_y, 1)
+        y_br = self.find_vertical_boundary(mask, min(x_box + w_box, x_notch_end + 5), mid_y, bottom_y, 1)
+
+        if y_bl is None or y_br is None: return None
+
+        # Get Roof Height
+        x_center_gap = int((x_notch_start + x_notch_end) / 2)
+        y_roof_center = self.find_vertical_boundary(mask, x_center_gap, mid_y, scan_y, -1)
+        
+        if y_roof_center is None: return None
+        
+        # Apply Slope
+        floor_diff = y_br - y_bl
+        slope = floor_diff / float(notch_width)
+        
+        dist_from_center_to_left = x_notch_start - x_center_gap
+        y_tl = y_roof_center + (slope * dist_from_center_to_left)
+        
+        dist_from_center_to_right = x_notch_end - x_center_gap
+        y_tr = y_roof_center + (slope * dist_from_center_to_right)
+
+        p_bl = np.array([x_notch_start, y_bl])
+        p_br = np.array([x_notch_end,   y_br])
+        p_tl = np.array([x_notch_start, y_tl]) 
+        p_tr = np.array([x_notch_end,   y_tr]) 
+        
+        return np.array([p_bl, p_tl, p_tr, p_br], dtype="double")
+
+    def process_frame(self, frame):
+        if self.camera_matrix is None: self.init_camera_matrix(frame.shape[1], frame.shape[0])
+        self.debug_search_zones = []
         
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array([0, 0, v_min]), np.array([180, s_max, 255]))
-        kernel = np.ones((5,5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.dilate(mask, kernel, iterations=1)
+        h, s, v = cv2.split(hsv)
+        v = self.clahe.apply(v)
+        hsv_enhanced = cv2.merge([h, s, v])
 
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for (lower, upper) in self.hsv_ranges:
+            mask += cv2.inRange(hsv_enhanced, lower, upper)
+            
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        live_cnt = None
-        max_area = 0
+        found, final_angle, final_dist = False, 0.0, 0.0
+        
         for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area > 3000:
-                epsilon = 0.005 * cv2.arcLength(cnt, True)
-                approx = cv2.approxPolyDP(cnt, epsilon, True)
-                if area > max_area:
-                    max_area = area
-                    live_cnt = approx
-
-        final_yaw = 0.0
-        final_conf = 0
-        final_dist = 0.0
-        is_tracking = False
-
-        if live_cnt is not None:
-            cv2.drawContours(display, [live_cnt], -1, (0, 255, 0), 2)
+            if cv2.contourArea(cnt) < MIN_AREA_THRESHOLD: continue
             
-            image_points = get_notch_2d_points(live_cnt)
+            x, y, w, h_box = cv2.boundingRect(cnt)
+            roi_h = int(h_box * 0.35)
+            roi_y = y + h_box - roi_h
+            if roi_y > 0 and roi_h > 0:
+                roi_v = v[roi_y:roi_y+roi_h, x:x+w]
+                _, roi_bright_mask = cv2.threshold(roi_v, SHADOW_CUT_THRESHOLD, 255, cv2.THRESH_BINARY)
+                current_roi_mask = mask[roi_y:roi_y+roi_h, x:x+w]
+                cleaned_roi = cv2.bitwise_and(current_roi_mask, roi_bright_mask)
+                mask[roi_y:roi_y+roi_h, x:x+w] = cleaned_roi
+
+        clean_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in clean_contours:
+            if cv2.contourArea(cnt) < MIN_AREA_THRESHOLD: continue
             
+            image_points = self.get_notch_from_mask_scan(mask, cnt)
+            
+            if self.debug_search_zones and not self.speed_optimize:
+                for (zx, zy, zw, zh) in self.debug_search_zones:
+                    cv2.rectangle(frame, (zx, zy), (zx+zw, zy+zh), (0, 255, 255), 1)
+
             if image_points is not None:
-                is_tracking = True
-                
+                # 1. PnP for Distance Only
                 success, rvec, tvec = cv2.solvePnP(
-                    object_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+                    self.object_points, image_points, self.camera_matrix, 
+                    self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE
                 )
                 
                 if success:
-                    final_yaw = calculate_yaw(rvec)
-                    final_conf = calculate_confidence(object_points, image_points, rvec, tvec)
-                    
-                    # --- NEW: DISTANCE CALCULATION ---
-                    # tvec is [x, y, z] in mm. Norm gives straight line distance.
+                    found = True
                     final_dist = np.linalg.norm(tvec)
-
-                    color = (0, 255, 0)
-                    if final_conf < 70: color = (0, 255, 255)
-                    if final_conf < 40: color = (0, 0, 255)
-
-                    for pt in image_points:
-                        cv2.circle(display, (int(pt[0]), int(pt[1])), 5, color, -1)
                     
-                    draw_3d_axes(display, rvec, tvec)
+                    # 2. SIMPLE 2D ANGLE CALCULATION
+                    # We take the angle of the line connecting Bottom-Left to Bottom-Right.
+                    # This guarantees that if the line is horizontal (slope 0), the angle is 0.
+                    p_bl = image_points[0]
+                    p_br = image_points[3]
+                    
+                    delta_y = p_br[1] - p_bl[1]
+                    delta_x = p_br[0] - p_bl[0]
+                    
+                    # atan2 gives angle in radians. 
+                    # Positive Y is DOWN in images, so if Right is Lower (larger Y), angle is positive.
+                    final_angle = math.degrees(math.atan2(delta_y, delta_x))
+                    
+                    if not self.speed_optimize:
+                        epsilon = 0.008 * cv2.arcLength(cnt, True)
+                        approx = cv2.approxPolyDP(cnt, epsilon, True)
+                        cv2.drawContours(frame, [approx], -1, (0, 255, 0), 2)
+                        
+                        colors = [(0,0,255), (0,255,255), (255,255,0), (255,0,0)]
+                        for i, pt in enumerate(image_points):
+                            cv2.circle(frame, (int(pt[0]), int(pt[1])), 5, colors[i], -1)
+                        
+                        # Draw Geometry
+                        p_bl, p_tl, p_tr, p_br = image_points
+                        cv2.line(frame, (int(p_bl[0]), int(p_bl[1])), (int(p_tl[0]), int(p_tl[1])), (0, 165, 255), 2)
+                        cv2.line(frame, (int(p_tr[0]), int(p_tr[1])), (int(p_br[0]), int(p_br[1])), (0, 165, 255), 2)
+                        cv2.line(frame, (int(p_tl[0]), int(p_tl[1])), (int(p_tr[0]), int(p_tr[1])), (0, 165, 255), 2)
+                        
+                        # THE CRITICAL LINE (Angle Source)
+                        cv2.line(frame, (int(p_bl[0]), int(p_bl[1])), (int(p_br[0]), int(p_br[1])), (0, 255, 255), 2)
 
-        # --- DRAW INFO BOX ---
-        # Increased height to 135 to fit Distance
-        box_w, box_h = 240, 135
-        h, w = display.shape[:2]
-        overlay = display[0:box_h, w-box_w:w]
+                        info_txt = f"Dist: {int(final_dist)}mm | Ang: {int(final_angle)}"
+                        cv2.putText(frame, info_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+                    break 
+
+        overlay_w, overlay_h = 160, 120
+        mask_small = cv2.resize(mask, (overlay_w, overlay_h))
+        mask_color = cv2.cvtColor(mask_small, cv2.COLOR_GRAY2BGR)
+        cv2.rectangle(mask_color, (0,0), (overlay_w-1, overlay_h-1), (0,255,0), 1)
+        frame[0:overlay_h, frame.shape[1]-overlay_w:frame.shape[1]] = mask_color
+
+        return found, final_angle, final_dist, frame
+
+    def read(self):
+        ret, frame = self.cap.read()
+        if not ret: return False, 0, 0
+        found, angle, dist, display_frame = self.process_frame(frame)
+        self.current_frame = display_frame
         
-        cv2.rectangle(overlay, (0,0), (box_w, box_h), (30,30,30), -1)
-        
-        cv2.putText(overlay, "BRICK TRACKER", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
-        cv2.line(overlay, (10, 32), (box_w-10, 32), (100,100,100), 1)
+        if self.debug and not self.headless and not self.speed_optimize:
+            cv2.imshow("Brick Vision Debug", display_frame)
+            cv2.waitKey(1)
+        return found, angle, dist
 
-        if is_tracking:
-            # Yaw
-            cv2.putText(overlay, f"Yaw : {final_yaw:.1f} deg", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
-            
-            # Distance (NEW)
-            cv2.putText(overlay, f"Dist: {int(final_dist)} mm", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
-            
-            # Confidence Bar
-            bar_x = 10
-            bar_y = 100
-            bar_w = 150
-            bar_h = 10
-            
-            conf_color = (0, 255, 0)
-            if final_conf < 70: conf_color = (0, 255, 255)
-            if final_conf < 40: conf_color = (0, 0, 255)
+    def save_frame(self, filename):
+        if self.current_frame is not None:
+            cv2.imwrite(filename, self.current_frame)
+            return True
+        return False
 
-            cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50,50,50), -1)
-            fill_w = int(bar_w * (final_conf / 100.0))
-            cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), conf_color, -1)
-            
-            cv2.putText(overlay, f"{final_conf}%", (bar_x + bar_w + 10, bar_y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
-        else:
-            cv2.putText(overlay, "NO NOTCH DETECTED", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
-
-        display[0:box_h, w-box_w:w] = overlay
-
-        thumb = cv2.resize(mask, (200, 150))
-        h, w = display.shape[:2]
-        display[h-150:h, 0:200] = cv2.cvtColor(thumb, cv2.COLOR_GRAY2BGR)
-        cv2.rectangle(display, (0, h-150), (200, h), (255,255,0), 1)
-
-        cv2.imshow("Master V45", display)
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
-
-    cap.release()
-    cv2.destroyAllWindows()
+    def close(self):
+        self.cap.release()
+        if not self.headless: cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    main()
+    det = BrickDetector(save_folder=".")
+    print("Running standalone test (Ctrl+C to stop)...")
+    try:
+        while True:
+            det.read()
+    except KeyboardInterrupt:
+        det.close()
