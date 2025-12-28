@@ -1,15 +1,14 @@
 """
-Brick Vision V105 - "The 2D Alignment Lock"
--------------------------------------------
-1. 2D ANGLE CALCULATION: 
-   - Angle is now strictly the 2D slope of the bottom notch line.
-   - Flat horizontal line = 0 degrees.
-   - Directly maps to robot roll/alignment needs.
-2. DUAL-ZONE SCANNERS (From V104):
-   - Strict Left/Right search zones to ignore the vertical groove.
-   - Width constraints (>35%) to ensure valid notch lock.
-3. PNP FOR DISTANCE:
-   - Uses 3D solver only for Z-distance (mm).
+Brick Vision V106 - "The Fingerprint Validator"
+-----------------------------------------------
+1. SHAPE FINGERPRINTING:
+   - Compares the geometry of the Detected Contour (Green) vs the Detected Notch (Orange).
+   - Calculates a Confidence Score based on expected physical ratios (Width, Height, Alignment).
+2. REJECTION LOGIC:
+   - If Confidence < 60%, the detection is marked as "REJECTED" (Red Box).
+   - The robot receives "found=False", keeping it still during bad detections (like hands).
+3. DEBUGGING:
+   - Prints detailed Confidence metrics to the console for tuning.
 """
 import cv2
 import numpy as np
@@ -24,7 +23,8 @@ from pathlib import Path
 CAMERA_INDEX = 0
 WORLD_MODEL_FILE = Path(__file__).parent / "world_model.json"
 MIN_AREA_THRESHOLD = 1000 
-SHADOW_CUT_THRESHOLD = 80  
+SHADOW_CUT_THRESHOLD = 80
+CONFIDENCE_THRESHOLD = 60.0 # Minimum score (0-100) to accept a lock
 
 class BrickDetector:
     def __init__(self, debug=True, save_folder=None, speed_optimize=False):
@@ -103,10 +103,67 @@ class BrickDetector:
             if len(hits) == 0: return y2 
             return y1 + hits[0]
 
+    def calculate_fingerprint_confidence(self, contour, notch_points):
+        """
+        Calculates a confidence score (0-100) based on how well the 
+        detected geometry matches a standard brick profile.
+        """
+        score = 100.0
+        reasons = []
+
+        # 1. Bounding Box Analysis
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Get Notch Dimensions from the 2D points
+        # Points: [BL, TL, TR, BR]
+        notch_w = np.linalg.norm(notch_points[3] - notch_points[0])
+        notch_h = np.linalg.norm(notch_points[1] - notch_points[0]) # Avg side height
+        notch_center_x = (notch_points[0][0] + notch_points[3][0]) / 2.0
+        notch_bottom_y = (notch_points[0][1] + notch_points[3][1]) / 2.0
+
+        # --- CHECK A: WIDTH RATIO ---
+        # A standard brick notch is usually 35-50% of the total brick width
+        width_ratio = notch_w / float(w)
+        expected_width_ratio = 0.45 
+        diff_w = abs(width_ratio - expected_width_ratio)
+        if diff_w > 0.2: 
+            penalty = (diff_w - 0.2) * 100
+            score -= penalty
+            reasons.append(f"Bad Width Ratio: {width_ratio:.2f}")
+
+        # --- CHECK B: HEIGHT RATIO (Critical for Hand rejection) ---
+        # The notch is usually short compared to the full brick height (maybe 25-30%)
+        # If the contour includes a hand, H will be huge, so ratio will be tiny (< 0.1)
+        height_ratio = notch_h / float(h)
+        expected_height_ratio = 0.25
+        # We penalize heavily if the ratio is too small (contour too tall)
+        if height_ratio < 0.10: 
+            score -= 60 # Massive penalty for "Super Tall" contours (Hand)
+            reasons.append(f"Contour Too Tall (Hand?): {height_ratio:.2f}")
+        elif height_ratio > 0.60:
+            score -= 40
+            reasons.append(f"Contour Too Short: {height_ratio:.2f}")
+
+        # --- CHECK C: BOTTOM ALIGNMENT ---
+        # The notch bottom should be very close to the contour bottom
+        cnt_bottom = y + h
+        dist_from_bottom = abs(cnt_bottom - notch_bottom_y)
+        if dist_from_bottom > (h * 0.15): # If notch is "floating" high up
+            score -= 40
+            reasons.append(f"Notch Floating: {dist_from_bottom:.1f}px")
+
+        # --- CHECK D: CENTER ALIGNMENT ---
+        cnt_center_x = x + (w / 2.0)
+        dist_center = abs(cnt_center_x - notch_center_x)
+        if dist_center > (w * 0.2): # Notch should be roughly centered
+            score -= 20
+            reasons.append("Notch Off-Center")
+
+        return max(0.0, score), reasons
+
     def get_notch_from_mask_scan(self, mask, contour):
         x_box, y_box, w_box, h_box = cv2.boundingRect(contour)
         
-        # Dual Zones (V104 Logic)
         zone_l_start = x_box + int(w_box * 0.10)
         zone_l_end   = x_box + int(w_box * 0.45)
         
@@ -121,40 +178,33 @@ class BrickDetector:
             (zone_r_start, scan_y - 10, zone_r_end - zone_r_start, 20)
         ]
 
-        # 1. Find Left Edge
         row_l = mask[scan_y, zone_l_start:zone_l_end]
         zero_indices_l = np.where(row_l == 0)[0]
         if len(zero_indices_l) == 0: return None 
         x_notch_start = zone_l_start + zero_indices_l[0]
 
-        # 2. Find Right Edge
         row_r = mask[scan_y, zone_r_start:zone_r_end]
         white_indices_r = np.where(row_r == 255)[0]
         if len(white_indices_r) == 0: return None 
         x_notch_end = zone_r_start + white_indices_r[0] 
 
-        # 3. Width Constraint
         notch_width = x_notch_end - x_notch_start
         min_required_width = w_box * 0.35 
         if notch_width < min_required_width: return None 
 
-        # 4. Geometry & Slope
         mid_y = y_box + int(h_box * 0.5)
         bottom_y = y_box + h_box
         
-        # Get Floor Heights
         y_bl = self.find_vertical_boundary(mask, max(x_box, x_notch_start - 5), mid_y, bottom_y, 1)
         y_br = self.find_vertical_boundary(mask, min(x_box + w_box, x_notch_end + 5), mid_y, bottom_y, 1)
 
         if y_bl is None or y_br is None: return None
 
-        # Get Roof Height
         x_center_gap = int((x_notch_start + x_notch_end) / 2)
         y_roof_center = self.find_vertical_boundary(mask, x_center_gap, mid_y, scan_y, -1)
         
         if y_roof_center is None: return None
         
-        # Apply Slope
         floor_diff = y_br - y_bl
         slope = floor_diff / float(notch_width)
         
@@ -213,50 +263,55 @@ class BrickDetector:
                     cv2.rectangle(frame, (zx, zy), (zx+zw, zy+zh), (0, 255, 255), 1)
 
             if image_points is not None:
-                # 1. PnP for Distance Only
-                success, rvec, tvec = cv2.solvePnP(
-                    self.object_points, image_points, self.camera_matrix, 
-                    self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE
-                )
-                
-                if success:
-                    found = True
-                    final_dist = np.linalg.norm(tvec)
-                    
-                    # 2. SIMPLE 2D ANGLE CALCULATION
-                    # We take the angle of the line connecting Bottom-Left to Bottom-Right.
-                    # This guarantees that if the line is horizontal (slope 0), the angle is 0.
-                    p_bl = image_points[0]
-                    p_br = image_points[3]
-                    
-                    delta_y = p_br[1] - p_bl[1]
-                    delta_x = p_br[0] - p_bl[0]
-                    
-                    # atan2 gives angle in radians. 
-                    # Positive Y is DOWN in images, so if Right is Lower (larger Y), angle is positive.
-                    final_angle = math.degrees(math.atan2(delta_y, delta_x))
-                    
-                    if not self.speed_optimize:
-                        epsilon = 0.008 * cv2.arcLength(cnt, True)
-                        approx = cv2.approxPolyDP(cnt, epsilon, True)
-                        cv2.drawContours(frame, [approx], -1, (0, 255, 0), 2)
-                        
-                        colors = [(0,0,255), (0,255,255), (255,255,0), (255,0,0)]
-                        for i, pt in enumerate(image_points):
-                            cv2.circle(frame, (int(pt[0]), int(pt[1])), 5, colors[i], -1)
-                        
-                        # Draw Geometry
-                        p_bl, p_tl, p_tr, p_br = image_points
-                        cv2.line(frame, (int(p_bl[0]), int(p_bl[1])), (int(p_tl[0]), int(p_tl[1])), (0, 165, 255), 2)
-                        cv2.line(frame, (int(p_tr[0]), int(p_tr[1])), (int(p_br[0]), int(p_br[1])), (0, 165, 255), 2)
-                        cv2.line(frame, (int(p_tl[0]), int(p_tl[1])), (int(p_tr[0]), int(p_tr[1])), (0, 165, 255), 2)
-                        
-                        # THE CRITICAL LINE (Angle Source)
-                        cv2.line(frame, (int(p_bl[0]), int(p_bl[1])), (int(p_br[0]), int(p_br[1])), (0, 255, 255), 2)
+                # --- CALCULATE CONFIDENCE ---
+                confidence, reasons = self.calculate_fingerprint_confidence(cnt, image_points)
+                print(f"Conf: {int(confidence)}% | Reasons: {reasons}")
 
-                        info_txt = f"Dist: {int(final_dist)}mm | Ang: {int(final_angle)}"
-                        cv2.putText(frame, info_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-                    break 
+                # Draw Visual Feedback
+                color = (0, 255, 0) if confidence >= CONFIDENCE_THRESHOLD else (0, 0, 255)
+                status_text = f"Conf: {int(confidence)}%" if confidence >= CONFIDENCE_THRESHOLD else "REJECTED"
+
+                if not self.speed_optimize:
+                    epsilon = 0.008 * cv2.arcLength(cnt, True)
+                    approx = cv2.approxPolyDP(cnt, epsilon, True)
+                    cv2.drawContours(frame, [approx], -1, color, 2)
+                    
+                    p_bl, p_tl, p_tr, p_br = image_points
+                    # Draw Notch Box
+                    cv2.line(frame, (int(p_bl[0]), int(p_bl[1])), (int(p_tl[0]), int(p_tl[1])), (0, 165, 255), 2)
+                    cv2.line(frame, (int(p_tr[0]), int(p_tr[1])), (int(p_br[0]), int(p_br[1])), (0, 165, 255), 2)
+                    cv2.line(frame, (int(p_tl[0]), int(p_tl[1])), (int(p_tr[0]), int(p_tr[1])), (0, 165, 255), 2)
+                    cv2.line(frame, (int(p_bl[0]), int(p_bl[1])), (int(p_br[0]), int(p_br[1])), (0, 255, 255), 2) # Angle Line
+
+                    # Draw Status
+                    cv2.putText(frame, status_text, (int(x), int(y)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                # ONLY RETURN DATA IF CONFIDENCE IS HIGH
+                if confidence >= CONFIDENCE_THRESHOLD:
+                    success, rvec, tvec = cv2.solvePnP(
+                        self.object_points, image_points, self.camera_matrix, 
+                        self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE
+                    )
+                    
+                    if success:
+                        found = True
+                        final_dist = np.linalg.norm(tvec)
+                        
+                        # Simple 2D Angle
+                        p_bl = image_points[0]
+                        p_br = image_points[3]
+                        delta_y = p_br[1] - p_bl[1]
+                        delta_x = p_br[0] - p_bl[0]
+                        final_angle = math.degrees(math.atan2(delta_y, delta_x))
+                        
+                        if not self.speed_optimize:
+                            info_txt = f"Dist: {int(final_dist)}mm | Ang: {int(final_angle)}"
+                            cv2.putText(frame, info_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+                        break # Locked on target
+                else:
+                    # If we found a candidate but rejected it, we continue searching 
+                    # other contours, or just finish this frame as "not found"
+                    pass
 
         overlay_w, overlay_h = 160, 120
         mask_small = cv2.resize(mask, (overlay_w, overlay_h))
