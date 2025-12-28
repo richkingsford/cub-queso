@@ -47,6 +47,10 @@ class BrickDetector:
         self.dist_coeffs = np.zeros((4,1))
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
         self.hsv_ranges = []
+        # Default fallback
+        # Default fallback
+        self.search_margin_mm = 6.0
+        self.notch_points_3d = []
         self.object_points, self.template_contour = self.load_world_model()
         
         self.debug_search_zones = []
@@ -75,7 +79,12 @@ class BrickDetector:
                     c.get('hex', '#AE363E'), c.get('hue_margin', 15),
                     c.get('sat_margin', 100), c.get('val_margin', 100)
                 )
+                
+                # Load Search Margin
+                self.search_margin_mm = model['brick']['notch'].get('search_margin_mm', 6.0)
+                
                 notch_pts = model['brick']['notch']['points_3d']
+                self.notch_points_3d = notch_pts # Store for 2D projection logic
                 p_map = {p['label']: [p['x'], p['y'], p['z']] for p in notch_pts}
                 pts_3d = np.array([
                     p_map['bottom_left'], p_map['top_left'],
@@ -161,65 +170,68 @@ class BrickDetector:
 
         return max(0.0, score), reasons
 
-    def get_notch_from_mask_scan(self, mask, contour):
+    def get_notch_from_contour(self, mask, contour):
         x_box, y_box, w_box, h_box = cv2.boundingRect(contour)
         
-        zone_l_start = x_box + int(w_box * 0.10)
-        zone_l_end   = x_box + int(w_box * 0.45)
+        # Estimate scale : Brick Width is 64mm
+        mm_per_pixel = w_box / 64.0
+        margin_px = int(self.search_margin_mm * mm_per_pixel)
         
-        zone_r_start = x_box + int(w_box * 0.55)
-        zone_r_end   = x_box + int(w_box * 0.90)
+        # We need to project where we expect the 4 notch corners to be
+        # relative to the full bounding box of the face.
+        # Face BBox (approx): X: -32 to 32, Y: 0 to 48 (inverted Y in image)
         
-        scan_y = int(y_box + (h_box * 0.90)) 
-        if scan_y >= mask.shape[0]: return None
-
-        self.debug_search_zones = [
-            (zone_l_start, scan_y - 10, zone_l_end - zone_l_start, 20),
-            (zone_r_start, scan_y - 10, zone_r_end - zone_r_start, 20)
-        ]
-
-        row_l = mask[scan_y, zone_l_start:zone_l_end]
-        zero_indices_l = np.where(row_l == 0)[0]
-        if len(zero_indices_l) == 0: return None 
-        x_notch_start = zone_l_start + zero_indices_l[0]
-
-        row_r = mask[scan_y, zone_r_start:zone_r_end]
-        white_indices_r = np.where(row_r == 255)[0]
-        if len(white_indices_r) == 0: return None 
-        x_notch_end = zone_r_start + white_indices_r[0] 
-
-        notch_width = x_notch_end - x_notch_start
-        min_required_width = w_box * 0.35 
-        if notch_width < min_required_width: return None 
-
-        mid_y = y_box + int(h_box * 0.5)
-        bottom_y = y_box + h_box
+        found_points = []
+        projected_zones = [] # For debugging
         
-        y_bl = self.find_vertical_boundary(mask, max(x_box, x_notch_start - 5), mid_y, bottom_y, 1)
-        y_br = self.find_vertical_boundary(mask, min(x_box + w_box, x_notch_end + 5), mid_y, bottom_y, 1)
-
-        if y_bl is None or y_br is None: return None
-
-        x_center_gap = int((x_notch_start + x_notch_end) / 2)
-        y_roof_center = self.find_vertical_boundary(mask, x_center_gap, mid_y, scan_y, -1)
+        # Map 3D points to 2D BBox coordinates
+        # We assume the contour roughly matches the face polygon
+        for pt in self.notch_points_3d:
+            # Normalize X (-32 to 32) -> (0 to 1) 
+            scale_x = (pt['x'] + 32.0) / 64.0
+            # Normalize Y (0 to 48) -> (0 to 1)
+            scale_y = (pt['y']) / 48.0 # 0 is bottom, 48 is top in 3D
+            
+            # Image Coordinates (Y is flipped: 0 is top, H is bottom)
+            # The 3D Y=0 is the bottom of the brick, which is y_box + h_box
+            # The 3D Y=48 is the top of the brick, which is y_box
+            
+            # Let's project simply:
+            px = int(x_box + (scale_x * w_box))
+            py = int((y_box + h_box) - (scale_y * h_box))
+            
+            # Define search zone
+            x1 = max(0, px - margin_px)
+            x2 = min(mask.shape[1], px + margin_px)
+            y1 = max(0, py - margin_px)
+            y2 = min(mask.shape[0], py + margin_px)
+            
+            projected_zones.append((x1, y1, x2-x1, y2-y1))
+            
+            # Search for a contour point in this zone
+            # We approximate the contour to get corner vertices
+            epsilon = 0.005 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            
+            best_p = None
+            best_dist = 99999
+            
+            for p_wrap in approx:
+                p = p_wrap[0]
+                if x1 <= p[0] <= x2 and y1 <= p[1] <= y2:
+                    dist = np.linalg.norm(np.array([px, py]) - p)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_p = p
+            
+            if best_p is not None:
+                found_points.append(best_p)
+            else:
+                return None, projected_zones
         
-        if y_roof_center is None: return None
-        
-        floor_diff = y_br - y_bl
-        slope = floor_diff / float(notch_width)
-        
-        dist_from_center_to_left = x_notch_start - x_center_gap
-        y_tl = y_roof_center + (slope * dist_from_center_to_left)
-        
-        dist_from_center_to_right = x_notch_end - x_center_gap
-        y_tr = y_roof_center + (slope * dist_from_center_to_right)
-
-        p_bl = np.array([x_notch_start, y_bl])
-        p_br = np.array([x_notch_end,   y_br])
-        p_tl = np.array([x_notch_start, y_tl]) 
-        p_tr = np.array([x_notch_end,   y_tr]) 
-        
-        return np.array([p_bl, p_tl, p_tr, p_br], dtype="double")
+        if len(found_points) == 4:
+            return np.array(found_points, dtype="double"), projected_zones
+        return None, projected_zones
 
     def process_frame(self, frame):
         if self.camera_matrix is None: self.init_camera_matrix(frame.shape[1], frame.shape[0])
@@ -256,10 +268,10 @@ class BrickDetector:
         for cnt in clean_contours:
             if cv2.contourArea(cnt) < MIN_AREA_THRESHOLD: continue
             
-            image_points = self.get_notch_from_mask_scan(mask, cnt)
+            image_points, search_zones = self.get_notch_from_contour(mask, cnt)
             
-            if self.debug_search_zones and not self.speed_optimize:
-                for (zx, zy, zw, zh) in self.debug_search_zones:
+            if self.debug and not self.speed_optimize and search_zones:
+                for (zx, zy, zw, zh) in search_zones:
                     cv2.rectangle(frame, (zx, zy), (zx+zw, zy+zh), (0, 255, 255), 1)
 
             if image_points is not None:
@@ -327,6 +339,12 @@ class BrickDetector:
         found, angle, dist, display_frame = self.process_frame(frame)
         self.current_frame = display_frame
         
+        # SAVE SCREENSHOT IF ENABLED
+        if self.save_folder is not None:
+             timestamp = int(time.time() * 1000)
+             filename = os.path.join(self.save_folder, f"frame_{timestamp}.jpg")
+             cv2.imwrite(filename, display_frame)
+
         if self.debug and not self.headless and not self.speed_optimize:
             cv2.imshow("Brick Vision Debug", display_frame)
             cv2.waitKey(1)

@@ -8,12 +8,31 @@ from brick_vision import BrickDetector
 from robot_control import Robot 
 import maneuvers
 import time
+import shutil
+import os
 
 def main():
     # 1. Initialize Hardware
     print("--- INITIALIZING ROBOT ---")
+    
+    # SYSTEM MODE:
+    # True  = Save Debug Screenshots (slower)
+    # False = Production Mode (faster, no saving)
+    DEBUG_MODE = True
+    
     robot = Robot()
-    vision = BrickDetector(debug=True)
+    
+    if DEBUG_MODE:
+        print("[SYSTEM] DEBUG MODE ON - Clearing old captures...")
+        if os.path.exists("debug_captures"):
+            shutil.rmtree("debug_captures")
+        os.makedirs("debug_captures")
+        
+        print("[SYSTEM] Saving Vision Captures to 'debug_captures'...")
+        vision = BrickDetector(debug=True, save_folder="debug_captures")
+    else:
+        print("[SYSTEM] PRODUCTION MODE - Max Speed")
+        vision = BrickDetector(debug=False, save_folder=None)
 
     print("--- STARTING APPROACH ---")
     print("Press Ctrl+C to abort.")
