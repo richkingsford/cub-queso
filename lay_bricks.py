@@ -12,7 +12,10 @@ import shutil
 import os
 import threading
 import cv2
+import sys
 from flask import Flask, Response
+
+print(f"[DEBUG] Python Interpreter: {sys.executable}")
 
 # --- FLASK CONFIG ---
 app = Flask(__name__)
@@ -51,10 +54,14 @@ def main():
     # 1. Initialize Hardware
     print("--- INITIALIZING ROBOT ---")
     
+    
     # SYSTEM MODE:
-    # True  = Save Debug Screenshots (slower)
-    # False = Production Mode (faster, no saving)
+    # True  = Enable Vision Overlays (Required for Web Stream visualization)
+    # False = Production Mode (Fastest, no overlays)
     DEBUG_MODE = True
+    
+    # Save frames to disk? (Turn off to save space/speed)
+    SAVE_TO_DISK = False
     
     robot = Robot()
     
@@ -64,13 +71,20 @@ def main():
     t.start()
     
     if DEBUG_MODE:
-        print("[SYSTEM] DEBUG MODE ON - Clearing old captures...")
+        print("[SYSTEM] DEBUG MODE ON - Vision Overlays Enabled")
+        
+        # Always clean up frame captures as requested
+        print("[SYSTEM] Clearing old captures...")
         if os.path.exists("debug_captures"):
             shutil.rmtree("debug_captures")
         os.makedirs("debug_captures")
         
-        print("[SYSTEM] Saving Vision Captures to 'debug_captures'...")
-        vision = BrickDetector(debug=True, save_folder="debug_captures")
+        save_path = None
+        if SAVE_TO_DISK:
+            print("[SYSTEM] Disk Saving ENABLED")
+            save_path = "debug_captures"
+        
+        vision = BrickDetector(debug=True, save_folder=save_path)
     else:
         print("[SYSTEM] PRODUCTION MODE - Max Speed")
         vision = BrickDetector(debug=False, save_folder=None)

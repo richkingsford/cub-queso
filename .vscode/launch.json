@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Lay Bricks (System)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/lay_bricks.py",
+            "console": "integratedTerminal",
+            "python": "/usr/bin/python3",
+            "env": {
+                "DISPLAY": ":0"
+            }
+        }
+    ]
+}

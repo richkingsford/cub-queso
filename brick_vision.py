@@ -30,7 +30,7 @@ class BrickDetector:
     def __init__(self, debug=True, save_folder=None, speed_optimize=False):
         self.debug = debug
         self.speed_optimize = speed_optimize
-        self.headless = False 
+        self.headless = True 
         self.save_folder = save_folder
         self.current_frame = None
         
@@ -171,36 +171,87 @@ class BrickDetector:
         return max(0.0, score), reasons
 
     def get_notch_from_contour(self, mask, contour):
-        x_box, y_box, w_box, h_box = cv2.boundingRect(contour)
+        # 1. Fit Rotated Rectangle
+        rect = cv2.minAreaRect(contour)
+        box = cv2.boxPoints(rect)
+        box = np.int32(box) # Box is 4 corners, not ordered
         
-        # Estimate scale : Brick Width is 64mm
+        # 2. Identify Long Axis (Width) vs Short Axis (Height)
+        # minAreaRect returns (center), (width, height), angle
+        # Width/Height order depends on rotation, so we normalize.
+        dim1, dim2 = rect[1]
+        if dim1 > dim2:
+            w_box, h_box = dim1, dim2
+            angle_corr = rect[2]
+        else:
+            w_box, h_box = dim2, dim1
+            angle_corr = rect[2] + 90
+            
+        # 3. Estimate Scale (Pixels per mm)
+        # Using the dominant dimension as the Width (64mm)
         mm_per_pixel = w_box / 64.0
         margin_px = int(self.search_margin_mm * mm_per_pixel)
         
-        # We need to project where we expect the 4 notch corners to be
-        # relative to the full bounding box of the face.
-        # Face BBox (approx): X: -32 to 32, Y: 0 to 48 (inverted Y in image)
+        # 4. Find the "Bottom Left" corner of the face in 2D space
+        # We need a vector system:
+        # Origin = Bottom-Left of brick face
+        # U-Vector = Along the width (Right)
+        # V-Vector = Along the height (Up)
         
+        # Sort points by Y to find the bottom-most points
+        # Then sort those by X to find Bottom-Left vs Bottom-Right
+        box_pts = sorted(box, key=lambda p: p[1]) # Sort by Y
+        # The bottom 2 points are the last 2 in the list
+        bottom_pts = sorted(box_pts[-2:], key=lambda p: p[0]) 
+        top_pts = sorted(box_pts[:2], key=lambda p: p[0])
+        
+        p_bl = np.array(bottom_pts[0], dtype='float32')
+        p_br = np.array(bottom_pts[1], dtype='float32')
+        p_tl = np.array(top_pts[0], dtype='float32') # Approx top-left
+        
+        # Calculate Unit Vectors
+        vec_right = p_br - p_bl
+        len_right = np.linalg.norm(vec_right)
+        if len_right < 1.0: return None, [] # Degenerate
+        u_vec = vec_right / len_right
+        
+        vec_up = p_tl - p_bl
+        len_up = np.linalg.norm(vec_up)
+        if len_up < 1.0: return None, []
+        v_vec = vec_up / len_up
+        
+        # 5. Project 3D Notch Points to 2D
         found_points = []
-        projected_zones = [] # For debugging
+        projected_zones = []
         
-        # Map 3D points to 2D BBox coordinates
-        # We assume the contour roughly matches the face polygon
+        # Notch 3D (relative to center of bottom edge of face)
+        # X: -16 to 16, Y: 0 to 8 (mm)
+        # Brick origin in our vector system is Bottom-Left (X=-32)
+        
         for pt in self.notch_points_3d:
-            # Normalize X (-32 to 32) -> (0 to 1) 
-            scale_x = (pt['x'] + 32.0) / 64.0
-            # Normalize Y (0 to 48) -> (0 to 1)
-            scale_y = (pt['y']) / 48.0 # 0 is bottom, 48 is top in 3D
+            # Shift X from center-relative to BL-relative
+            # pt['x'] is -16 (left notch side) or +16 (right notch side)
+            # relative to center. 
+            # So dist_from_left_edge_mm = pt['x'] + 32.0
+            x_mm = pt['x'] + 32.0 
+            y_mm = pt['y']        # Height up from bottom edge
+
+            # Convert to pixels
+            tx = x_mm * mm_per_pixel
+            ty = y_mm * mm_per_pixel
             
-            # Image Coordinates (Y is flipped: 0 is top, H is bottom)
-            # The 3D Y=0 is the bottom of the brick, which is y_box + h_box
-            # The 3D Y=48 is the top of the brick, which is y_box
+            # Project using our vectors
+            # P_proj = P_bl + (tx * u_vec) + (ty * v_vec)
+            # Note: v_vec points "Up" in image space (towards top of screen) 
+            # if we defined it that way. Actually p_tl has lower Y than p_bl.
+            # So vec_up is numerically negative in Y. That's correct for "Up".
             
-            # Let's project simply:
-            px = int(x_box + (scale_x * w_box))
-            py = int((y_box + h_box) - (scale_y * h_box))
+            projected_pt = p_bl + (tx * u_vec) + (ty * v_vec)
+            px, py = int(projected_pt[0]), int(projected_pt[1])
             
-            # Define search zone
+            # Create search zone around this projected point
+            # Since the zone is square, we don't need to rotate the zone itself,
+            # just center it on the rotated projection.
             x1 = max(0, px - margin_px)
             x2 = min(mask.shape[1], px + margin_px)
             y1 = max(0, py - margin_px)
@@ -208,8 +259,7 @@ class BrickDetector:
             
             projected_zones.append((x1, y1, x2-x1, y2-y1))
             
-            # Search for a contour point in this zone
-            # We approximate the contour to get corner vertices
+            # Search for best contour point
             epsilon = 0.005 * cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, epsilon, True)
             
