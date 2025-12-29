@@ -33,6 +33,7 @@ class BrickDetector:
         self.headless = True 
         self.save_folder = save_folder
         self.current_frame = None
+        self.raw_frame = None
         
         if self.save_folder and not os.path.exists(self.save_folder):
             try: os.makedirs(self.save_folder)
@@ -398,6 +399,10 @@ class BrickDetector:
     def read(self):
         ret, frame = self.cap.read()
         if not ret: return False, 0, 0, 0
+        
+        # Store RAW frame for ML training (clean, no text)
+        self.raw_frame = frame.copy()
+        
         found, angle, dist, offset_x, display_frame = self.process_frame(frame)
         self.current_frame = display_frame
         

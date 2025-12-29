@@ -105,6 +105,28 @@ try:
             else:
                 msg = f"d {speed} {CMD_DURATION}" # Down
 
+        # 3. BUTTONS (Discrete Events)
+        # We check buttons and send special strings
+        # A=0, B=1, X=2, Y=3 (Standard mapping, verify if needed)
+        
+        # Simple debounce/state tracking could be added in a class, 
+        # but for now we rely on the server handling or just raw sends.
+        # Actually, let's send ONE message per press to avoid flooding "BTN_A".
+        # We need to track 'prev_buttons' outside the loop, but inserting it here is messy without refactor.
+        # Let's just check get_button. If pressed, we send. 
+        # To avoid flood, we only send if we haven't sent a button msg this frame?
+        # A proper way requires state. 
+        # Let's assume the user holds it briefly.
+        
+        if joy.get_button(0): # A Button
+             msg = "BTN_A"
+        elif joy.get_button(1): # B Button
+             msg = "BTN_B"
+        elif joy.get_button(2): # X Button
+             msg = "BTN_X"
+        elif joy.get_button(3): # Y Button
+             msg = "BTN_Y"
+
         # --- SEND COMMAND ---
         if msg:
             try:

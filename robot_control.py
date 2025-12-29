@@ -42,31 +42,57 @@ class Robot:
             except Exception as e:
                 print(f"[ROBOT] Write Error: {e}")
 
-    def drive(self, speed):
+    def send_command(self, cmd_char, speed):
         """
-        Moves the robot Forward or Backward.
-        speed: Float between -1.0 (Full Reverse) and 1.0 (Full Forward)
+        Sends a high-level command: {char} {pwm} {duration}
+        cmd_char: f, b, l, r, u, d
+        speed: 0.0 to 1.0
         """
-        # 1. Deadzone check
+        # 1. Deadzone check (implied stop)
         if abs(speed) < 0.05:
-            # Stop command (Forward at 0 speed)
-            self._send(f"f 0 {self.CMD_DURATION}\n") 
+            # For safety, sending 0 speed usually stops that action
+            self._send(f"{cmd_char} 0 {self.CMD_DURATION}\n")
             return
 
-        # 2. Convert 0.0-1.0 to MIN_PWM-255
-        abs_speed = abs(speed)
-        pwm = int(self.MIN_PWM + (self.MAX_PWM - self.MIN_PWM) * abs_speed)
-        pwm = min(pwm, 255) # Cap at 255
+        # 2. Scale to PWM
+        pwm = int(self.MIN_PWM + (self.MAX_PWM - self.MIN_PWM) * abs(speed))
+        pwm = min(pwm, 255)
+        
+        # 3. Send
+        self._send(f"{cmd_char} {pwm} {self.CMD_DURATION}\n")
 
-        # 3. Choose Direction
-        direction = 'f' if speed > 0 else 'b'
+    def drive(self, speed):
+        """Wrapper for BACKWARD COMPATIBILITY with maneuvers.py"""
+        if speed > 0:
+            self.send_command('f', speed)
+        elif speed < 0:
+            self.send_command('b', abs(speed))
+        else:
+            self.stop()
 
-        # 4. Send Command (e.g., "f 150 100")
-        cmd = f"{direction} {pwm} {self.CMD_DURATION}\n"
-        self._send(cmd)
+    def spin(self, speed):
+        """Wrapper: speed>0 -> Right, speed<0 -> Left"""
+        if speed > 0:
+            self.send_command('r', speed)
+        elif speed < 0:
+            self.send_command('l', abs(speed))
+        else:
+            self.stop() # Or just stop drive?
+            
+    def set_lift_motor(self, speed):
+        """Wrapper: speed>0 -> Up, speed<0 -> Down"""
+        if speed > 0:
+            self.send_command('u', speed)
+        elif speed < 0:
+            self.send_command('d', abs(speed))
+        else:
+            self.send_command('u', 0)
 
     def stop(self):
+        # Stop everything. 'f 0' usually stops the base?
+        # Let's send a stop for drive and lift to be sure.
         self._send(f"f 0 {self.CMD_DURATION}\n")
+        self._send(f"u 0 {self.CMD_DURATION}\n")
 
     def close(self):
         self.stop()
