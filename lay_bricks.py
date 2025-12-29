@@ -73,15 +73,16 @@ def main():
     if DEBUG_MODE:
         print("[SYSTEM] DEBUG MODE ON - Vision Overlays Enabled")
         
-        # Always clean up frame captures as requested
-        print("[SYSTEM] Clearing old captures...")
-        if os.path.exists("debug_captures"):
-            shutil.rmtree("debug_captures")
-        os.makedirs("debug_captures")
-        
         save_path = None
         if SAVE_TO_DISK:
             print("[SYSTEM] Disk Saving ENABLED")
+            
+            # Always clean up frame captures as requested
+            print("[SYSTEM] Clearing old captures...")
+            if os.path.exists("debug_captures"):
+                shutil.rmtree("debug_captures")
+            os.makedirs("debug_captures")
+            
             save_path = "debug_captures"
         
         vision = BrickDetector(debug=True, save_folder=save_path)

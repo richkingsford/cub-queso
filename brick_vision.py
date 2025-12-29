@@ -59,6 +59,12 @@ class BrickDetector:
             try: cv2.namedWindow("Brick Vision Debug")
             except: self.headless = True
 
+    def draw_text_with_bg(self, img, text, pos, font=cv2.FONT_HERSHEY_SIMPLEX, font_scale=0.6, text_color=(255, 255, 255), thickness=1, bg_color=(0, 0, 0)):
+        x, y = pos
+        (w, h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        cv2.rectangle(img, (x, y - h - 5), (x + w, y + 5), bg_color, -1)
+        cv2.putText(img, text, (x, y), font, font_scale, text_color, thickness)
+
     def hex_to_hsv_ranges(self, hex_str, h_margin, s_margin, v_margin):
         hex_str = hex_str.lstrip('#')
         r, g, b = int(hex_str[0:2], 16), int(hex_str[2:4], 16), int(hex_str[4:6], 16)
@@ -298,7 +304,7 @@ class BrickDetector:
             
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        found, final_angle, final_dist = False, 0.0, 0.0
+        found, final_angle, final_dist, final_offset_x = False, 0.0, 0.0, 0.0
         
         for cnt in contours:
             if cv2.contourArea(cnt) < MIN_AREA_THRESHOLD: continue
@@ -331,8 +337,7 @@ class BrickDetector:
 
                 # Draw Visual Feedback
                 color = (0, 255, 0) if confidence >= CONFIDENCE_THRESHOLD else (0, 0, 255)
-                status_text = f"Conf: {int(confidence)}%" if confidence >= CONFIDENCE_THRESHOLD else "REJECTED"
-
+                
                 if not self.speed_optimize:
                     epsilon = 0.008 * cv2.arcLength(cnt, True)
                     approx = cv2.approxPolyDP(cnt, epsilon, True)
@@ -345,8 +350,9 @@ class BrickDetector:
                     cv2.line(frame, (int(p_tl[0]), int(p_tl[1])), (int(p_tr[0]), int(p_tr[1])), (0, 165, 255), 2)
                     cv2.line(frame, (int(p_bl[0]), int(p_bl[1])), (int(p_br[0]), int(p_br[1])), (0, 255, 255), 2) # Angle Line
 
-                    # Draw Status
-                    cv2.putText(frame, status_text, (int(x), int(y)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    # Draw Status ONLY if rejected
+                    if confidence < CONFIDENCE_THRESHOLD:
+                         self.draw_text_with_bg(frame, "REJECTED", (int(x), int(y)-10), font_scale=0.6, text_color=color)
 
                 # ONLY RETURN DATA IF CONFIDENCE IS HIGH
                 if confidence >= CONFIDENCE_THRESHOLD:
@@ -358,6 +364,7 @@ class BrickDetector:
                     if success:
                         found = True
                         final_dist = np.linalg.norm(tvec)
+                        final_offset_x = tvec[0][0]
                         
                         # Simple 2D Angle
                         p_bl = image_points[0]
@@ -367,8 +374,13 @@ class BrickDetector:
                         final_angle = math.degrees(math.atan2(delta_y, delta_x))
                         
                         if not self.speed_optimize:
-                            info_txt = f"Dist: {int(final_dist)}mm | Ang: {int(final_angle)}"
-                            cv2.putText(frame, info_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+                            line1 = f"Conf: {int(confidence)}% | Dist: {int(final_dist)}mm"
+                            line2 = f"Ang: {int(final_angle)}deg | Off: {int(final_offset_x)}mm"
+                            self.draw_text_with_bg(frame, line1, (10, 20), font_scale=0.35, text_color=(0, 255, 0))
+                            self.draw_text_with_bg(frame, line2, (10, 40), font_scale=0.35, text_color=(0, 255, 0))
+                        
+                        # LOG ALL METRICS
+                        print(f"[VISION] LOCKED | Conf: {int(confidence)}% | Dist: {int(final_dist)}mm | Ang: {int(final_angle)}deg | Off: {int(final_offset_x)}mm")
                         break # Locked on target
                 else:
                     # If we found a candidate but rejected it, we continue searching 
@@ -381,12 +393,12 @@ class BrickDetector:
         cv2.rectangle(mask_color, (0,0), (overlay_w-1, overlay_h-1), (0,255,0), 1)
         frame[0:overlay_h, frame.shape[1]-overlay_w:frame.shape[1]] = mask_color
 
-        return found, final_angle, final_dist, frame
+        return found, final_angle, final_dist, final_offset_x, frame
 
     def read(self):
         ret, frame = self.cap.read()
-        if not ret: return False, 0, 0
-        found, angle, dist, display_frame = self.process_frame(frame)
+        if not ret: return False, 0, 0, 0
+        found, angle, dist, offset_x, display_frame = self.process_frame(frame)
         self.current_frame = display_frame
         
         # SAVE SCREENSHOT IF ENABLED
@@ -398,7 +410,7 @@ class BrickDetector:
         if self.debug and not self.headless and not self.speed_optimize:
             cv2.imshow("Brick Vision Debug", display_frame)
             cv2.waitKey(1)
-        return found, angle, dist
+        return found, angle, dist, offset_x
 
     def save_frame(self, filename):
         if self.current_frame is not None:
@@ -411,7 +423,7 @@ class BrickDetector:
         if not self.headless: cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    det = BrickDetector(save_folder=".")
+    det = BrickDetector(save_folder=None)
     print("Running standalone test (Ctrl+C to stop)...")
     try:
         while True:
