@@ -308,17 +308,36 @@ class TelemetryLogger:
         wall = "SET" if data['wall_origin'] else "UNSET"
         evt = data.get('last_event')
         
-        print(f"| T={data['timestamp']:.2f} | STATE={data['objective']} | WALL={wall}")
-        print(f"| POSE: X={p['x']:.0f} Y={p['y']:.0f} H={p['theta']:.0f}° | LIFT={data['lift_height']:.0f}")
-        print(f"| BRICK: Vis={b['visible']} D={b['dist']:.0f} A={b['angle']:.0f} Conf={b['confidence']:.0f}%")
+        print(f"\n{'='*40}")
+        print(f"TIME: {data['timestamp']:.2f}s")
+        print(f"OBJECTIVE: {data['objective']}")
+        print(f"WALL: {wall}")
+        print(f"{'-'*40}")
+        print(f"POSE:")
+        print(f"  X: {p['x']:.0f} mm")
+        print(f"  Y: {p['y']:.0f} mm")
+        print(f"  Heading: {p['theta']:.0f}°")
+        print(f"  Lift: {data['lift_height']:.0f} mm")
+        print(f"{'-'*40}")
+        print(f"BRICK:")
+        print(f"  Visible: {b['visible']}")
+        if b['visible']:
+            print(f"  Distance: {b['dist']:.0f} mm")
+            print(f"  Angle: {b['angle']:.1f}°")
+            print(f"  Offset: {b['offset_x']:.1f} mm")
+            print(f"  Confidence: {b['confidence']:.0f}%")
+        print(f"{'-'*40}")
         
         if evt:
             age = data['timestamp'] - evt['timestamp']
-            print(f"| LAST EVENT: {evt['type']} | Power: {evt['power']} | Dur: {evt['duration_ms']}ms | Age: {age:.1f}s")
+            print(f"LAST EVENT: {evt['type']}")
+            print(f"  Power: {evt['power']}")
+            print(f"  Duration: {evt['duration_ms']}ms")
+            print(f"  Age: {age:.1f}s")
         else:
-            print(f"| LAST EVENT: None")
-            
-        print("-" * 60)
+            print(f"LAST EVENT: None")
+        print(f"{'='*40}\n")
+
 
     def close(self):
         # Remove trailing comma and add closing bracket

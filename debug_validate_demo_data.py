@@ -25,25 +25,40 @@ def validate_session(session_path):
     if not entries:
         return False, "Empty log"
 
-    # Check for Objectives
-    found_objs = set()
+    # Track objective transitions to detect runs
+    objectives_sequence = []
     for e in entries:
-        found_objs.add(e.get('objective', ''))
-
+        obj = e.get('objective', '')
+        if not objectives_sequence or objectives_sequence[-1] != obj:
+            objectives_sequence.append(obj)
+    
+    # Check for all required objectives across the entire session
+    found_objs = set(objectives_sequence)
     required_objs = {"FIND", "ALIGN", "SCOOP", "LIFT", "PLACE"}
     missing = required_objs - found_objs
     if missing:
         return False, f"Missing Objectives: {missing}"
 
-    # Check for Success
-    success = False
-    for e in entries:
-        evt = e.get('last_event')
-        if evt and evt.get('type') == "JOB_SUCCESS":
-            success = True
-            break
-    if not success:
-        return False, "No JOB_SUCCESS event"
+    # Detect complete runs (cycles that reach PLACE)
+    # A run is complete if we see the sequence reach PLACE
+    complete_runs = 0
+    current_run_objs = []
+    
+    for obj in objectives_sequence:
+        if obj == "FIND" and current_run_objs:
+            # Starting a new run, check if previous was complete
+            if "PLACE" in current_run_objs:
+                complete_runs += 1
+            current_run_objs = ["FIND"]
+        else:
+            current_run_objs.append(obj)
+    
+    # Check final run
+    if "PLACE" in current_run_objs:
+        complete_runs += 1
+    
+    if complete_runs == 0:
+        return False, f"No complete runs (sequence: {' -> '.join(objectives_sequence)})"
 
     # Check for Vision Stability in ALIGN/SCOOP
     align_vision_hits = 0
@@ -58,7 +73,9 @@ def validate_session(session_path):
     if align_vision_hits < 5:
         return False, f"Poor ALIGN vision ({align_vision_hits} hits)"
     
-    return True, f"READY ({len(entries)} entries)"
+    # Success!
+    total_runs = objectives_sequence.count("FIND")
+    return True, f"READY: {complete_runs}/{total_runs} runs, {len(entries)} entries"
 
 def main():
     demos_dir = os.path.join(os.getcwd(), "demos")

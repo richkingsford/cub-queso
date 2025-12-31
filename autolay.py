@@ -81,7 +81,7 @@ def load_demo(session_name):
         print(f"Error: Session {session_name} not found.")
         return None
 
-    events = []
+    raw_events = []
     with open(path, 'r') as f:
         for line in f:
             line = line.strip()
@@ -91,12 +91,45 @@ def load_demo(session_name):
             
             # We only care about entries that had a command
             if data.get('last_event'):
-                events.append({
+                raw_events.append({
                     'obj': data.get('objective'),
                     'cmd': data['last_event']['type'],
                     'duration': data['last_event']['duration_ms'] / 1000.0
                 })
-    return events
+    
+    # Merge consecutive identical commands into longer durations
+    if not raw_events:
+        return []
+    
+    merged_events = []
+    current_event = raw_events[0].copy()
+    
+    for next_event in raw_events[1:]:
+        # If same objective and command, merge durations
+        if (next_event['obj'] == current_event['obj'] and 
+            next_event['cmd'] == current_event['cmd']):
+            current_event['duration'] += next_event['duration']
+        else:
+            # Different command, save current and start new
+            merged_events.append(current_event)
+            current_event = next_event.copy()
+    
+    # Don't forget the last event
+    merged_events.append(current_event)
+    
+    return merged_events
+
+def event_type_to_cmd(event_type):
+    """Convert logged event type to single-character robot command."""
+    mapping = {
+        'forward': 'f',
+        'backward': 'b',
+        'left_turn': 'l',
+        'right_turn': 'r',
+        'mast_up': 'u',
+        'mast_down': 'd'
+    }
+    return mapping.get(event_type, None)
 
 def main_autoplay(session_name):
     events = load_demo(session_name)
@@ -123,9 +156,15 @@ def main_autoplay(session_name):
             with app_state.lock:
                 app_state.active_objective = current_obj
                 app_state.world.objective_state = ObjectiveState[current_obj]
-            print(f"\n>>> objective: {current_obj}")
+            print(f"\n>>> OBJECTIVE: {current_obj}")
 
-        cmd = ev['cmd']
+        event_type = ev['cmd']
+        cmd = event_type_to_cmd(event_type)
+        
+        if cmd is None:
+            print(f"  [{i+1}/{len(events)}] Skipping unknown event: {event_type}")
+            continue
+            
         # Special handling for mast boost (4x as previously requested)
         speed = GEAR_1_SPEED
         if cmd in ('u', 'd'):
@@ -134,22 +173,44 @@ def main_autoplay(session_name):
         duration = ev['duration']
         
         with app_state.lock:
-            app_state.status_msg = f"Executing: {cmd} ({duration:.2f}s)"
+            app_state.status_msg = f"Executing: {event_type} ({duration:.2f}s)"
         
-        print(f"  [{i+1}/{len(events)}] {cmd} for {duration:.2f}s")
-        app_state.robot.send_command(cmd, speed)
+        print(f"  [{i+1}/{len(events)}] {event_type} ({cmd}) for {duration:.2f}s")
         
-        # Log this motion in our active world model for HUD/Telemetry
-        m_evt = MotionEvent(cmd, int(speed*255), int(duration*1000))
-        app_state.world.update_from_motion(m_evt)
+        # Send commands continuously during the duration (like recording script does)
+        # Robot CMD_DURATION is 100ms, so we send at ~10Hz
+        start_time = time.time()
+        command_interval = 0.1  # 100ms, matches CMD_DURATION
         
-        time.sleep(duration)
+        while True:
+            if not app_state.running:
+                break
+            
+            elapsed = time.time() - start_time
+            if elapsed >= duration:
+                break
+                
+            app_state.robot.send_command(cmd, speed)
+            
+            # Log this motion in our active world model for HUD/Telemetry
+            m_evt = MotionEvent(event_type, int(speed*255), int(command_interval*1000))
+            app_state.world.update_from_motion(m_evt)
+            
+            # Sleep for command interval or remaining time, whichever is shorter
+            remaining = duration - elapsed
+            sleep_time = min(command_interval, remaining)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+        
+        # Stop after the duration
         app_state.robot.stop()
 
     print("\n[AUTOPLAY] Sequence Complete.")
     app_state.status_msg = "SEQUENCE COMPLETE"
     app_state.running = False
     time.sleep(2)
+
+
 
 def find_sessions():
     demos_dir = os.path.join(os.getcwd(), "demos")

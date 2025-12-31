@@ -260,8 +260,10 @@ def control_loop(app_state):
             img_path = os.path.join(app_state.session_dir, img_name)
             cv2.imwrite(img_path, app_state.vision.raw_frame)
             app_state.world.last_image_file = img_name
-            
-        app_state.logger.log_state(app_state.world)
+        
+        # Log state with lock to ensure objective_state is read atomically
+        with app_state.lock:
+            app_state.logger.log_state(app_state.world)
         
         # 5. Draw HUD for Web Stream
         # Use standardized telemetry overlay
