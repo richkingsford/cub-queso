@@ -26,6 +26,40 @@ WEB_PORT = 5000
 LOG_RATE_HZ = 10
 CMD_TIMEOUT = 0.2 # If no command for 0.2s, stop motors
 
+# --- FLASK ---
+flask_app = Flask(__name__)
+
+def generate_frames():
+    while True:
+        if app_state is None:
+            time.sleep(0.1)
+            continue
+            
+        with app_state.lock:
+            if app_state.current_frame is None:
+                frame_to_send = None
+            else:
+                frame_to_send = app_state.current_frame.copy()
+        
+        if frame_to_send is None:
+            time.sleep(0.05)
+            continue
+
+        (flag, encodedImage) = cv2.imencode(".jpg", frame_to_send)
+        if not flag:
+            continue
+        
+        yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + 
+              bytearray(encodedImage) + b'\r\n')
+
+@flask_app.route("/")
+def index():
+    return "<html><body style='background:#111; color:#eee; font-family:sans-serif; text-align:center;'><h1>Robot Eyes (Xbox Mode)</h1><img src='/video_feed' style='border:2px solid #555; border-radius:10px;'></body></html>"
+
+@flask_app.route("/video_feed")
+def video_feed():
+    return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
 # --- SHARED APP STATE ---
 class AppState:
     def __init__(self):
@@ -54,13 +88,15 @@ class AppState:
         
         # Telemetry
         self.world = WorldModel()
-        log_path = os.path.join(self.session_dir, "log.json")
+        log_path = os.path.join(self.session_dir, "a_log.json")
         self.logger = TelemetryLogger(log_path)
         self.vision = None
         self.robot = None
         
         # Video
         self.current_frame = None
+
+app_state = AppState()
 
 # ... (rest of file)
 
@@ -79,7 +115,7 @@ def handle_command(cmd_str):
         app_state.job_start_timer = time.time()
         
         # Reset Objective
-        app_state.world.objective_state = ObjectiveState.FIND
+        app_state.world.reset_mission()
         
         # Log Event
         evt = MotionEvent("JOB_START", 0, 0)
@@ -103,7 +139,7 @@ def handle_command(cmd_str):
         app_state.job_abort_timer = time.time()
         
         # Reset Objective
-        app_state.world.objective_state = ObjectiveState.FIND
+        app_state.world.reset_mission()
         
         # Log Event
         evt = MotionEvent("JOB_ABORT", 0, 0)
@@ -112,14 +148,9 @@ def handle_command(cmd_str):
         return
         
     if cmd == "BTN_X":
-
         # Cycle Objective
-        # Simple cycle logic
-        states = list(ObjectiveState)
-        curr_idx = states.index(app_state.world.objective_state)
-        next_idx = (curr_idx + 1) % len(states)
-        app_state.world.objective_state = states[next_idx]
-        print(f"[DEMO] Objective Set: {app_state.world.objective_state.name}")
+        new_state = app_state.world.next_objective()
+        print(f"[DEMO] Objective Set: {new_state}")
         return
 
     # MOVEMENT
@@ -180,12 +211,12 @@ def control_loop():
             pass
         
         # 3. Vision
-        found, angle, dist, offset_x = app_state.vision.read()
+        found, angle, dist, offset_x, max_y = app_state.vision.read()
         view_frame = app_state.vision.current_frame
         
         # 4. Telemetry Update
         conf = 100 if found else 0
-        app_state.world.update_vision(found, dist, angle, conf)
+        app_state.world.update_vision(found, dist, angle, conf, offset_x, max_y)
         
         # Track Motion
         if app_state.active_command and app_state.active_speed > 0.05:
@@ -207,7 +238,15 @@ def control_loop():
         app_state.logger.log_state(app_state.world)
         
         # 6. Draw HUD
-        draw_hud(view_frame, app_state.world)
+        messages = []
+        if app_state.job_start and time.time() - app_state.job_start_timer < 3.0:
+            messages.append("JOB STARTED")
+        if app_state.job_success and time.time() - app_state.job_success_timer < 5.0:
+            messages.append("JOB COMPLETE!")
+        if app_state.job_abort and time.time() - app_state.job_abort_timer < 3.0:
+            messages.append("JOB ABORTED")
+
+        draw_telemetry_overlay(view_frame, app_state.world, messages)
         with app_state.lock:
             app_state.current_frame = view_frame.copy()
             
@@ -216,44 +255,6 @@ def control_loop():
         if elapsed < dt:
             time.sleep(dt - elapsed)
 
-def draw_hud(frame, wm):
-    h, w = frame.shape[:2]
-    
-    # Reuse simple overlay logic
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (w-250, 0), (w, h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
-    
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    x_base = w - 240
-    y_cur = 30
-    
-    cv2.putText(frame, f"OBJ: {wm.objective_state.value}", (x_base, y_cur), font, 0.5, (255, 200, 0), 1)
-    y_cur += 25
-    
-    if wm.brick['visible']:
-        cv2.putText(frame, f"DIST: {wm.brick['dist']:.0f}", (x_base, y_cur), font, 0.5, (0, 255, 0), 1)
-    else:
-        cv2.putText(frame, "SEARCHING", (x_base, y_cur), font, 0.5, (0, 0, 255), 1)
-    y_cur += 25
-    
-    if wm.last_event:
-        cv2.putText(frame, f"ACT: {wm.last_event.action_type}", (x_base, y_cur), font, 0.5, (255, 100, 255), 1)
-        
-    # START BANNER
-    if app_state.job_start:
-        if time.time() - app_state.job_start_timer < 3.0:
-            cv2.putText(frame, "JOB STARTED", (w//2 - 150, h//2 - 50), font, 1.5, (0, 255, 255), 3)
-        else:
-            app_state.job_start = False
-
-    # SUCCESS BANNER
-    if app_state.job_success:
-        # Show for 5 seconds
-        if time.time() - app_state.job_success_timer < 5.0:
-            cv2.putText(frame, "JOB COMPLETE!", (w//2 - 150, h//2), font, 1.5, (0, 255, 0), 3)
-        else:
-            app_state.job_success = False
 
 def main():
     # 1. TCP Server Thread

@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+import json
+import os
+import sys
+import argparse
+from datetime import datetime
+
+# ANSI Colors
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+RED = "\033[91m"
+BOLD = "\033[1m"
+END = "\033[0m"
+
+class LogEntry:
+    def __init__(self, d):
+        self.ts = d.get('timestamp', 0)
+        self.pose = d.get('robot_pose', {})
+        self.wall = d.get('wall_origin')
+        self.brick = d.get('brick', {})
+        self.lift = d.get('lift_height', 0)
+        self.obj = d.get('objective', 'UNKNOWN')
+        self.evt = d.get('last_event')
+        self.img = d.get('image_file')
+
+def find_sessions():
+    demos_dir = os.path.join(os.getcwd(), "demos")
+    if not os.path.exists(demos_dir):
+        return []
+    
+    sessions = []
+    for d in os.listdir(demos_dir):
+        p = os.path.join(demos_dir, d)
+        if os.path.isdir(p):
+            # Check for either a_log.json or log.json
+            if os.path.exists(os.path.join(p, "a_log.json")) or os.path.exists(os.path.join(p, "log.json")):
+                sessions.append(d)
+            
+    # Sort by name (timestamp based)
+    sessions.sort(reverse=True)
+    return sessions
+
+def find_latest_log():
+    sessions = find_sessions()
+    if not sessions:
+        return None
+    latest_dir = os.path.join(os.getcwd(), "demos", sessions[0])
+    a_log = os.path.join(latest_dir, "a_log.json")
+    if os.path.exists(a_log):
+        return a_log
+    return os.path.join(latest_dir, "log.json")
+
+def format_pose(pose):
+    return f"({pose.get('x',0):.1f}, {pose.get('y',0):.1f}, {pose.get('theta',0):.1f}°)"
+
+def get_summary_line(entry):
+    """Generates a one-line summary of the current state."""
+    status = f"OBJ:{entry.obj}"
+    
+    if entry.brick.get('visible'):
+        vision = f"{GREEN}Seen (Dist:{entry.brick.get('dist',0):.0f}mm, Ang:{entry.brick.get('angle',0):.1f}°){END}"
+    else:
+        vision = f"{RED}Searching...{END}"
+        
+    act = "Idle"
+    if entry.evt:
+        act = f"{MAGENTA}{entry.evt.get('type','unknown')}{END} @ {entry.evt.get('power',0)}"
+        
+    return f"{status} | {vision} | {act} | Pose:{format_pose(entry.pose)}"
+
+def summarize_log(path):
+    if not os.path.exists(path):
+        print(f"Error: {path} not found.")
+        return
+
+    print(f"{BOLD}{BLUE}Reading Log:{END} {path}")
+    
+    entries = []
+    try:
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line == "[" or line == "]":
+                    continue
+                # Remove trailing comma
+                if line.endswith(","):
+                    line = line[:-1]
+                try:
+                    data = json.loads(line)
+                    entries.append(LogEntry(data))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        return
+
+    if not entries:
+        print(f"{RED}Log is empty or unreadable.{END}")
+        return
+
+    start_ts = entries[0].ts
+    duration_total = entries[-1].ts - start_ts
+    
+    output_lines = []
+    output_lines.append(f"SESSION SUMMARY: {os.path.dirname(path)}")
+    output_lines.append(f"Total Entries: {len(entries)}")
+    output_lines.append(f"Total Time: {duration_total:.1f} seconds")
+    output_lines.append("-" * 60)
+    output_lines.append("Timeline Summary:")
+
+    def get_period_desc(e):
+        act_type = e.evt.get('type') if e.evt else "Idle"
+        vis = e.brick.get('visible', False)
+        
+        base_desc = ""
+        if e.obj == "FIND":
+            if not vis:
+                base_desc = "Searching for a brick..."
+            else:
+                base_desc = "Found a brick!"
+        elif e.obj == "ALIGN":
+            base_desc = "Aligning with brick..."
+        elif e.obj == "SCOOP":
+            base_desc = "Approaching/Scooping brick..."
+        elif e.obj == "LIFT":
+            base_desc = "Scooping/Lifting brick..."
+        elif e.obj == "PLACE":
+            base_desc = "Putting down brick..."
+        else:
+            base_desc = f"Objective: {e.obj}"
+            
+        if act_type != "Idle":
+            base_desc += f" [Moving: {act_type}]"
+            
+        return base_desc
+
+    current_period = {
+        'start': 0,
+        'desc': None,
+        'min_dist': float('inf'),
+        'max_dist': float('-inf'),
+        'vis_count': 0
+    }
+    wall_set_time = None
+
+    # --- SUMMARIZATION LOOP ---
+    periods = []
+    
+    current_p = {
+        'start': 0,
+        'obj': entries[0].obj,
+        'seated': entries[0].brick.get('seated', False),
+        'held': entries[0].brick.get('held', False),
+        'min_dist': float('inf'),
+        'max_dist': float('-inf'),
+        'vis_count': 0,
+        'move_types': set()
+    }
+    
+    for i, e in enumerate(entries):
+        elapsed = e.ts - start_ts
+        mtype = e.evt.get('type') if e.evt else "Idle"
+        dist = e.brick.get('dist', 0) if e.brick.get('visible') else None
+        seated = e.brick.get('seated', False)
+        held = e.brick.get('held', False)
+        
+        # Merge if Objective AND State Flags are same
+        state_match = (e.obj == current_p['obj'] and 
+                       seated == current_p['seated'] and 
+                       held == current_p['held'])
+        
+        if state_match:
+            if dist is not None:
+                current_p['min_dist'] = min(current_p['min_dist'], dist)
+                current_p['max_dist'] = max(current_p['max_dist'], dist)
+                current_p['vis_count'] += 1
+            if mtype != "Idle":
+                current_p['move_types'].add(mtype)
+        else:
+            # Commit current
+            current_p['end'] = elapsed
+            periods.append(current_p)
+            
+            # Start new
+            current_p = {
+                'start': elapsed,
+                'obj': e.obj,
+                'seated': seated,
+                'held': held,
+                'min_dist': float('inf'),
+                'max_dist': float('-inf'),
+                'vis_count': 0,
+                'move_types': set()
+            }
+            if dist is not None:
+                current_p['min_dist'] = dist
+                current_p['max_dist'] = dist
+                current_p['vis_count'] = 1
+            if mtype != "Idle":
+                current_p['move_types'].add(mtype)
+                
+    # Final flush
+    current_p['end'] = entries[-1].ts - start_ts
+    periods.append(current_p)
+
+    # --- FORMAT OUTPUT ---
+    obj_map = {
+        "FIND": "Looking for brick (FIND)",
+        "ALIGN": "Aligning with brick (ALIGN)",
+        "SCOOP": "Seating brick (SCOOP)",
+        "LIFT": "Lifting brick (LIFT)",
+        "PLACE": "Lowering brick (PLACE)"
+    }
+    
+    # ANSI for internal color markers
+    ORANGE_M = "\033[38;5;208m"
+    GREEN_M = "\033[32m"
+    
+    for p in periods:
+        desc = obj_map.get(p['obj'], f"Objective: {p['obj']}")
+        
+        # Add state markers
+        if p['held']:
+            desc += f" {BOLD}{GREEN_M}(HELD){END}"
+        elif p['seated']:
+            desc += f" {BOLD}{ORANGE_M}(SEATED){END}"
+            
+        # Add movement info if any
+        if p['move_types']:
+            moves = ", ".join(sorted(list(p['move_types'])))
+            desc += f" [Actions: {moves}]"
+        
+        # Add vision info
+        if p['vis_count'] > 0:
+            d_min, d_max = p['min_dist'], p['max_dist']
+            if abs(d_min - d_max) < 0.1:
+                desc += f". Distance was {d_min:.0f}mm"
+            else:
+                desc += f". Distance was between {d_min:.0f} and {d_max:.0f}mm"
+        else:
+            # If we are seated/held, we don't necessarily care about "No brick seen" noise
+            if not p['seated'] and not p['held']:
+                desc += ". (No brick seen)"
+        
+        output_lines.append(f"Sec {p['start']:4.1f} - {p['end']:4.1f}: {desc}")
+    
+    # --- SPECIAL EVENTS ---
+    # Highlights for Success/Abort/Wall
+    for e in entries:
+        elapsed = e.ts - start_ts
+        etype = e.evt.get('type') if e.evt else None
+        
+        if etype == "JOB_SUCCESS":
+            output_lines.append(f"{BOLD}{GREEN}      >>> JOB SUCCESS CONFIRMED at {elapsed:.1f}s <<<{END}")
+        elif etype == "JOB_ABORT":
+            output_lines.append(f"{BOLD}{RED}      >>> JOB ABORTED at {elapsed:.1f}s <<<{END}")
+            
+    wall_set_time = None
+    for e in entries:
+        if e.wall and wall_set_time is None:
+            wall_set_time = e.ts - start_ts
+            w = e.wall
+            output_lines.append(f"      >> WALL SET at x={w['x']:.0f}, y={w['y']:.0f} [at {wall_set_time:.1f}s]")
+            break
+
+    output_lines.append("-" * 60)
+
+    # 1. Print to Terminal
+    for line in output_lines:
+        # Simple color replacement for terminal
+        l = line.replace("Found a brick!", f"{GREEN}Found a brick!{END}")
+        l = l.replace("WALL SET", f"{YELLOW}WALL SET{END}")
+        print(l)
+        
+    # 2. Save to a_summary.txt
+    summary_path = os.path.join(os.path.dirname(path), "a_summary.txt")
+    try:
+        with open(summary_path, 'w') as f:
+            for line in output_lines:
+                # Strip all potential color codes
+                clean = line
+                for code in [GREEN, RED, YELLOW, BLUE, MAGENTA, CYAN, BOLD, END, ORANGE_M, GREEN_M]:
+                    clean = clean.replace(code, "")
+                f.write(clean + "\n")
+        print(f"\n{BOLD}{CYAN}Persistent summary saved to:{END} {summary_path}")
+    except Exception as e:
+        print(f"Failed to save summary file: {e}")
+
+    print(f"\n{GREEN}Summary Complete.{END}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Summarize robot session logs.")
+    parser.add_argument("log_path", nargs="?", help="Path to log.json")
+    parser.add_argument("--list", action="store_true", help="List all sessions")
+    args = parser.parse_args()
+    
+    if args.list:
+        sessions = find_sessions()
+        if not sessions:
+            print("No sessions found.")
+        else:
+            print(f"{BOLD}Available Sessions:{END}")
+            for i, s in enumerate(sessions):
+                print(f"  [{i}] {s}")
+        sys.exit(0)
+
+    log_path = args.log_path or find_latest_log()
+    
+    if not log_path:
+        print("No log files found in demos/. Use the recorder first!")
+        sys.exit(1)
+        
+    summarize_log(log_path)

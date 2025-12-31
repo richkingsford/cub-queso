@@ -1,80 +1,121 @@
 """
-manual_test.py
---------------
-A raw diagnostic tool to test Motor Power and Serial Protocol.
-Bypasses all vision and autonomy logic.
+debug_test_keyboard.py
+----------------------
+A simple script to "wiggle" the robot using terminal keys.
+No recording, no vision. Just raw movement tests.
 
 Controls:
-  'w' = Forward (High Power - 200 PWM)
-  's' = Stop    (0 PWM)
-  'r' = Reverse (High Power - 200 PWM)
-  
-  OR type a custom string (e.g., "100,100") to send raw data.
+  W/S: Forward/Backward
+  A/D: Left/Right
+  P/L: Mast Up/Down
+  Q: Quit
 """
-import serial
-import time
 import sys
+import threading
+import time
+import tty
+import termios
+from robot_control import Robot
 
-# --- CONFIGURATION ---
-SERIAL_PORT = '/dev/ttyCH341USB0' 
-BAUD_RATE = 115200 
+# --- CONFIG ---
+GEAR_1_SPEED = 0.32 
+GEAR_9_SPEED = 1.0
+HEARTBEAT_TIMEOUT = 0.3 
 
-def main():
-    print("--- MOTOR DIAGNOSTIC TOOL ---")
-    print(f"Connecting to {SERIAL_PORT}...")
+class TestState:
+    def __init__(self):
+        self.running = True
+        self.active_command = None
+        self.active_speed = 0.0
+        self.current_gear = 1
+        self.last_key_time = 0
+        self.lock = threading.Lock()
+
+def getch():
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
+
+def keyboard_thread(state):
+    print("\n[WIGGLE TEST] Ready.")
+    print("Hold W/A/S/D or P/L to move. Release to stop.")
+    print("Press 'q' to quit.")
     
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        time.sleep(2) # Wait for Arduino Reset
-        print("CONNECTED.")
-    except Exception as e:
-        print(f"ERROR: {e}")
-        return
-
-    print("\nCOMMANDS:")
-    print("  [w] Forward (PWM 200)")
-    print("  [s] STOP")
-    print("  [r] Reverse (PWM -200)")
-    print("  ...or type a raw string like '100,100' or '<150,150>' to test protocol.")
-    print("  [q] Quit")
-    print("-" * 30)
-
-    try:
-        while True:
-            user_input = input("CMD > ").strip()
-            
-            if user_input.lower() == 'q':
+    while state.running:
+        ch = getch().lower()
+        with state.lock:
+            state.last_key_time = time.time()
+            if ch == 'q':
+                state.running = False
                 break
             
-            command_to_send = ""
+            if ch == 'w':
+                state.active_command = 'b' # INVERTED
+            elif ch == 's':
+                state.active_command = 'f' # INVERTED
+            elif ch == 'a':
+                state.active_command = 'l'
+            elif ch == 'd':
+                state.active_command = 'r'
+            elif ch == 'p':
+                state.active_command = 'u'
+            elif ch == 'l':
+                state.active_command = 'd'
+            
+            # GEARS
+            elif ch in '123456789':
+                state.current_gear = int(ch)
+                print(f"\n[GEAR] Gear {state.current_gear}")
 
-            # --- PRESETS ---
-            if user_input.lower() == 'w':
-                command_to_send = "200,200\n"
-                print(f"  -> Sending HIGH POWER Forward: {repr(command_to_send)}")
-            
-            elif user_input.lower() == 's':
-                command_to_send = "0,0\n"
-                print(f"  -> Sending STOP: {repr(command_to_send)}")
-            
-            elif user_input.lower() == 'r':
-                command_to_send = "-200,-200\n"
-                print(f"  -> Sending REVERSE: {repr(command_to_send)}")
+def main():
+    state = TestState()
+    robot = Robot()
+    
+    # Start keyboard thread
+    kb_t = threading.Thread(target=keyboard_thread, args=(state,), daemon=True)
+    kb_t.start()
+    
+    was_moving = False
+    
+    try:
+        while state.running:
+            with state.lock:
+                # Heartbeat check
+                if time.time() - state.last_key_time > HEARTBEAT_TIMEOUT:
+                    state.active_command = None
+                    state.active_speed = 0.0
                 
-            # --- RAW INPUT (For Debugging Protocol) ---
-            else:
-                # If you type "100,100", we append newline just in case
-                command_to_send = user_input + "\n"
-                print(f"  -> Sending RAW: {repr(command_to_send)}")
-
-            # SEND TO ARDUINO
-            ser.write(command_to_send.encode('utf-8'))
+                # Gear Speed
+                gear_ratio = (state.current_gear - 1) / 8.0
+                gear_speed = GEAR_1_SPEED + gear_ratio * (GEAR_9_SPEED - GEAR_1_SPEED)
+                
+                cmd = state.active_command
+                if cmd:
+                    speed = gear_speed
+                else:
+                    speed = 0.0
+            
+            if cmd and speed > 0:
+                robot.send_command(cmd, speed)
+                was_moving = True
+            elif was_moving:
+                robot.stop()
+                was_moving = False
+            
+            time.sleep(0.05) # 20Hz update
             
     except KeyboardInterrupt:
-        print("\nExiting...")
+        pass
     finally:
-        ser.write("0,0\n".encode('utf-8'))
-        ser.close()
+        state.running = False
+        robot.stop()
+        robot.close()
+        print("\nWiggle Test Stopped.")
 
 if __name__ == "__main__":
     main()

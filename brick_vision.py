@@ -305,7 +305,7 @@ class BrickDetector:
             
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        found, final_angle, final_dist, final_offset_x = False, 0.0, 0.0, 0.0
+        found, final_angle, final_dist, final_offset_x, max_y = False, 0.0, 0.0, 0.0, 0.0
         
         for cnt in contours:
             if cv2.contourArea(cnt) < MIN_AREA_THRESHOLD: continue
@@ -366,6 +366,7 @@ class BrickDetector:
                         found = True
                         final_dist = np.linalg.norm(tvec)
                         final_offset_x = tvec[0][0]
+                        max_y = np.max(image_points[:, 1])
                         
                         # Simple 2D Angle
                         p_bl = image_points[0]
@@ -394,7 +395,7 @@ class BrickDetector:
         cv2.rectangle(mask_color, (0,0), (overlay_w-1, overlay_h-1), (0,255,0), 1)
         frame[0:overlay_h, frame.shape[1]-overlay_w:frame.shape[1]] = mask_color
 
-        return found, final_angle, final_dist, final_offset_x, frame
+        return found, final_angle, final_dist, final_offset_x, max_y, frame
 
     def read(self):
         ret, frame = self.cap.read()
@@ -403,7 +404,7 @@ class BrickDetector:
         # Store RAW frame for ML training (clean, no text)
         self.raw_frame = frame.copy()
         
-        found, angle, dist, offset_x, display_frame = self.process_frame(frame)
+        found, final_angle, final_dist, final_offset_x, max_y, display_frame = self.process_frame(frame)
         self.current_frame = display_frame
         
         # SAVE SCREENSHOT IF ENABLED
@@ -415,7 +416,7 @@ class BrickDetector:
         if self.debug and not self.headless and not self.speed_optimize:
             cv2.imshow("Brick Vision Debug", display_frame)
             cv2.waitKey(1)
-        return found, angle, dist, offset_x
+        return found, final_angle, final_dist, final_offset_x, max_y
 
     def save_frame(self, filename):
         if self.current_frame is not None:

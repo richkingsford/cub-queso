@@ -2,12 +2,23 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Lay Bricks (System)",
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "python": "${command:python.interpreterPath}",
+            "env": {
+                "DISPLAY": ":0"
+            }
+        },
+        {
+            "name": "Python: Lay Bricks (Auto)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/lay_bricks.py",
             "console": "integratedTerminal",
-            "python": "/usr/bin/python3",
+            "python": "${command:python.interpreterPath}",
             "env": {
                 "DISPLAY": ":0"
             }

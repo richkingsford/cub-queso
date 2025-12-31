@@ -18,7 +18,7 @@ def crawl_forward_if_aligned(robot, detector):
     3. ONLY if the brick is found AND angle is ~0 -> MOVE FORWARD.
     """
     # 1. Get the latest sensor data
-    found, angle, dist, offset_x = detector.read()
+    found, angle, dist, offset_x, max_y = detector.read()
 
     # 2. SAFETY CHECK: Do we have a lock?
     if not found:
