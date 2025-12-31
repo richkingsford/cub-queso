@@ -15,6 +15,7 @@ from leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveSt
 GEAR_1_SPEED = 0.32
 WEB_PORT = 5001  # Different port to avoid conflict if both run
 HEARTBEAT_RATE = 20 # Hz for internal loop
+SLOWDOWN_FACTOR = 7.0  # Slow down replay by this factor for readability
 
 class AutoplayState:
     def __init__(self):
@@ -66,11 +67,14 @@ def vision_thread():
             app_state.world.update_vision(found, dist, angle, conf, offset_x, max_y)
             
             # Draw HUD
-            frame = app_state.vision.current_frame.copy()
-            messages = [f"AUTO: {app_state.active_objective}", app_state.status_msg]
-            reminders = ["Ctrl+C to ABORT"]
-            draw_telemetry_overlay(frame, app_state.world, messages, reminders, gear=1)
-            app_state.current_frame = frame
+            if app_state.vision.current_frame is not None:
+                frame = app_state.vision.current_frame.copy()
+                messages = [f"AUTO: {app_state.active_objective}", app_state.status_msg]
+                reminders = ["Ctrl+C to ABORT"]
+                draw_telemetry_overlay(frame, app_state.world, messages, reminders, gear=1)
+                app_state.current_frame = frame
+        
+        time.sleep(0.05)  # ~20Hz update rate
 
 def load_demo(session_name):
     path = f"demos/{session_name}/a_log.json"
