@@ -5,6 +5,7 @@ import sys
 import time
 import threading
 import cv2
+import numpy as np
 from flask import Flask, Response
 
 from robot_control import Robot
@@ -13,7 +14,7 @@ from leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveSt
 
 # --- CONFIG ---
 GEAR_1_SPEED = 0.32
-WEB_PORT = 5001  # Different port to avoid conflict if both run
+WEB_PORT = 5000  # Matches recording port for consistency
 HEARTBEAT_RATE = 20 # Hz for internal loop
 SLOWDOWN_FACTOR = 7.0  # Slow down replay by this factor for readability
 
@@ -35,7 +36,10 @@ def generate_frames():
     while True:
         with app_state.lock:
             if app_state.current_frame is None:
-                frame_to_send = None
+                # Create NO SIGNAL placeholder
+                frame_to_send = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(frame_to_send, "NO SIGNAL", (200, 240), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
             else:
                 frame_to_send = app_state.current_frame.copy()
         
@@ -59,8 +63,24 @@ def video_feed():
 
 def vision_thread():
     app_state.vision = BrickDetector(debug=True, speed_optimize=False)
+    consecutive_failures = 0
     while app_state.running:
         found, angle, dist, offset_x, max_y = app_state.vision.read()
+        
+        # dist == -1 is our sentinel for "Hardware Read Error"
+        if not found and dist == -1:
+            consecutive_failures += 1
+            print(f"[VISION] WARNING: Camera read failed! ({consecutive_failures}/5)", flush=True)
+            if consecutive_failures >= 5:
+                print("[VISION] FATAL: Camera connection lost. Aborting script.", flush=True)
+                app_state.running = False
+                # Force exit entire process from thread
+                os._exit(1)
+        else:
+            # If we didn't see a brick (found=False) but hardware IS working (dist=0), 
+            # we do NOT count it as a hardware failure.
+            consecutive_failures = 0
+            
         conf = 100 if found else 0
         
         with app_state.lock:
@@ -145,9 +165,9 @@ def main_autoplay(session_name):
     threading.Thread(target=vision_thread, daemon=True).start()
     threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False), daemon=True).start()
     
-    print(f"\n[AUTOPLAY] Loaded {len(events)} events from {session_name}")
-    print(f"[AUTOPLAY] Safety Check: Defaulting all speeds to GEAR 1 ({GEAR_1_SPEED})")
-    print(f"[AUTOPLAY] Web Stream: http://<robot-ip>:{WEB_PORT}")
+    print(f"\n[AUTOPLAY] Loaded {len(events)} events from {session_name}", flush=True)
+    print(f"[AUTOPLAY] Safety Check: Defaulting all speeds to GEAR 1 ({GEAR_1_SPEED})", flush=True)
+    print(f"[AUTOPLAY] Web Stream: http://<robot-ip>:{WEB_PORT}", flush=True)
     time.sleep(2)
 
     # Group by Objective to show progress
@@ -160,7 +180,7 @@ def main_autoplay(session_name):
             with app_state.lock:
                 app_state.active_objective = current_obj
                 app_state.world.objective_state = ObjectiveState[current_obj]
-            print(f"\n>>> OBJECTIVE: {current_obj}")
+            print(f"\n>>> OBJECTIVE: {current_obj}", flush=True)
 
         event_type = ev['cmd']
         cmd = event_type_to_cmd(event_type)
@@ -174,12 +194,12 @@ def main_autoplay(session_name):
         if cmd in ('u', 'd'):
             speed = min(1.0, speed * 4.0)
             
-        duration = ev['duration']
+        duration = ev['duration'] * SLOWDOWN_FACTOR
         
         with app_state.lock:
             app_state.status_msg = f"Executing: {event_type} ({duration:.2f}s)"
         
-        print(f"  [{i+1}/{len(events)}] {event_type} ({cmd}) for {duration:.2f}s")
+        print(f"\n> {event_type} ({duration:.2f}s)", flush=True)
         
         # Send commands continuously during the duration (like recording script does)
         # Robot CMD_DURATION is 100ms, so we send at ~10Hz

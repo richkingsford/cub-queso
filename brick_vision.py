@@ -30,7 +30,24 @@ class BrickDetector:
     def __init__(self, debug=True, save_folder=None, speed_optimize=False):
         self.debug = debug
         self.speed_optimize = speed_optimize
-        self.headless = True 
+        # Check for Display
+        if not os.environ.get('DISPLAY') and not os.environ.get('WAYLAND_DISPLAY'):
+             self.headless = True
+        else:
+             self.headless = True # Default to True for safety unless explicitly disabled elsewhere, 
+                                  # but code below suggests we want non-headless if debug=True?
+                                  # The original code had `self.headless = True` hardcoded on line 33!
+                                  # Wait, line 33 was: `self.headless = True`
+                                  # And line 61: `except: self.headless = True`
+                                  # Let's make it dynamic based on Config + Environment.
+        
+        # Override if debug is requested but we have a display
+        if self.debug and (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+            self.headless = False
+            
+        # Camera State
+        self.fail_count = 0
+        
         self.save_folder = save_folder
         self.current_frame = None
         self.raw_frame = None
@@ -39,11 +56,33 @@ class BrickDetector:
             try: os.makedirs(self.save_folder)
             except: pass
 
-        self.cap = cv2.VideoCapture(CAMERA_INDEX)
+        # Try to find camera (Indices 0-3) using Default Backend
+        self.cap = None
+        for idx in range(4):
+            print(f"[VISION] Attempting to open Camera {idx}...")
+            temp_cap = cv2.VideoCapture(idx)
+            if temp_cap.isOpened():
+                print(f"[VISION] Success! Connected to Camera {idx}")
+                print(f"[VISION] Backend: {temp_cap.getBackendName()}")
+                self.cap = temp_cap
+                break
+            temp_cap.release()
+            
+        if self.cap is None:
+            print("[VISION] FATAL: Could not find ANY camera (0-3).")
+            # We don't exit here, we let the first read() fail so the main loop handles it
+            self.cap = cv2.VideoCapture(0) # Dummy
+            
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3) 
+        # self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3) # Disabled for stability
         
+        # Warm Up
+        print("[VISION] Warming up (5 frames)...")
+        for i in range(5): 
+            ret, _ = self.cap.read()
+            # Silent warmup
+            
         self.camera_matrix = None
         self.dist_coeffs = np.zeros((4,1))
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
@@ -56,9 +95,11 @@ class BrickDetector:
         
         self.debug_search_zones = []
 
-        if self.debug and not self.speed_optimize:
+        if self.debug and not self.speed_optimize and not self.headless:
             try: cv2.namedWindow("Brick Vision Debug")
-            except: self.headless = True
+            except: 
+                print("[VISION] Warning: Could not create window. Running headless.")
+                self.headless = True
 
     def draw_text_with_bg(self, img, text, pos, font=cv2.FONT_HERSHEY_SIMPLEX, font_scale=0.6, text_color=(255, 255, 255), thickness=1, bg_color=(0, 0, 0)):
         x, y = pos
@@ -399,7 +440,9 @@ class BrickDetector:
 
     def read(self):
         ret, frame = self.cap.read()
-        if not ret: return False, 0, 0, 0
+        if not ret: 
+            # SIGNAL HARDWARE FAILURE with dist = -1
+            return False, 0, -1, 0, 0
         
         # Store RAW frame for ML training (clean, no text)
         self.raw_frame = frame.copy()

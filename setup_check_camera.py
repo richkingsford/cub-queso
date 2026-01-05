@@ -16,7 +16,7 @@ import time
 import argparse
 
 # --- CONFIG ---
-SAVE_FOLDER = os.path.expanduser("~/leia/debug_snaps")
+SAVE_FOLDER = os.path.join(os.getcwd(), "debug_captures")
 
 def find_cameras():
     """Finds all /dev/video* devices."""
