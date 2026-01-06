@@ -68,7 +68,8 @@ def vision_thread():
     app_state.vision = BrickDetector(debug=True, speed_optimize=False)
     consecutive_failures = 0
     while app_state.running:
-        found, angle, dist, offset_x, max_y, conf = app_state.vision.read()
+        # 1. Get the latest sensor data
+        found, angle, dist, offset_x, conf, cam_h = app_state.vision.read()
         
         # dist == -1 is our sentinel for "Hardware Read Error"
         if not found and dist == -1:
@@ -82,7 +83,8 @@ def vision_thread():
             consecutive_failures = 0
             
         with app_state.lock:
-            app_state.world.update_vision(found, dist, angle, conf, offset_x, max_y)
+            # 3. Telemetry Update
+            app_state.world.update_vision(found, dist, angle, conf, offset_x, cam_h)
             
             # --- HUD PROCESSING (OPTIONAL) ---
             if STREAM_ENABLED:
@@ -90,7 +92,7 @@ def vision_thread():
                     frame = app_state.vision.current_frame.copy()
                     messages = [f"AUTO: {app_state.active_objective}", app_state.status_msg]
                     reminders = ["Ctrl+C to ABORT"]
-                    draw_telemetry_overlay(frame, app_state.world, messages, reminders, gear=1)
+                    draw_telemetry_overlay(frame, app_state.world, messages, reminders)
                     app_state.current_frame = frame
         
         time.sleep(0.05)  # ~20Hz update rate
@@ -127,19 +129,24 @@ def load_demo(session_name):
     # --- SUCCESS HEURISTIC EXTRACTION ---
     # Find the vision state at the moment of transition for each objective
     heuristics = {}
-    last_obj = None
+    current_obj = None
+    last_state_entry = None
     
-    for i, entry in enumerate(log_data):
-        obj = entry.get('objective')
-        if not obj: continue
+    for entry in log_data:
+        etype = entry.get('type')
         
-        if obj != last_obj:
-            if last_obj is not None:
+        if etype == 'keyframe':
+            obj_field = entry.get('objective')
+            if obj_field:
+                current_obj = obj_field
+            
+            marker = entry.get('marker')
+            if marker == 'OBJ_SUCCESS' and current_obj and last_state_entry:
                 # --- Success Visibility / Precision ---
-                prev_entry = log_data[i-1]
-                prev_state = prev_entry.get('brick') or {}
-                if last_obj not in heuristics:
-                    heuristics[last_obj] = {
+                prev_state = last_state_entry.get('brick') or {}
+                
+                if current_obj not in heuristics:
+                    heuristics[current_obj] = {
                         'max_offset_x': 0.0,
                         'max_angle': 0.0,
                         'final_visibility': prev_state.get('visible', True),
@@ -147,33 +154,17 @@ def load_demo(session_name):
                         'samples': 0
                     }
                 
-                h = heuristics[last_obj]
+                h = heuristics[current_obj]
                 h['max_offset_x'] = max(h['max_offset_x'], abs(prev_state.get('offset_x', 0)))
                 h['max_angle'] = max(h['max_angle'], abs(prev_state.get('angle', 0)))
                 if prev_state.get('visible') is not None:
                     h['final_visibility'] = prev_state.get('visible')
                 
-                # --- Duration Logging ---
-                start_idx = i - 1
-                while start_idx > 0:
-                    prev_obj = log_data[start_idx-1].get('objective')
-                    if prev_obj != last_obj:
-                        break
-                    start_idx -= 1
-                
-                # Safeguard against missing or null events
-                start_ev = log_data[start_idx].get('last_event') or {}
-                end_ev = prev_entry.get('last_event') or {}
-                
-                start_ts = start_ev.get('timestamp', 0)
-                end_ts = end_ev.get('timestamp', 0)
-                
-                if start_ts and end_ts:
-                    duration_ms = (end_ts - start_ts) * 1000.0
-                    h['max_duration_ms'] = max(h['max_duration_ms'], duration_ms)
-                
                 h['samples'] += 1
-            last_obj = obj
+                # Note: Duration logging logic could be restored here if needed by tracking OBJ_START timestamp
+                
+        elif etype == 'state':
+            last_state_entry = entry
 
     # Final Tuning: If we have heuristics, print them
     print("\n[LEARNED] Objective Success Gates from Demo:", flush=True)
@@ -332,12 +323,12 @@ def main_autoplay(session_name):
             active_cmd = cmd
             active_speed = speed
             
-            if current_obj == "ALIGN":
+            if current_obj == "SCOOP":
                 with app_state.lock:
                     off_x = app_state.world.brick.get('offset_x', 0)
                     visible = app_state.world.brick['visible']
                     # Use learned threshold or default
-                    align_rules = app_state.world.learned_rules.get("ALIGN", {})
+                    align_rules = app_state.world.learned_rules.get("SCOOP", {})
                     tol_off = align_rules.get("max_offset_x", 10.0) * 1.1 # 10% buffer
                 
                 if visible:

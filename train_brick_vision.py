@@ -90,7 +90,7 @@ class BrickDetector:
         # Default fallback
         # Default fallback
         self.search_margin_mm = 6.0
-        self.notch_points_3d = []
+        self.camera_center_offset_px = 0.0
         self.object_points, self.template_contour = self.load_world_model()
         
         self.debug_search_zones = []
@@ -122,6 +122,11 @@ class BrickDetector:
         if WORLD_MODEL_FILE.exists():
             with open(WORLD_MODEL_FILE, 'r') as f:
                 model = json.load(f)
+                
+                # Load Calibration
+                cal = model.get('calibration', {})
+                self.camera_center_offset_px = cal.get('camera_center_offset_px', 0.0)
+
                 c = model['brick']['color']
                 self.hsv_ranges = self.hex_to_hsv_ranges(
                     c.get('hex', '#AE363E'), c.get('hue_margin', 15),
@@ -162,61 +167,65 @@ class BrickDetector:
 
     def calculate_fingerprint_confidence(self, contour, notch_points):
         """
-        Calculates a confidence score (0-100) based on how well the 
-        detected geometry matches a standard brick profile.
+        Calculates confidence scores based on how well the detected geometry
+        matches a standard brick profile.
+        Returns (notch_score, blob_score, reasons)
         """
-        score = 100.0
+        notch_score = 100.0
+        blob_score = 100.0
         reasons = []
 
-        # 1. Bounding Box Analysis
+        # --- 1. BLOB ANALYSIS (Contour only) ---
         x, y, w, h = cv2.boundingRect(contour)
+        aspect_ratio = float(w) / h
+        # Standard brick face is 64x35mm -> ~1.8 aspect ratio
+        # Top down is 64x64mm -> ~1.0 aspect ratio
+        # We accept anything between 0.8 and 2.5 for a "brick-like" blob
+        if not (0.7 < aspect_ratio < 2.8):
+            blob_score -= 40
+            reasons.append(f"Bad Blob Aspect: {aspect_ratio:.2f}")
         
-        # Get Notch Dimensions from the 2D points
+        area = cv2.contourArea(contour)
+        if area < MIN_AREA_THRESHOLD * 1.5:
+            blob_score -= 20
+            reasons.append("Blob Small")
+
+        if notch_points is None:
+            return 0.0, max(0.0, blob_score), reasons
+
+        # --- 2. NOTCH ANALYSIS (Fingerprinting) ---
         # Points: [BL, TL, TR, BR]
         notch_w = np.linalg.norm(notch_points[3] - notch_points[0])
-        notch_h = np.linalg.norm(notch_points[1] - notch_points[0]) # Avg side height
+        notch_h = np.linalg.norm(notch_points[1] - notch_points[0]) 
         notch_center_x = (notch_points[0][0] + notch_points[3][0]) / 2.0
         notch_bottom_y = (notch_points[0][1] + notch_points[3][1]) / 2.0
 
         # --- CHECK A: WIDTH RATIO ---
-        # A standard brick notch is usually 35-50% of the total brick width
         width_ratio = notch_w / float(w)
         expected_width_ratio = 0.45 
         diff_w = abs(width_ratio - expected_width_ratio)
         if diff_w > 0.2: 
-            penalty = (diff_w - 0.2) * 100
-            score -= penalty
+            notch_score -= (diff_w - 0.2) * 100
             reasons.append(f"Bad Width Ratio: {width_ratio:.2f}")
 
-        # --- CHECK B: HEIGHT RATIO (Critical for Hand rejection) ---
-        # The notch is usually short compared to the full brick height (maybe 25-30%)
-        # If the contour includes a hand, H will be huge, so ratio will be tiny (< 0.1)
+        # --- CHECK B: HEIGHT RATIO ---
         height_ratio = notch_h / float(h)
-        expected_height_ratio = 0.25
-        # We penalize heavily if the ratio is too small (contour too tall)
-        if height_ratio < 0.10: 
-            score -= 60 # Massive penalty for "Super Tall" contours (Hand)
-            reasons.append(f"Contour Too Tall (Hand?): {height_ratio:.2f}")
+        # Lenient height check for steeper camera angles (we see the brick top)
+        if height_ratio < 0.05: 
+            notch_score -= 60 
+            reasons.append(f"Contour Too Tall: {height_ratio:.2f}")
         elif height_ratio > 0.60:
-            score -= 40
+            notch_score -= 40
             reasons.append(f"Contour Too Short: {height_ratio:.2f}")
 
         # --- CHECK C: BOTTOM ALIGNMENT ---
-        # The notch bottom should be very close to the contour bottom
         cnt_bottom = y + h
         dist_from_bottom = abs(cnt_bottom - notch_bottom_y)
-        if dist_from_bottom > (h * 0.15): # If notch is "floating" high up
-            score -= 40
-            reasons.append(f"Notch Floating: {dist_from_bottom:.1f}px")
+        if dist_from_bottom > (h * 0.15): 
+            notch_score -= 40
+            reasons.append(f"Notch Floating")
 
-        # --- CHECK D: CENTER ALIGNMENT ---
-        cnt_center_x = x + (w / 2.0)
-        dist_center = abs(cnt_center_x - notch_center_x)
-        if dist_center > (w * 0.2): # Notch should be roughly centered
-            score -= 20
-            reasons.append("Notch Off-Center")
-
-        return max(0.0, score), reasons
+        return max(0.0, notch_score), max(0.0, blob_score), reasons
 
     def get_notch_from_contour(self, mask, contour):
         # 1. Fit Rotated Rectangle
@@ -346,7 +355,7 @@ class BrickDetector:
             
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        found, final_angle, final_dist, final_offset_x, max_y, confidence = False, 0.0, 0.0, 0.0, 0.0, 0.0
+        found, final_angle, final_dist, final_offset_x, confidence, cam_height = False, 0.0, 0.0, 0.0, 0.0, 0.0
         
         for cnt in contours:
             if cv2.contourArea(cnt) < MIN_AREA_THRESHOLD: continue
@@ -366,70 +375,95 @@ class BrickDetector:
         for cnt in clean_contours:
             if cv2.contourArea(cnt) < MIN_AREA_THRESHOLD: continue
             
-            image_points, search_zones = self.get_notch_from_contour(mask, cnt)
+            x, y, w, h_box = cv2.boundingRect(cnt)
+            rect = cv2.minAreaRect(cnt)
+            box = cv2.boxPoints(rect)
+            box = np.int32(box)
             
-            if self.debug and not self.speed_optimize and search_zones:
-                for (zx, zy, zw, zh) in search_zones:
-                    cv2.rectangle(frame, (zx, zy), (zx+zw, zy+zh), (0, 255, 255), 1)
+            # 1. Try Notch-Based Identification
+            image_points, search_zones = self.get_notch_from_contour(mask, cnt)
+            notch_conf, blob_conf, reasons = self.calculate_fingerprint_confidence(cnt, image_points)
 
-            if image_points is not None:
-                # --- CALCULATE CONFIDENCE ---
-                confidence, reasons = self.calculate_fingerprint_confidence(cnt, image_points)
-                # print(f"Conf: {int(confidence)}% | Reasons: {reasons}")
+            # --- DECISION LOGIC ---
+            is_notch_lock = (image_points is not None and notch_conf >= CONFIDENCE_THRESHOLD)
+            is_blob_lock = (not is_notch_lock and blob_conf >= 70.0)
 
-                # Draw Visual Feedback
-                color = (0, 255, 0) if confidence >= CONFIDENCE_THRESHOLD else (0, 0, 255)
+            if is_notch_lock or is_blob_lock:
+                found = True
+                confidence = notch_conf if is_notch_lock else blob_conf
                 
+                # Visuals
+                color = (0, 255, 0) if is_notch_lock else (255, 255, 0) # Green or Cyan
                 if not self.speed_optimize:
-                    epsilon = 0.008 * cv2.arcLength(cnt, True)
-                    approx = cv2.approxPolyDP(cnt, epsilon, True)
-                    cv2.drawContours(frame, [approx], -1, color, 2)
-                    
-                    p_bl, p_tl, p_tr, p_br = image_points
-                    # Draw Notch Box
-                    cv2.line(frame, (int(p_bl[0]), int(p_bl[1])), (int(p_tl[0]), int(p_tl[1])), (0, 165, 255), 2)
-                    cv2.line(frame, (int(p_tr[0]), int(p_tr[1])), (int(p_br[0]), int(p_br[1])), (0, 165, 255), 2)
-                    cv2.line(frame, (int(p_tl[0]), int(p_tl[1])), (int(p_tr[0]), int(p_tr[1])), (0, 165, 255), 2)
-                    cv2.line(frame, (int(p_bl[0]), int(p_bl[1])), (int(p_br[0]), int(p_br[1])), (0, 255, 255), 2) # Angle Line
+                    cv2.drawContours(frame, [box], -1, color, 2)
+                    label = "NOTCH LOCK" if is_notch_lock else "BLOB LOCK"
+                    self.draw_text_with_bg(frame, f"{label} {int(confidence)}%", (int(box[0][0]), int(box[0][1])-10), text_color=color)
 
-                    # Draw Status ONLY if rejected
-                    if confidence < CONFIDENCE_THRESHOLD:
-                         self.draw_text_with_bg(frame, "REJECTED", (int(x), int(y)-10), font_scale=0.6, text_color=color)
-
-                # ONLY RETURN DATA IF CONFIDENCE IS HIGH
-                if confidence >= CONFIDENCE_THRESHOLD:
+                if is_notch_lock:
+                    # High Precision PnP
                     success, rvec, tvec = cv2.solvePnP(
                         self.object_points, image_points, self.camera_matrix, 
                         self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE
                     )
-                    
                     if success:
-                        found = True
                         final_dist = np.linalg.norm(tvec)
-                        final_offset_x = tvec[0][0]
-                        max_y = np.max(image_points[:, 1])
                         
-                        # Simple 2D Angle
-                        p_bl = image_points[0]
-                        p_br = image_points[3]
-                        delta_y = p_br[1] - p_bl[1]
-                        delta_x = p_br[0] - p_bl[0]
-                        final_angle = math.degrees(math.atan2(delta_y, delta_x))
+                        # ESTIMATE CAMERA HEIGHT & Orientation
+                        R, _ = cv2.Rodrigues(rvec)
                         
+                        # The brick's orientation relative to camera
+                        # Extract Yaw (rotation around world Y axis)
+                        # In our PnP setup, the brick's "forward" is world Z
+                        # the brick's "side" is world X.
+                        # We want the rotation around world Y.
+                        # sy = sqrt(R00*R00 + R10*R10)
+                        # yaw = atan2(R21, R22) ... this depends on convention.
+                        # Simpler: The angle of the front edge in 3D projected back.
+                        # Let's use the rotation matrix to find the angle of the X-axis in the XZ plane
+                        # Brick X-axis vector in camera space is the first column of R
+                        brick_x_in_cam = R[:, 0]
+                        # We want the angle of this vector in the camera's XZ plane (ignoring camera Y/Pitch)
+                        final_angle = -math.degrees(math.atan2(brick_x_in_cam[2], brick_x_in_cam[0]))
+                        
+                        cam_pos_world = -np.matrix(R).T @ np.matrix(tvec)
+                        cam_height = float(cam_pos_world[1, 0])
+                        
+                        focal = self.camera_matrix[0,0]
+                        mm_offset_fix = (self.camera_center_offset_px * final_dist) / focal
+                        final_offset_x = tvec[0][0] - mm_offset_fix
+                        
+                        # Debug visuals for notch points
                         if not self.speed_optimize:
-                            # line1 = f"Conf: {int(confidence)}% | Dist: {int(final_dist)}mm"
-                            # line2 = f"Ang: {int(final_angle)}deg | Off: {int(final_offset_x)}mm"
-                            # self.draw_text_with_bg(frame, line1, (10, 20), font_scale=0.35, text_color=(0, 255, 0))
-                            # self.draw_text_with_bg(frame, line2, (10, 40), font_scale=0.35, text_color=(0, 255, 0))
-                            pass
+                            for p in image_points:
+                                cv2.circle(frame, (int(p[0]), int(p[1])), 4, (0, 0, 255), -1)
+                        break
+
+                elif is_blob_lock:
+                    # Fallback Geometry (Centroid & Aspect Width)
+                    (cx, cy), (w_rect, h_rect), angle = rect
+                    # Normalize orientation to [-45, 45] range
+                    if w_rect < h_rect:
+                        w_estimate = h_rect
+                        final_angle = angle + 90
+                    else:
+                        w_estimate = w_rect
+                        final_angle = angle
                         
-                        # LOG ALL METRICS
-                        # print(f"[VISION] LOCKED | Conf: {int(confidence)}% | Dist: {int(final_dist)}mm | Ang: {int(final_angle)}deg | Off: {int(final_offset_x)}mm")
-                        break # Locked on target
-                else:
-                    # If we found a candidate but rejected it, we continue searching 
-                    # other contours, or just finish this frame as "not found"
-                    pass
+                    # Normalize to [-90, 90] then to steerable range
+                    if final_angle > 90: final_angle -= 180
+                    if final_angle < -90: final_angle += 180
+                        
+                    focal = self.camera_matrix[0,0]
+                    final_dist = (64.0 * focal) / w_estimate
+                    
+                    # Offset based on image center + Calibration Offset
+                    img_w = frame.shape[1]
+                    cal_cx = (img_w / 2.0) + self.camera_center_offset_px
+                    final_offset_x = (cx - cal_cx) * (final_dist / focal)
+                    
+                    # Cannot estimate height accurately from blob alone without assumed tilt
+                    cam_height = 0.0 
+                    break
 
         overlay_w, overlay_h = 160, 120
         mask_small = cv2.resize(mask, (overlay_w, overlay_h))
@@ -437,7 +471,7 @@ class BrickDetector:
         cv2.rectangle(mask_color, (0,0), (overlay_w-1, overlay_h-1), (0,255,0), 1)
         frame[0:overlay_h, frame.shape[1]-overlay_w:frame.shape[1]] = mask_color
 
-        return found, final_angle, final_dist, final_offset_x, max_y, frame, confidence
+        return found, final_angle, final_dist, final_offset_x, frame, confidence, cam_height
 
     def read(self):
         ret, frame = self.cap.read()
@@ -448,7 +482,7 @@ class BrickDetector:
         # Store RAW frame for ML training (clean, no text)
         self.raw_frame = frame.copy()
         
-        found, final_angle, final_dist, final_offset_x, max_y, display_frame, confidence = self.process_frame(frame)
+        found, final_angle, final_dist, final_offset_x, display_frame, confidence, cam_height = self.process_frame(frame)
         self.current_frame = display_frame
         
         # SAVE SCREENSHOT IF ENABLED
@@ -464,7 +498,7 @@ class BrickDetector:
         # This prevents 'FIND' from skipping on noise/hands.
         reliable_found = found and confidence > 25
         
-        return reliable_found, final_angle, final_dist, final_offset_x, max_y, confidence
+        return reliable_found, final_angle, final_dist, final_offset_x, confidence, cam_height
 
     def save_frame(self, filename):
         if self.current_frame is not None:

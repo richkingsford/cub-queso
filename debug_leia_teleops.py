@@ -66,15 +66,11 @@ class TeleopManager:
             loop_start = time.time()
             
             # A. Read Vision
-            found, angle, dist, offset_x, max_y = self.vision.read()
+            found, angle, dist, offset_x, conf, cam_h = self.vision.read()
             view_frame = self.vision.current_frame
             
             # Update World Model with Vision
-            # Note: We are using a normalized confidence of 100 if found, else 0 for now 
-            # as brick_vision returns boolean found. To get raw confidence we'd need to update brick_vision,
-            # but for now we assume found=High Confidence.
-            conf = 100 if found else 0
-            self.world.update_vision(found, dist, angle, conf, offset_x, max_y)
+            self.world.update_vision(found, dist, angle, conf, offset_x, cam_h)
             
             # B. Robot Control & Motion Tracking
             if self.state == RobotState.IDLE:

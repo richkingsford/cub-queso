@@ -7,11 +7,11 @@ import time
 import json
 import math
 import os
+import threading
 from enum import Enum
 
 class ObjectiveState(Enum):
     FIND = "FIND"
-    ALIGN = "ALIGN"
     SCOOP = "SCOOP"
     LIFT = "LIFT"
     PLACE = "PLACE"
@@ -63,8 +63,7 @@ class WorldModel:
             "offset_x": 0,
             "confidence": 0,
             "held": False,
-            "seated": False,
-            "perfect_align": False
+            "seated": False
         }
 
         # Forklift
@@ -74,6 +73,10 @@ class WorldModel:
         self._objective_state = None
         self._objective_start_time = 0
         self.objective_state = ObjectiveState.FIND
+        self.attempt_status = "NORMAL" # NORMAL, FAIL, RECOVERY
+        self.run_id = "unset"
+        self.attempt_id = 0
+        self.recording_active = False # For HUD prompt logic (Idle vs Success phase)
         
         # Alignment & Stability
         self.align_tol_angle = 5.0    # +/- Degrees
@@ -98,7 +101,8 @@ class WorldModel:
         # Internal physics constants for dead reckoning (Calibration needed!)
         self.mm_per_sec_full_speed = 200.0 
         self.deg_per_sec_full_speed = 90.0
-        self.lift_mm_per_sec = 20.0
+        self.lift_mm_per_sec = 23.5 # Adjusted for better dead reckoning
+        self.lift_height_anchor = None # The Vision height at Mast=0mm
 
     @property
     def objective_state(self):
@@ -182,13 +186,28 @@ class WorldModel:
             self.lift_height -= self.lift_mm_per_sec * power_ratio * dt
             if self.lift_height < 0: self.lift_height = 0
 
-    def update_vision(self, found, dist, angle, conf, offset_x=0, max_y=0):
-        self.brick["visible"] = found
-        self.brick["dist"] = dist
-        self.brick["angle"] = angle
-        self.brick["confidence"] = conf
-        self.brick["offset_x"] = offset_x
-        self.brick["max_y"] = max_y
+    def update_vision(self, found, dist, angle, conf, offset_x=0, cam_h=0):
+        self.brick["visible"] = bool(found)
+        self.brick["dist"] = float(dist)
+        self.brick["angle"] = float(angle)
+        self.brick["confidence"] = float(conf)
+        self.brick["offset_x"] = float(offset_x)
+        
+        # --- LIFT HEIGHT FUSION ---
+        # If we have a high-confidence vision height (PnP lock), use it to anchor and refine
+        if found and conf > 50 and cam_h > 0:
+            if self.lift_height_anchor is None:
+                # Capture the anchor: VisionHeight - DeadReckonHeight
+                # This assumes dead reckoning is 0 at startup
+                self.lift_height_anchor = cam_h - self.lift_height
+                print(f"[WORLD] Lift Anchor Set: {self.lift_height_anchor:.1f}mm")
+            
+            # Estimated Lift = Vision Altitude - Baseline Altitude
+            vis_lift = cam_h - self.lift_height_anchor
+            
+            # FUSE: 90% Dead Reckon, 10% Vision (Smooth pull)
+            # This keeps the motion fluid but corrects drift/scale errors
+            self.lift_height = (0.9 * self.lift_height) + (0.1 * vis_lift)
         
         # Intelligent Alignment Check
         was_aligned = self.is_aligned()
@@ -270,10 +289,8 @@ class WorldModel:
         return False
 
     def next_objective(self):
-        """Cycles through the 5-step mission: FIND -> ALIGN -> SCOOP -> LIFT -> PLACE"""
+        """Cycles through the 4-step mission: FIND -> SCOOP -> LIFT -> PLACE"""
         if self.objective_state == ObjectiveState.FIND:
-            self.objective_state = ObjectiveState.ALIGN
-        elif self.objective_state == ObjectiveState.ALIGN:
             self.objective_state = ObjectiveState.SCOOP
         elif self.objective_state == ObjectiveState.SCOOP:
             self.objective_state = ObjectiveState.LIFT
@@ -287,12 +304,18 @@ class WorldModel:
 
         return self.objective_state.value
 
+    def get_next_objective_label(self):
+        """Returns the string label of the next objective in sequence."""
+        objs = [o.value for o in ObjectiveState]
+        curr_idx = objs.index(self.objective_state.value)
+        next_idx = (curr_idx + 1) % len(objs)
+        return objs[next_idx]
+
     def reset_mission(self):
         """Resets the objective state and all mission-specific flags."""
         self.objective_state = ObjectiveState.FIND
         self.brick["seated"] = False
         self.brick["held"] = False
-        self.brick["perfect_align"] = False
         self.stability_count = 0
         self.verification_stage = "IDLE"
         self.verify_dist_mm = 0.0
@@ -301,203 +324,231 @@ class WorldModel:
         return self.objective_state.value
 
     def to_dict(self):
-        last_evt_dict = self.last_event.to_dict() if self.last_event else None
         return {
+            "type": "state",
             "timestamp": time.time(),
+            "run_id": self.run_id,
+            "attempt_id": self.attempt_id,
             "robot_pose": {"x": self.x, "y": self.y, "theta": self.theta},
             "wall_origin": self.wall_origin,
             "brick": self.brick,
-            "lift_height": self.lift_height,
-            "objective": self.objective_state.value,
-            "last_event": self.last_event.to_dict() if self.last_event else None,
-            "image_file": self.last_image_file
+            "lift_height": self.lift_height
         }
 
 class TelemetryLogger:
     def __init__(self, filename="leia_log.json"):
         self.filename = filename
+        self.lock = threading.Lock()
+        self.enabled = False # Don't log state until first keyframe
         # Clear old log
         with open(self.filename, 'w') as f:
             f.write("[\n") # Start JSON array
         self.first_entry = True
 
     def log_state(self, world_model: WorldModel):
+        if not self.enabled:
+            return
         data = world_model.to_dict()
-        
-        # 1. Terminal Output (Human Readable)
-        # self._print_terminal(data)
-        
-        # 2. JSON Log
-        with open(self.filename, 'a') as f:
-            if not self.first_entry:
-                f.write(",\n")
-            json.dump(data, f)
-            self.first_entry = False
+        self._write_row(data)
 
-    def log_event(self, event: MotionEvent):
-        # We also append events to the stream or a separate file?
-        # User asked for "State logs (continuous)" and "Motion events".
-        # Let's embed motion events in the continuous log or strictly continuous snapshot?
-        # User said "two aligned logging streams".
-        # For simplicity, I'll log motion events as a special entry in the same JSON list 
-        # but with a different 'record_type' field if I could, but strictly the request 
-        # implies state snapshots at ticks.
-        # I will just log motion events to terminal for now, or add them to the NEXT tick?
-        # Let's write them to the JSON as a separate object for now.
+    def log_keyframe(self, marker, objective=None, timestamp=None):
+        self.enabled = True # Start recording state once we have a semantic marker
+        if timestamp is None:
+            timestamp = time.time()
         
-        event_data = event.to_dict()
-        event_data['record_type'] = 'event'
-        
-        with open(self.filename, 'a') as f:
-            if not self.first_entry:
-                f.write(",\n")
-            json.dump(event_data, f)
-            self.first_entry = False
+        data = {
+            "type": "keyframe",
+            "timestamp": timestamp,
+            "marker": marker
+        }
+        if objective:
+            data["objective"] = objective
+            
+        self._write_row(data)
+
+    def _write_row(self, data):
+        with self.lock:
+            with open(self.filename, 'a') as f:
+                if not self.first_entry:
+                    f.write(",\n")
+                json.dump(data, f)
+                self.first_entry = False
+
+    def log_event(self, event: MotionEvent, objective=None):
+        """Deprecated: Use log_keyframe or rely on log_state for continuous motion."""
+        # For now, we'll map motion events to keyframes if they are semantic
+        semantic_events = ['FAIL', 'RECOVERY_START', 'OBJECTIVE_SUCCESS', 'JOB_SUCCESS', 'JOB_START']
+        if event.action_type in semantic_events:
+            self.log_keyframe(event.action_type, objective, event.timestamp)
+        else:
+            # Low-level motion is already captured in the high-frequency state logs
+            pass
+
+    def close(self):
+        """
+        Consolidated close method that handles JSON array termination.
+        Removes trailing comma if necessary and appends the closing bracket.
+        """
+        with self.lock:
+            if not os.path.exists(self.filename):
+                return
+                
+            try:
+                with open(self.filename, 'rb+') as f:
+                    f.seek(0, os.SEEK_END)
+                    pos = f.tell()
+                    # Search backwards for the last comma
+                    while pos > 0:
+                        pos -= 1
+                        f.seek(pos)
+                        char = f.read(1)
+                        if char == b',':
+                            f.seek(pos)
+                            f.truncate()
+                            break
+                        elif char == b'[': # Empty array case
+                            break
+                    f.seek(0, os.SEEK_END)
+                    f.write(b"\n]\n")
+                print(f"[LOGGER] Log closed: {self.filename}")
+            except Exception as e:
+                print(f"[LOGGER] Error closing log: {e}")
 
     def _print_terminal(self, data):
-        # Clear screen code (optional, maybe too flashy)
-        # print("\033[H\033[J", end="") 
-        
-        p = data['robot_pose']
-        b = data['brick']
-        wall = "SET" if data['wall_origin'] else "UNSET"
+        p = data.get('robot_pose', {'x':0, 'y':0, 'theta':0})
+        b = data.get('brick', {})
+        wall = "SET" if data.get('wall_origin') else "UNSET"
         evt = data.get('last_event')
         
-        print(f"\n{'='*40}")
-        print(f"TIME: {data['timestamp']:.2f}s")
-        print(f"OBJECTIVE: {data['objective']}")
+        print(f"{'='*40}")
+        print(f"TIME: {data.get('timestamp', 0):.2f}s")
+        if 'objective' in data:
+            print(f"OBJECTIVE: {data['objective']}")
         print(f"WALL: {wall}")
         print(f"{'-'*40}")
         print(f"POSE:")
-        print(f"  X: {p['x']:.0f} mm")
-        print(f"  Y: {p['y']:.0f} mm")
-        print(f"  Heading: {p['theta']:.0f}°")
-        print(f"  Lift: {data['lift_height']:.0f} mm")
+        print(f"  X: {p['x']:.2f} mm")
+        print(f"  Y: {p['y']:.2f} mm")
+        print(f"  Heading: {p['theta']:.2f}°")
+        print(f"  Lift: {data.get('lift_height', 0):.2f} mm")
         print(f"{'-'*40}")
         print(f"BRICK:")
-        print(f"  Visible: {b['visible']}")
-        if b['visible']:
-            print(f"  Distance: {b['dist']:.0f} mm")
-            print(f"  Angle: {b['angle']:.1f}°")
-            print(f"  Offset: {b['offset_x']:.1f} mm")
-            print(f"  Confidence: {b['confidence']:.0f}%")
+        print(f"  Visible: {b.get('visible', False)}")
+        if b.get('visible'):
+            print(f"  Distance: {b.get('dist', 0):.2f} mm")
+            print(f"  Angle: {b.get('angle', 0):.2f}°")
+            print(f"  Offset: {b.get('offset_x', 0):.2f} mm")
+            print(f"  Confidence: {b.get('confidence', 0):.2f}%")
         print(f"{'-'*40}")
         
         if evt:
-            age = data['timestamp'] - evt['timestamp']
-            print(f"LAST EVENT: {evt['type']}")
-            print(f"  Power: {evt['power']}")
-            print(f"  Duration: {evt['duration_ms']}ms")
-            print(f"  Age: {age:.1f}s")
+            age = data.get('timestamp', 0) - evt.get('timestamp', 0)
+            print(f"LAST EVENT: {evt.get('type', 'unknown')}")
+            print(f"  Power: {evt.get('power', 0)}")
+            print(f"  Duration: {evt.get('duration_ms', 0):.2f}ms")
+            print(f"  Age: {age:.2f}s")
         else:
             print(f"LAST EVENT: None")
-        print(f"{'='*40}\n")
-
-
-    def close(self):
-        # Remove trailing comma and add closing bracket
-        if os.path.exists(self.filename):
-            with open(self.filename, 'rb+') as f:
-                f.seek(0, os.SEEK_END)
-                pos = f.tell()
-                # Search backwards for the last comma
-                while pos > 0:
-                    pos -= 1
-                    f.seek(pos)
-                    if f.read(1) == b',':
-                        f.seek(pos)
-                        f.truncate()
-                        break
-                f.write(b"\n]")
+        print(f"{'='*40}")
 
 # --- SHARED VISUALIZATION ---
 import cv2
 
-def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, controls=None, gear=None):
+def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders=None, gear=None):
     """
-    Miniaturized HUD renderer with alignment centerline.
+    Simplified HUD renderer.
+    - Merged objective/checklist/status into single-line prompt.
+    - Unified CONTROLS section (White).
+    - Removed gear logic.
     """
     h, w = frame.shape[:2]
     
     # --- COLORS (BGR) ---
-    MAGENTA = (255, 0, 255)
     GREEN = (0, 255, 0)
-    YELLOW = (0, 255, 255)
-    ORANGE = (0, 165, 255) # Bright Orange
     WHITE = (255, 255, 255)
+    ORANGE = (0, 165, 255)
     
-    # 0. Center Alignment Line (Subtle)
-    cv2.line(frame, (w//2, 0), (w//2, h), (100, 100, 100), 1)
+    # 0. Center Alignment Line
+    cal_offset = 0
+    if WORLD_MODEL_FILE.exists():
+        try:
+            with open(WORLD_MODEL_FILE, 'r') as f:
+                cal_offset = json.load(f).get('calibration', {}).get('camera_center_offset_px', 0)
+        except: pass
+    cv2.line(frame, (w//2 + cal_offset, 0), (w//2 + cal_offset, h), (60, 60, 60), 1)
 
-    # 1. Background Panel (Left Side) - Darker
+    # 1. Background Panel (Left Side)
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (220, h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
     
-    # 2. Text Config
+    # 2. Text Setup
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.35 # ~30% smaller than 0.5
-    bold = 1 # Boldness is more sensitive at smaller scales
+    scale = 0.38
+    thickness = 1 # No bolding, as it gets fuzzy
     x_base = 12
     y_cur = 25
-    line_h = 18 # Tighter spacing
+    line_h = 20
     
-    # 2.5 Big State Line (Prominent)
-    state_txt = f"STATE: {wm.objective_state.value}"
-    cv2.putText(frame, state_txt, (x_base, y_cur+5), font, 0.6, GREEN, 2)
-    y_cur += 35 # Extra space for the big state
-    
-    def put_line(txt, c=WHITE, s=scale, thickness=bold):
+    def put_line(txt, c=WHITE, s=scale, th=thickness):
         nonlocal y_cur
-        cv2.putText(frame, txt, (x_base, y_cur), font, s, c, thickness)
+        cv2.putText(frame, txt, (x_base, y_cur), font, s, c, th)
         y_cur += line_h
 
-    # 3. Objective Dashboard (Top - Magenta)
-    # (Simplified: List removed as requested)
+    # 3. MERGED STATE & PROMPT
+    state_label = wm.objective_state.value
+    status_label = f" ({wm.attempt_status})" if wm.attempt_status != "NORMAL" else ""
+    put_line(f"OBJ: {state_label}{status_label}", GREEN, 0.45, 1) # Objective Header
     
-    y_cur += 8 # Spacer
+    # Prompts based on attempt status and recording state
+    if wm.attempt_status == "NORMAL":
+        if not wm.recording_active:
+            prompt = f"Press 'f' to BEGIN {state_label} (FAIL version)"
+        else:
+            prompt = f"Show clean {state_label} (+ Press 'f' when done)"
+    elif wm.attempt_status == "FAIL":
+        prompt = f"Press 'f' to BEGIN RECOVERY for {state_label}"
+    elif wm.attempt_status == "RECOVERY":
+        prompt = f"Press 'f' to finish recovery & start SUCCESS demo"
+    else:
+        prompt = f"Current focus: {state_label}"
     
-    # 4. Pose & Lift (Green)
-    put_line(f"X: {wm.x:.1f} mm", GREEN)
-    put_line(f"Y: {wm.y:.1f} mm", GREEN)
-    put_line(f"H: {wm.theta:.1f} deg", GREEN)
-    put_line(f"LIFT: {wm.lift_height:.1f} mm", GREEN)
+    # Override with specific override if provided (e.g. from Keyboard Demo)
+    if extra_messages:
+        if isinstance(extra_messages, list): prompt = extra_messages[-1]
+        else: prompt = extra_messages
+
+    put_line(prompt, (0, 255, 255), 0.38, 1)
+    y_cur += 10
+
+    # 4. Position Info
+    put_line("--- TELEMETRY ---", WHITE, 0.35, 1)
+    put_line(f"OFFSET: {wm.brick['offset_x']:.1f} mm", GREEN, 0.38, 1)
+    put_line(f"ANGLE:  {wm.brick['angle']:.1f} deg", GREEN, 0.38, 1)
+    put_line(f"DIST:   {wm.brick['dist']:.0f} mm", GREEN, 0.38, 1)
+    put_line(f"LIFT:   {wm.lift_height:.0f} mm", GREEN, 0.38, 1)
     
-    y_cur += 8 # Spacer
-    
-    # 5. Vision Data (Orange)
+    # 5. CONTROLS (Moved up below telemetry)
+    y_cur += 10
+    put_line("--- CONTROLS ---", WHITE, 0.35, 1)
+    put_line("W/S: DRIVE (Fwd/Bwd)", WHITE, 0.35, 1)
+    put_line("A/D: TURN (Left/Right)", WHITE, 0.35, 1)
+    put_line("P/L: MAST (Up/Down)", WHITE, 0.35, 1)
+    put_line("F: NEXT ACTION Cycle", WHITE, 0.35, 1)
+    put_line("Q: QUIT", WHITE, 0.35, 1)
+
+    # 6. Vision Info
+    y_cur += 15
     vis_txt = "VISION: LOCKED" if wm.brick['visible'] else "VISION: SEARCHING"
     vis_col = ORANGE if wm.brick['visible'] else (0, 0, 255)
-    put_line(vis_txt, vis_col, 0.35, 1)
+    put_line(vis_txt, vis_col, 0.38, 1)
     
-    if wm.brick['visible']:
-        put_line(f" CONF: {wm.brick['confidence']}%", ORANGE)
-        put_line(f" DIST: {wm.brick['dist']:.0f} mm", ORANGE)
-        put_line(f" ANG: {wm.brick['angle']:.1f} deg", ORANGE)
-        put_line(f" OFF: {wm.brick['offset_x']:.1f} mm", ORANGE)
-    
-    y_cur += 8 # Spacer
-    
-    # 6. Action (Magenta)
+    # 7. Action Tracking
+    y_cur += 10
     if wm.last_event:
-        evt = wm.last_event
-        put_line(f"ACTION: {evt.action_type}", MAGENTA)
-        put_line(f"PWR: {evt.power} ({evt.duration_ms}ms)", MAGENTA)
+        put_line(f"ACT: {wm.last_event.action_type}", (255, 0, 255), 0.35, 1)
     else:
-        put_line("ACTION: IDLE", MAGENTA)
-    
-    y_cur += 8 # Spacer
-    
-    # 7. Alignment / Status Sub-Dashboard (Alternative to Banners)
-    if wm.brick.get("perfect_align"):
-        put_line("ALIGN: PERFECT", (0, 215, 255), thickness=2)
-    elif wm.is_aligned():
-        put_line("ALIGN: LOCKED", GREEN, thickness=1)
-    else:
-        put_line("ALIGN: SEARCHING", (100, 100, 100))
-        
-    if wm.brick["seated"]:
-        put_line("BRICK: SEATED", (0, 0, 150), thickness=2)
+        put_line("ACT: IDLE", (100, 100, 100), 0.35, 1)
 
     # 7b. Verification Progress
     if wm.verification_stage != "IDLE":
@@ -507,16 +558,10 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, controls=
 
     # 8. Extra Messages (Banners -> Moved to Sidebar)
     if extra_messages:
+        y_cur = h - 20
         for msg in extra_messages:
-            put_line(msg, GREEN, scale, 1)
+             put_line(f"! {msg}", (0, 0, 255), 0.4, 2)
 
-
-
-
-
-    # 9. GEAR & CONTROLS (Yellow - Bottom Left)
-    y_cur = h - 15
-    if controls:
-        for msg in reversed(controls):
-            cv2.putText(frame, msg, (x_base, y_cur), font, 0.35, YELLOW, 1)
-            y_cur -= 15
+    # 9. GEAR Display
+    if gear:
+        cv2.putText(frame, f"GEAR: {gear}", (x_base, h - 35), font, 0.4, YELLOW, 2)

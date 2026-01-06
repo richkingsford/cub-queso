@@ -1,11 +1,3 @@
-"""
-# train_demo_keyboard.py
------------------------
-Keyboard-based version of the demo recorder.
-Runs on the Jetson. 
-Uses W/A/S/D/P/L for slow, precise control.
-NON-STICKY: Robot only moves while keys are held/tapped.
-"""
 import sys
 import threading
 import time
@@ -13,6 +5,7 @@ import os
 import tty
 import termios
 import cv2
+import numpy as np
 from flask import Flask, Response
 
 from robot_control import Robot
@@ -21,46 +14,9 @@ from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, Objec
  
 # --- CONFIG ---
 LOG_RATE_HZ = 10
-WEB_PORT = 5000
 GEAR_1_SPEED = 0.32  # 4x faster per user request
 GEAR_9_SPEED = 1.0   # 100% capacity
 HEARTBEAT_TIMEOUT = 0.3 # Stop if no key for 0.3s
-
-# --- FLASK ---
-flask_app = Flask(__name__)
-# Global-ish for generator
-_stream_state = None 
-
-def generate_frames():
-    while True:
-        if _stream_state is None:
-            time.sleep(0.1)
-            continue
-            
-        with _stream_state.lock:
-            if _stream_state.current_frame is None:
-                frame_to_send = None
-            else:
-                frame_to_send = _stream_state.current_frame.copy()
-        
-        if frame_to_send is None:
-            time.sleep(0.05)
-            continue
-
-        (flag, encodedImage) = cv2.imencode(".jpg", frame_to_send)
-        if not flag:
-            continue
-        
-        yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + 
-              bytearray(encodedImage) + b'\r\n')
-
-@flask_app.route("/")
-def index():
-    return "<html><body style='background:#111; color:#eee; font-family:sans-serif; text-align:center;'><h1>Robot Eyes (Keyboard Mode)</h1><img src='/video_feed' style='border:2px solid #555; border-radius:10px;'></body></html>"
-
-@flask_app.route("/video_feed")
-def video_feed():
-    return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 class AppState:
     def __init__(self):
@@ -77,35 +33,84 @@ class AppState:
         self.job_abort = False
         self.job_abort_timer = 0
         
-        # Speed Gears
-        self.current_gear = 1 # 1-9
+        # Job Status
         
         self.lock = threading.Lock()
+        self.current_frame = None
+        self.internal_step = "START_ERROR" # START_ERROR, START_RECOVERY, START_SUCCESS, FINISH_OBJ
         
         # Session Setup
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.session_dir = os.path.join(os.getcwd(), "demos", f"kbd_{timestamp}")
-        if not os.path.exists(self.session_dir):
-            os.makedirs(self.session_dir)
+        self.demos_dir = os.path.join(os.getcwd(), "demos")
+        if not os.path.exists(self.demos_dir):
+            os.makedirs(self.demos_dir)
             
-        print(f"[SESSION] Recording Keyboard Demo to: {self.session_dir}")
-        print("CONTROLS (Hold or tap rapidly):")
+        log_path = os.path.join(self.demos_dir, f"kbd_{timestamp}.json")
+        print(f"[SESSION] Recording Keyboard Demo to: {log_path}")
         print("  W/S: Forward/Backward          |  A/D: Turn Left/Right")
         print("  P/L: Lift Up/Down")
-        print("  Y: Start Job           |  K: Success (End)")
-        print("  J: Abort Job           |  X: Cycle Objective")
-        print("  1-9: Change Speed Gear")
+        print("  F: NEXT ACTION (Fail -> Recover -> Success -> Next Objective)")
         print("  Q: Quit")
         
         # Telemetry
         self.world = WorldModel()
-        log_path = os.path.join(self.session_dir, "a_log.json")
         self.logger = TelemetryLogger(log_path)
+        
+        # ID Init
+        self.world.run_id = f"run_{timestamp}"
+        self.world.attempt_id = 1
+
         self.vision = None
         self.robot = None
+
+# --- WEB STREAMING ---
+web_app = Flask(__name__)
+app_state_ref = None
+
+def generate_frames(app_state):
+    while app_state.running:
+        with app_state.lock:
+            if app_state.current_frame is None:
+                # Placeholder if no frame yet
+                frame_to_send = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(frame_to_send, "WAITING FOR CAMERA...", (120, 240), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            else:
+                frame_to_send = app_state.current_frame.copy()
         
-        # Video
-        self.current_frame = None
+        (flag, encodedImage) = cv2.imencode(".jpg", frame_to_send)
+        if not flag:
+            continue
+        
+        yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + 
+              bytearray(encodedImage) + b'\r\n')
+
+@web_app.route("/")
+def index():
+    return """
+    <html>
+        <head>
+            <title>Robot Leia - Keyboard Training</title>
+            <style>
+                body { background: #1a1a1a; color: #eee; font-family: sans-serif; text-align: center; margin-top: 50px; }
+                .stream-container { display: inline-block; border: 5px solid #333; border-radius: 8px; overflow: hidden; }
+                h1 { color: #f0ad4e; }
+            </style>
+        </head>
+        <body>
+            <h1>Robot Leia - Keyboard Training</h1>
+            <div class="stream-container">
+                <img src="/video_feed" width="800">
+            </div>
+            <p>Use the terminal for controls. Keep this window open to see the live feed.</p>
+        </body>
+    </html>
+    """
+
+@web_app.route("/video_feed")
+def video_feed():
+    return Response(generate_frames(app_state_ref), 
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
 
 def getch():
     """Reads a single character from stdin in raw mode."""
@@ -142,60 +147,86 @@ def keyboard_thread(app_state):
             elif ch == 'l':
                 app_state.active_command = 'd'
             
-            # JOB CONTROL (Single Taps)
-            # MISSION STATE CONTROL
-            elif ch == 'r':
-                app_state.world.reset_mission()
-                app_state.job_start = True
-                app_state.job_start_timer = time.time()
-                app_state.job_success = False
-                app_state.job_abort = False
-                evt = MotionEvent("JOB_START", 0, 0)
-                app_state.world.update_from_motion(evt)
-                print(f"\n[EVENT] Objective: FIND (New Job Started)")
-            elif ch == 't':
-                app_state.world.objective_state = ObjectiveState.ALIGN
-                print(f"\n[EVENT] Objective: ALIGN")
-            elif ch == 'y': 
-                app_state.world.objective_state = ObjectiveState.SCOOP
-                print(f"\n[EVENT] Objective: SCOOP")
-            elif ch == 'u':
-                app_state.world.objective_state = ObjectiveState.LIFT
-                print(f"\n[EVENT] Objective: LIFT")
-            elif ch == 'i':
-                app_state.world.objective_state = ObjectiveState.PLACE
-                print(f"\n[EVENT] Objective: PLACE")
-            
-            # JOB CONTROL
-            elif ch == 'g': # 'G' for GO / START
-                app_state.job_start = True
-                app_state.job_start_timer = time.time()
-                app_state.world.reset_mission()
-                evt = MotionEvent("JOB_START", 0, 0)
-                app_state.world.update_from_motion(evt)
-                print("\n[EVENT] JOB STARTED")
-            elif ch == 'k':
-                app_state.job_success = True
-                app_state.job_success_timer = time.time()
-                evt = MotionEvent("JOB_SUCCESS", 0, 0)
-                app_state.world.update_from_motion(evt)
-                print("\n[EVENT] JOB SUCCESS")
-            elif ch == 'j':
-                app_state.job_abort = True
-                app_state.job_abort_timer = time.time()
-                app_state.world.reset_mission()
-                evt = MotionEvent("JOB_ABORT", 0, 0)
-                app_state.world.update_from_motion(evt)
-                print("\n[EVENT] JOB ABORTED")
-            
-            # GEARS (1-9)
-            elif ch in '123456789':
-                app_state.current_gear = int(ch)
-                print(f"\n[GEAR] Switched to Gear {app_state.current_gear}")
+            # JOB CONTROL (Single Taps - Refactored to 'f')
+            elif ch == 'f':
+                obj = app_state.world.objective_state.value
+                
+                if app_state.internal_step == "START_ERROR":
+                    # --- Start Objective and Mark FAIL Start ---
+                    app_state.world.recording_active = True
+                    app_state.logger.log_keyframe("OBJ_START", obj)
+                    app_state.logger.log_keyframe("FAIL_START", obj)
+                    
+                    app_state.world.attempt_status = "FAIL"
+                    evt = MotionEvent("FAIL", 0, 0)
+                    app_state.world.update_from_motion(evt)
+                    print(f"[{obj}] -> FAIL_START (Mistake Started)")
+                    app_state.internal_step = "START_RECOVERY"
+                    
+                elif app_state.internal_step == "START_RECOVERY":
+                    # --- End FAIL, Start RECOVER ---
+                    app_state.logger.log_keyframe("FAIL_END", obj)
+                    app_state.logger.log_keyframe("RECOVER_START", obj)
+                    
+                    app_state.world.attempt_status = "RECOVERY"
+                    evt = MotionEvent("RECOVERY_START", 0, 0)
+                    app_state.world.update_from_motion(evt)
+                    print(f"[{obj}] -> RECOVER_START (Recovery Started)")
+                    app_state.internal_step = "START_SUCCESS"
+                    
+                elif app_state.internal_step == "START_SUCCESS":
+                    # --- End RECOVER, Start SUCCESS Demo ---
+                    app_state.logger.log_keyframe("RECOVER_END", obj)
+                    app_state.logger.log_keyframe("SUCCESS_START", obj)
+                    
+                    app_state.world.attempt_status = "NORMAL"
+                    print(f"[{obj}] -> SUCCESS_START (Clean Run Started)")
+                    app_state.internal_step = "FINISH_OBJ"
+
+                elif app_state.internal_step == "FINISH_OBJ":
+                    # --- End SUCCESS, Wrap Objective ---
+                    app_state.logger.log_keyframe("SUCCESS_END", obj)
+                    app_state.logger.log_keyframe("OBJ_SUCCESS", obj)
+                    
+                    # Pause high-freq state logging until next objective starts
+                    app_state.logger.enabled = False
+                    app_state.world.recording_active = False
+                    
+                    app_state.world.attempt_status = "NORMAL"
+                    
+                    old_obj_enum = app_state.world.objective_state
+                    if old_obj_enum == ObjectiveState.PLACE:
+                        # Job Complete
+                        app_state.job_success = True
+                        app_state.job_success_timer = time.time()
+                        app_state.logger.log_keyframe("JOB_SUCCESS")
+                        
+                        evt = MotionEvent("JOB_SUCCESS", 0, 0)
+                        app_state.world.update_from_motion(evt)
+                        print("[JOB] SUCCESS - Preparing next run...")
+                        
+                        # Reset for Next Job
+                        app_state.world.reset_mission()
+                        app_state.world.attempt_id += 1 
+                        app_state.logger.log_keyframe("JOB_START")
+                        
+                        app_state.job_start = True
+                        app_state.job_start_timer = time.time()
+                        evt_start = MotionEvent("JOB_START", 0, 0)
+                        app_state.world.update_from_motion(evt_start)
+                    else:
+                        # Move to Next Objective
+                        evt = MotionEvent("OBJECTIVE_SUCCESS", 0, 0)
+                        app_state.world.update_from_motion(evt)
+                        new_obj = app_state.world.next_objective()
+                        print(f"[EVENT] Objective Transition -> {new_obj}")
+                    
+                    app_state.internal_step = "START_ERROR"
 
 def control_loop(app_state):
     app_state.robot = Robot()
-    app_state.vision = BrickDetector(debug=True, speed_optimize=False) # Changed to False for better visualization
+    # speed_optimize=False so we get the debug markers drawn on the frame
+    app_state.vision = BrickDetector(debug=True, speed_optimize=False)
     
     dt = 1.0 / LOG_RATE_HZ
     was_moving = False
@@ -209,18 +240,15 @@ def control_loop(app_state):
                 app_state.active_command = None
                 app_state.active_speed = 0.0
             
-            # Dynamic Speed Calculation based on Gear
-            # Gear 1 = 0.32, Gear 9 = 1.0
-            gear_ratio = (app_state.current_gear - 1) / 8.0
-            gear_speed = 0.32 + gear_ratio * (1.0 - 0.32)
+            # Fixed speed based on Gear 1
+            gear_speed = GEAR_1_SPEED
             
             cmd = app_state.active_command
             if cmd:
-                # Assign speed based on gear
                 speed = gear_speed
                 if cmd in ('u', 'd'):
                     speed = min(1.0, speed * 4.0)
-                app_state.active_speed = speed # Update state for telemetry
+                app_state.active_speed = speed 
             else:
                 speed = 0.0
                 app_state.active_speed = 0.0
@@ -233,10 +261,22 @@ def control_loop(app_state):
             was_moving = False
             
         # 2. Vision
-        found, angle, dist, offset_x, max_y, conf = app_state.vision.read()
+        found, angle, dist, offset_x, conf, cam_h = app_state.vision.read()
         
         # 3. Telemetry Update
-        app_state.world.update_vision(found, dist, angle, conf, offset_x, max_y)
+        app_state.world.update_vision(found, dist, angle, conf, offset_x, cam_h)
+        
+        # 4. Update Web Stream Frame
+        if app_state.vision.current_frame is not None:
+            # Create a copy and draw our rich HUD
+            frame = app_state.vision.current_frame.copy()
+            
+            with app_state.lock:
+                draw_telemetry_overlay(
+                    frame, 
+                    app_state.world
+                )
+                app_state.current_frame = frame
         
         # Track Motion
         if cmd and speed > 0:
@@ -252,58 +292,30 @@ def control_loop(app_state):
             evt = MotionEvent(atype, pwr, int(dt*1000))
             app_state.world.update_from_motion(evt)
             
-        # 4. Save Raw Frame & Log
-        if app_state.vision.raw_frame is not None:
-            ts_ns = time.time_ns()
-            img_name = f"frame_{ts_ns}.jpg"
-            img_path = os.path.join(app_state.session_dir, img_name)
-            cv2.imwrite(img_path, app_state.vision.raw_frame)
-            app_state.world.last_image_file = img_name
-        
-        # Log state with lock to ensure objective_state is read atomically
+        # 5. Save Log (Image saving removed)
         with app_state.lock:
             app_state.logger.log_state(app_state.world)
-        
-        # 5. Draw HUD for Web Stream
-        # Use standardized telemetry overlay
-        if app_state.vision.current_frame is not None:
-            view_frame = app_state.vision.current_frame.copy()
-            
-            messages = []
-            if app_state.job_start and time.time() - app_state.job_start_timer < 3.0:
-                messages.append("JOB STARTED")
-            if app_state.job_success and time.time() - app_state.job_success_timer < 5.0:
-                messages.append("JOB COMPLETE!")
-            if app_state.job_abort and time.time() - app_state.job_abort_timer < 3.0:
-                messages.append("JOB ABORTED")
-                
-            reminders = [
-                f"W: Drive | P/L: Mast | 1-9: Gears ({app_state.current_gear})",
-                "R: New Job / Find"
-            ]
-                
-            draw_telemetry_overlay(view_frame, app_state.world, messages, reminders, gear=app_state.current_gear)
-            
-            with app_state.lock:
-                app_state.current_frame = view_frame
         
         # 6. Rate Limiting
         elapsed = time.time() - loop_start
         if elapsed < dt:
             time.sleep(dt - elapsed)
 
-
 if __name__ == "__main__":
     state = AppState()
-    _stream_state = state
-    
-    # Web thread
-    t_web = threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=WEB_PORT, debug=False, use_reloader=False), daemon=True)
-    t_web.start()
     
     # Keyboard thread
     kb_t = threading.Thread(target=keyboard_thread, args=(state,), daemon=True)
     kb_t.start()
+    
+    # Web Stream thread
+    app_state_ref = state
+    stream_t = threading.Thread(
+        target=lambda: web_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False),
+        daemon=True
+    )
+    stream_t.start()
+    print(f"\n[VISION] Stream started at http://localhost:5000")
     
     try:
         control_loop(state)

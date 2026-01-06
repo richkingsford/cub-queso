@@ -23,8 +23,7 @@ from train_brick_vision import BrickDetector
 from robot_leia_telemetry import WorldModel, draw_telemetry_overlay
 
 # --- CONFIG ---
-GEAR_1_SPEED = 0.32 
-GEAR_9_SPEED = 1.0
+ROBOT_SPEED = 0.32 
 HEARTBEAT_TIMEOUT = 0.3 
 
 class TestState:
@@ -32,7 +31,6 @@ class TestState:
         self.running = True
         self.active_command = None
         self.active_speed = 0.0
-        self.current_gear = 1
         self.last_key_time = 0
         self.current_frame = None
         self.world = WorldModel()
@@ -67,15 +65,15 @@ def video_feed():
 def vision_thread(state):
     detector = BrickDetector(debug=True, speed_optimize=False)
     while state.running:
-        found, angle, dist, offset_x, max_y, conf = detector.read()
+        found, angle, dist, offset_x, conf, h = detector.read()
         
         with state.lock:
-            state.world.update_vision(found, dist, angle, conf, offset_x, max_y)
+            state.world.update_vision(found, dist, angle, conf, offset_x, h)
             if detector.current_frame is not None:
                 frame = detector.current_frame.copy()
-                messages = ["MODE: MANUAL DEBUG", f"GEAR: {state.current_gear}"]
+                messages = ["MODE: MANUAL DEBUG"]
                 reminders = ["W/A/S/D to move", "Q to quit"]
-                draw_telemetry_overlay(frame, state.world, messages, reminders, gear=state.current_gear)
+                draw_telemetry_overlay(frame, state.world, messages, reminders)
                 state.current_frame = frame
         time.sleep(0.05)
 
@@ -115,10 +113,7 @@ def keyboard_thread(state):
             elif ch == 'l':
                 state.active_command = 'd'
             
-            # GEARS
-            elif ch in '123456789':
-                state.current_gear = int(ch)
-                print(f"\n[GEAR] Gear {state.current_gear}")
+            # MOVEMENT
 
 def main():
     state = TestState()
@@ -140,33 +135,49 @@ def main():
     kb_t.start()
     
     was_moving = False
+    dt = 0.05 # 20Hz update
     
     try:
         while state.running:
+            loop_start = time.time()
+            
             with state.lock:
                 # Heartbeat check
                 if time.time() - state.last_key_time > HEARTBEAT_TIMEOUT:
                     state.active_command = None
                     state.active_speed = 0.0
                 
-                # Gear Speed
-                gear_ratio = (state.current_gear - 1) / 8.0
-                gear_speed = GEAR_1_SPEED + gear_ratio * (GEAR_9_SPEED - GEAR_1_SPEED)
+                # Fixed speed based on Gear 1
+                speed = GEAR_1_SPEED
                 
                 cmd = state.active_command
-                if cmd:
-                    speed = gear_speed
-                else:
-                    speed = 0.0
             
             if cmd and speed > 0:
                 robot.send_command(cmd, speed)
                 was_moving = True
+                
+                # TRACK MOTION for Telemetry
+                atype = "unknown"
+                if cmd == 'f': atype = "forward"
+                elif cmd == 'b': atype = "backward"
+                elif cmd == 'l': atype = "left_turn"
+                elif cmd == 'r': atype = "right_turn"
+                elif cmd == 'u': atype = "mast_up"
+                elif cmd == 'd': atype = "mast_down"
+                
+                pwr = int(speed * 255)
+                # Use current dt for duration
+                evt = MotionEvent(atype, pwr, int(dt * 1000))
+                with state.lock:
+                    state.world.update_from_motion(evt)
             elif was_moving:
                 robot.stop()
                 was_moving = False
             
-            time.sleep(0.05) # 20Hz update
+            # Rate Limiting
+            elapsed = time.time() - loop_start
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
             
     except KeyboardInterrupt:
         pass

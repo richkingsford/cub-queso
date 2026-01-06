@@ -166,19 +166,6 @@ def handle_command(cmd_str):
     except: 
         app_state.active_speed = 0.0
 
-    # MOVEMENT
-    # Format: <char> <speed> <dur>
-    # Note: Client sends "f 200 50", we just need 'f' and speed ratio.
-    if len(parts) < 2: return
-    
-    app_state.active_command = cmd
-    
-    try:
-        val = int(parts[1])
-        app_state.active_speed = val / 255.0
-    except: 
-        app_state.active_speed = 0.0
-
 # --- MAIN CONTROL LOOP ---
 def control_loop():
     print("[SYSTEM] Starting Control Loop...")
@@ -211,11 +198,11 @@ def control_loop():
             pass
         
         # 3. Vision
-        found, angle, dist, offset_x, max_y, conf = app_state.vision.read()
+        found, angle, dist, offset_x, conf, cam_h = app_state.vision.read()
         view_frame = app_state.vision.current_frame
         
         # 4. Telemetry Update
-        app_state.world.update_vision(found, dist, angle, conf, offset_x, max_y)
+        app_state.world.update_vision(found, dist, angle, conf, offset_x, cam_h)
         
         # Track Motion
         if app_state.active_command and app_state.active_speed > 0.05:
@@ -274,6 +261,7 @@ def main():
         if app_state.robot: app_state.robot.close()
         if app_state.vision: app_state.vision.close()
         app_state.logger.close()
+        print("\nShutdown complete.")
 
 if __name__ == "__main__":
     main()
