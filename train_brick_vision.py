@@ -346,7 +346,7 @@ class BrickDetector:
             
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        found, final_angle, final_dist, final_offset_x, max_y = False, 0.0, 0.0, 0.0, 0.0
+        found, final_angle, final_dist, final_offset_x, max_y, confidence = False, 0.0, 0.0, 0.0, 0.0, 0.0
         
         for cnt in contours:
             if cv2.contourArea(cnt) < MIN_AREA_THRESHOLD: continue
@@ -375,7 +375,7 @@ class BrickDetector:
             if image_points is not None:
                 # --- CALCULATE CONFIDENCE ---
                 confidence, reasons = self.calculate_fingerprint_confidence(cnt, image_points)
-                print(f"Conf: {int(confidence)}% | Reasons: {reasons}")
+                # print(f"Conf: {int(confidence)}% | Reasons: {reasons}")
 
                 # Draw Visual Feedback
                 color = (0, 255, 0) if confidence >= CONFIDENCE_THRESHOLD else (0, 0, 255)
@@ -417,13 +417,14 @@ class BrickDetector:
                         final_angle = math.degrees(math.atan2(delta_y, delta_x))
                         
                         if not self.speed_optimize:
-                            line1 = f"Conf: {int(confidence)}% | Dist: {int(final_dist)}mm"
-                            line2 = f"Ang: {int(final_angle)}deg | Off: {int(final_offset_x)}mm"
-                            self.draw_text_with_bg(frame, line1, (10, 20), font_scale=0.35, text_color=(0, 255, 0))
-                            self.draw_text_with_bg(frame, line2, (10, 40), font_scale=0.35, text_color=(0, 255, 0))
+                            # line1 = f"Conf: {int(confidence)}% | Dist: {int(final_dist)}mm"
+                            # line2 = f"Ang: {int(final_angle)}deg | Off: {int(final_offset_x)}mm"
+                            # self.draw_text_with_bg(frame, line1, (10, 20), font_scale=0.35, text_color=(0, 255, 0))
+                            # self.draw_text_with_bg(frame, line2, (10, 40), font_scale=0.35, text_color=(0, 255, 0))
+                            pass
                         
                         # LOG ALL METRICS
-                        print(f"[VISION] LOCKED | Conf: {int(confidence)}% | Dist: {int(final_dist)}mm | Ang: {int(final_angle)}deg | Off: {int(final_offset_x)}mm")
+                        # print(f"[VISION] LOCKED | Conf: {int(confidence)}% | Dist: {int(final_dist)}mm | Ang: {int(final_angle)}deg | Off: {int(final_offset_x)}mm")
                         break # Locked on target
                 else:
                     # If we found a candidate but rejected it, we continue searching 
@@ -436,18 +437,18 @@ class BrickDetector:
         cv2.rectangle(mask_color, (0,0), (overlay_w-1, overlay_h-1), (0,255,0), 1)
         frame[0:overlay_h, frame.shape[1]-overlay_w:frame.shape[1]] = mask_color
 
-        return found, final_angle, final_dist, final_offset_x, max_y, frame
+        return found, final_angle, final_dist, final_offset_x, max_y, frame, confidence
 
     def read(self):
         ret, frame = self.cap.read()
         if not ret: 
             # SIGNAL HARDWARE FAILURE with dist = -1
-            return False, 0, -1, 0, 0
+            return False, 0, -1, 0, 0, 0
         
         # Store RAW frame for ML training (clean, no text)
         self.raw_frame = frame.copy()
         
-        found, final_angle, final_dist, final_offset_x, max_y, display_frame = self.process_frame(frame)
+        found, final_angle, final_dist, final_offset_x, max_y, display_frame, confidence = self.process_frame(frame)
         self.current_frame = display_frame
         
         # SAVE SCREENSHOT IF ENABLED
@@ -455,11 +456,15 @@ class BrickDetector:
              timestamp = int(time.time() * 1000)
              filename = os.path.join(self.save_folder, f"frame_{timestamp}.jpg")
              cv2.imwrite(filename, display_frame)
-
+        
         if self.debug and not self.headless and not self.speed_optimize:
             cv2.imshow("Brick Vision Debug", display_frame)
             cv2.waitKey(1)
-        return found, final_angle, final_dist, final_offset_x, max_y
+        # Noise Filter: only consider a brick 'found' if confidence is > 25%
+        # This prevents 'FIND' from skipping on noise/hands.
+        reliable_found = found and confidence > 25
+        
+        return reliable_found, final_angle, final_dist, final_offset_x, max_y, confidence
 
     def save_frame(self, filename):
         if self.current_frame is not None:

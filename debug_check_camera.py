@@ -1,5 +1,5 @@
 """
-setup_check_camera.py
+# debug_check_camera.py
 ---------------------
 Unified Camera Setup and Testing Utility.
 1. Finds attached video devices (`/dev/video*`).

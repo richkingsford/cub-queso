@@ -1,12 +1,12 @@
 """
-lay_bricks.py
+# train_lay_bricks.py
 -------------
 The "Manager". It sets up the hardware and assigns the current task.
 """
-from brick_vision import BrickDetector
+from train_brick_vision import BrickDetector
 # Assuming your hardware driver is saved here:
 from robot_control import Robot 
-import maneuvers
+import debug_maneuvers as maneuvers
 import time
 import shutil
 import os

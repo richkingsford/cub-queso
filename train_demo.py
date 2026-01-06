@@ -1,5 +1,5 @@
 """
-record_demo.py
+# train_demo.py
 --------------
 Runs on the Robot.
 Acts as a TCP Server for the Windows Xbox Client.
@@ -16,8 +16,8 @@ import os
 from flask import Flask, Response
 
 from robot_control import Robot
-from brick_vision import BrickDetector
-from leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
+from train_brick_vision import BrickDetector
+from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
 
 # --- CONFIG ---
 HOST_IP = '0.0.0.0'
@@ -211,11 +211,10 @@ def control_loop():
             pass
         
         # 3. Vision
-        found, angle, dist, offset_x, max_y = app_state.vision.read()
+        found, angle, dist, offset_x, max_y, conf = app_state.vision.read()
         view_frame = app_state.vision.current_frame
         
         # 4. Telemetry Update
-        conf = 100 if found else 0
         app_state.world.update_vision(found, dist, angle, conf, offset_x, max_y)
         
         # Track Motion

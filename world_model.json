@@ -90,5 +90,12 @@
                 "y": 0
             }
         ]
+    },
+    "objectives": {
+        "FIND": {},
+        "ALIGN": {},
+        "SCOOP": {},
+        "LIFT": {},
+        "PLACE": {}
     }
 }

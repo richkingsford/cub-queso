@@ -57,9 +57,16 @@ class Robot:
         # 2. Scale to PWM
         pwm = int(self.MIN_PWM + (self.MAX_PWM - self.MIN_PWM) * abs(speed))
         pwm = min(pwm, 255)
-        
-        # 3. Send
-        self._send(f"{cmd_char} {pwm} {self.CMD_DURATION}\n")
+
+        # 3. Hardware Inversion Correction
+        # The robot wiring is currently swapped: 'f' moves backward, 'b' moves forward.
+        # We fix this here so all high-level scripts (autolay, recording, etc) can use logical commands.
+        real_hw_cmd = cmd_char
+        if cmd_char == 'f': real_hw_cmd = 'b'
+        elif cmd_char == 'b': real_hw_cmd = 'f'
+
+        # 4. Send
+        self._send(f"{real_hw_cmd} {pwm} {self.CMD_DURATION}\n")
 
     def drive(self, speed):
         """Wrapper for BACKWARD COMPATIBILITY with maneuvers.py"""

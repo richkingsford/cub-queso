@@ -1,4 +1,4 @@
-import maneuvers
+import debug_maneuvers as maneuvers
 import sys
 
 # Mock Robot

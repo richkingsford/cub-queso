@@ -1,5 +1,5 @@
 """
-setup_check_arduino.py
+# debug_check_arduino.py
 ----------------------
 Unified Arduino Setup and Testing Utility.
 1. Scans for connected Serial/COM ports.

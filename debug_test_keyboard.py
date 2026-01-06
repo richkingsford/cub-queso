@@ -15,7 +15,12 @@ import threading
 import time
 import tty
 import termios
+import cv2
+import numpy as np
+from flask import Flask, Response
 from robot_control import Robot
+from train_brick_vision import BrickDetector
+from robot_leia_telemetry import WorldModel, draw_telemetry_overlay
 
 # --- CONFIG ---
 GEAR_1_SPEED = 0.32 
@@ -29,7 +34,50 @@ class TestState:
         self.active_speed = 0.0
         self.current_gear = 1
         self.last_key_time = 0
+        self.current_frame = None
+        self.world = WorldModel()
         self.lock = threading.Lock()
+
+app = Flask(__name__)
+
+def generate_frames(state):
+    while state.running:
+        with state.lock:
+            if state.current_frame is None:
+                frame_to_send = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(frame_to_send, "NO SIGNAL", (200, 240), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+            else:
+                frame_to_send = state.current_frame.copy()
+        
+        (flag, encodedImage) = cv2.imencode(".jpg", frame_to_send)
+        if not flag: continue
+        
+        yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + 
+              bytearray(encodedImage) + b'\r\n')
+
+@app.route("/")
+def index():
+    return "<html><body style='background:#111; color:#eee; text-align:center;'><h1>Robot Eyes (DEBUG)</h1><img src='/video_feed'></body></html>"
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(generate_frames(app_state_ref), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+def vision_thread(state):
+    detector = BrickDetector(debug=True, speed_optimize=False)
+    while state.running:
+        found, angle, dist, offset_x, max_y, conf = detector.read()
+        
+        with state.lock:
+            state.world.update_vision(found, dist, angle, conf, offset_x, max_y)
+            if detector.current_frame is not None:
+                frame = detector.current_frame.copy()
+                messages = ["MODE: MANUAL DEBUG", f"GEAR: {state.current_gear}"]
+                reminders = ["W/A/S/D to move", "Q to quit"]
+                draw_telemetry_overlay(frame, state.world, messages, reminders, gear=state.current_gear)
+                state.current_frame = frame
+        time.sleep(0.05)
 
 def getch():
     fd = sys.stdin.fileno()
@@ -75,6 +123,17 @@ def keyboard_thread(state):
 def main():
     state = TestState()
     robot = Robot()
+    
+    # Start vision and web server
+    global app_state_ref
+    app_state_ref = state
+    
+    threading.Thread(target=vision_thread, args=(state,), daemon=True).start()
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, 
+                                          debug=False, use_reloader=False), 
+                     daemon=True).start()
+    
+    print("\n[VISION] Stream started at http://<robot-ip>:5000")
     
     # Start keyboard thread
     kb_t = threading.Thread(target=keyboard_thread, args=(state,), daemon=True)

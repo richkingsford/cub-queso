@@ -1,5 +1,5 @@
 """
-record_demo_keyboard.py
+# train_demo_keyboard.py
 -----------------------
 Keyboard-based version of the demo recorder.
 Runs on the Jetson. 
@@ -16,8 +16,8 @@ import cv2
 from flask import Flask, Response
 
 from robot_control import Robot
-from brick_vision import BrickDetector
-from leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
+from train_brick_vision import BrickDetector
+from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
  
 # --- CONFIG ---
 LOG_RATE_HZ = 10
@@ -90,7 +90,7 @@ class AppState:
             
         print(f"[SESSION] Recording Keyboard Demo to: {self.session_dir}")
         print("CONTROLS (Hold or tap rapidly):")
-        print("  W/S: Backward/Forward (INVERTED) |  A/D: Turn Left/Right")
+        print("  W/S: Forward/Backward          |  A/D: Turn Left/Right")
         print("  P/L: Lift Up/Down")
         print("  Y: Start Job           |  K: Success (End)")
         print("  J: Abort Job           |  X: Cycle Objective")
@@ -130,9 +130,9 @@ def keyboard_thread(app_state):
             
             # MOVEMENT (Heartbeat triggers)
             if ch == 'w':
-                app_state.active_command = 'b' # INVERTED
+                app_state.active_command = 'f'
             elif ch == 's':
-                app_state.active_command = 'f' # INVERTED
+                app_state.active_command = 'b'
             elif ch == 'a':
                 app_state.active_command = 'l'
             elif ch == 'd':
@@ -233,10 +233,9 @@ def control_loop(app_state):
             was_moving = False
             
         # 2. Vision
-        found, angle, dist, offset_x, max_y = app_state.vision.read()
+        found, angle, dist, offset_x, max_y, conf = app_state.vision.read()
         
         # 3. Telemetry Update
-        conf = 100 if found else 0
         app_state.world.update_vision(found, dist, angle, conf, offset_x, max_y)
         
         # Track Motion

@@ -1,5 +1,5 @@
 """
-leia_teleops.py
+# debug_leia_teleops.py
 ---------------
 The Brain of Leia for Teleoperation Demos.
 Combines:
@@ -17,8 +17,8 @@ from flask import Flask, Response
 
 # Import our capabilities
 from robot_control import Robot
-from brick_vision import BrickDetector
-from leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
+from train_brick_vision import BrickDetector
+from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
 
 # --- CONFIG ---
 WEB_PORT = 5000

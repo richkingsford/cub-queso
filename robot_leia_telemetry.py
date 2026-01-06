@@ -1,5 +1,5 @@
 """
-leia_telemetry.py
+# robot_leia_telemetry.py
 -----------------
 Handles the World Model and Logging for Robot Leia.
 """
@@ -31,8 +31,21 @@ class MotionEvent:
             "timestamp": self.timestamp
         }
 
+from pathlib import Path
+WORLD_MODEL_FILE = Path(__file__).parent / "world_model.json"
+
 class WorldModel:
     def __init__(self):
+        # Load Rules
+        self.rules = {}
+        if WORLD_MODEL_FILE.exists():
+            try:
+                with open(WORLD_MODEL_FILE, 'r') as f:
+                    self.rules = json.load(f).get('objectives', {})
+            except: pass
+            
+        self.learned_rules = {} # Rules derived from demo analysis
+            
         # Robot Pose (Dead Reckoning)
         self.x = 0.0 # mm
         self.y = 0.0 # mm
@@ -58,6 +71,8 @@ class WorldModel:
         self.lift_height = 0.0 # mm (estimated)
 
         # Objective
+        self._objective_state = None
+        self._objective_start_time = 0
         self.objective_state = ObjectiveState.FIND
         
         # Alignment & Stability
@@ -66,7 +81,7 @@ class WorldModel:
         self.align_tol_dist_min = 30.0 # mm (Too close)
         self.align_tol_dist_max = 500.0 # mm (Too far)
         self.stability_count = 0
-        self.stability_threshold = 5  # Frames required for a "lock"
+        self.stability_threshold = 10  # 10 frames @ 20Hz = 0.5 seconds
         
         self.last_dist = 999.0 # Track last distance for seated heuristic
         
@@ -84,6 +99,18 @@ class WorldModel:
         self.mm_per_sec_full_speed = 200.0 
         self.deg_per_sec_full_speed = 90.0
         self.lift_mm_per_sec = 20.0
+
+    @property
+    def objective_state(self):
+        return self._objective_state
+
+    @objective_state.setter
+    def objective_state(self, value):
+        if self._objective_state == value:
+            return
+        self._objective_state = value
+        self._objective_start_time = time.time()
+        # print(f"[WORLD] Objective changed to {value}, timer reset.", flush=True)
 
     def update_from_motion(self, event):
         """
@@ -166,19 +193,26 @@ class WorldModel:
         # Intelligent Alignment Check
         was_aligned = self.is_aligned()
         
-        # Perfect Alignment Hint: Angle ~ 0, Offset ~ 0, Notch at bottom of frame
+        # --- PERFECT ALIGNMENT (DATA DRIVEN) ---
         self.brick["perfect_align"] = False
-        if found and conf >= 80:
-            angle_ok = abs(angle) <= self.align_tol_angle
-            offset_ok = abs(offset_x) <= self.align_tol_offset
-            dist_ok = self.align_tol_dist_min <= dist <= self.align_tol_dist_max
+        if found and conf >= 25:
+            # Use learned thresholds if available, otherwise defaults
+            align_rules = self.learned_rules.get("ALIGN", {})
+            tol_off = align_rules.get("max_offset_x", self.align_tol_offset)
+            tol_ang = align_rules.get("max_angle", self.align_tol_angle)
             
-            # Additional hint: Notch near bottom (assuming 480px height)
-            depth_ok = max_y > 450
+            # Add a small buffer (10%) to the learned threshold for robustness
+            tol_off *= 1.1 
+            tol_ang *= 1.1
+            
+            angle_ok = abs(angle) <= tol_ang
+            offset_ok = abs(offset_x) <= tol_off
+            dist_ok = self.align_tol_dist_min <= dist <= self.align_tol_dist_max
             
             if angle_ok and offset_ok and dist_ok:
                 self.stability_count += 1
-                if abs(angle) < 1.5 and abs(offset_x) < 5.0 and depth_ok:
+                # Final gate: strict stability or ultra-centered
+                if self.stability_count >= self.stability_threshold:
                     self.brick["perfect_align"] = True
             else:
                 self.stability_count = 0
@@ -188,8 +222,6 @@ class WorldModel:
             # SEATED HEURISTIC (Vision Lost)
             if was_aligned and self.last_dist < 100 and self.objective_state == ObjectiveState.SCOOP:
                  self.brick["seated"] = True
-                 # Trigger Wiggle Verification automatically?
-                 # No, user manually wiggles, we just track it.
                  if self.verification_stage == "IDLE":
                      self.verification_stage = "BACK"
 
@@ -213,6 +245,29 @@ class WorldModel:
     def is_aligned(self):
         """Returns True if metrics have been stable and centered."""
         return self.stability_count >= self.stability_threshold
+
+    def check_objective_complete(self):
+        """Checks if success criteria are met using ONLY learned rules from demos."""
+        obj_name = self.objective_state.value
+        learned = self.learned_rules.get(obj_name, {})
+        
+        if not learned:
+            # If we don't have learned data for this objective (e.g. PLACE at the very end)
+            # just return False to let it run its recorded duration.
+            return False
+            
+        # 1. Logic-based Criteria
+        if obj_name == "ALIGN":
+            # ALIGN is complete when the data-driven 'perfect_align' flag is set
+            if self.brick.get("perfect_align"):
+                return True
+        
+        elif "final_visibility" in learned:
+            # For FIND / SCOOP, check if we've reached the desired visibility state
+            if self.brick["visible"] == learned["final_visibility"]:
+                return True
+
+        return False
 
     def next_objective(self):
         """Cycles through the 5-step mission: FIND -> ALIGN -> SCOOP -> LIFT -> PLACE"""
@@ -270,7 +325,7 @@ class TelemetryLogger:
         data = world_model.to_dict()
         
         # 1. Terminal Output (Human Readable)
-        self._print_terminal(data)
+        # self._print_terminal(data)
         
         # 2. JSON Log
         with open(self.filename, 'a') as f:
@@ -387,27 +442,18 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, controls=
     y_cur = 25
     line_h = 18 # Tighter spacing
     
+    # 2.5 Big State Line (Prominent)
+    state_txt = f"STATE: {wm.objective_state.value}"
+    cv2.putText(frame, state_txt, (x_base, y_cur+5), font, 0.6, GREEN, 2)
+    y_cur += 35 # Extra space for the big state
+    
     def put_line(txt, c=WHITE, s=scale, thickness=bold):
         nonlocal y_cur
         cv2.putText(frame, txt, (x_base, y_cur), font, s, c, thickness)
         y_cur += line_h
 
     # 3. Objective Dashboard (Top - Magenta)
-    put_line("OBJECTIVES:", MAGENTA, 0.4, 1)
-    
-    objectives = [
-        (ObjectiveState.FIND,  "Objective (R): FIND"),
-        (ObjectiveState.ALIGN, "Objective (T): ALIGN"),
-        (ObjectiveState.SCOOP, "Objective (Y): SCOOP"),
-        (ObjectiveState.LIFT,  "Objective (U): LIFT"),
-        (ObjectiveState.PLACE, "Objective (I): PLACE")
-    ]
-    
-    for state, label in objectives:
-        is_active = (wm.objective_state == state)
-        color = MAGENTA if is_active else (80, 80, 80)
-        prefix = "> " if is_active else "  "
-        put_line(f"{prefix}{label}", color, 0.32, 1)
+    # (Simplified: List removed as requested)
     
     y_cur += 8 # Spacer
     
@@ -432,52 +478,41 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, controls=
     
     y_cur += 8 # Spacer
     
-    # 6. Last Activity (Magenta)
+    # 6. Action (Magenta)
     if wm.last_event:
         evt = wm.last_event
-        put_line(f"ACT: {evt.action_type}", MAGENTA)
+        put_line(f"ACTION: {evt.action_type}", MAGENTA)
         put_line(f"PWR: {evt.power} ({evt.duration_ms}ms)", MAGENTA)
     else:
-        put_line("ACT: IDLE", MAGENTA)
+        put_line("ACTION: IDLE", MAGENTA)
     
-    # 7. Alignment / Seated Banners (Center)
+    y_cur += 8 # Spacer
+    
+    # 7. Alignment / Status Sub-Dashboard (Alternative to Banners)
     if wm.brick.get("perfect_align"):
-        banner_text = "PERFECT ALIGNMENT"
-        tw, th = cv2.getTextSize(banner_text, cv2.FONT_HERSHEY_DUPLEX, 1.2, 3)[0]
-        bx = (w - tw) // 2
-        by = 100
-        cv2.rectangle(frame, (bx-15, by-th-15), (bx+tw+15, by+15), (0, 215, 255), -1) # Gold
-        cv2.putText(frame, banner_text, (bx, by), cv2.FONT_HERSHEY_DUPLEX, 1.2, (0, 0, 0), 3)
+        put_line("ALIGN: PERFECT", (0, 215, 255), thickness=2)
     elif wm.is_aligned():
-        banner_text = "ALIGNED & LOCKED"
-        tw, th = cv2.getTextSize(banner_text, cv2.FONT_HERSHEY_DUPLEX, 1.0, 2)[0]
-        bx = (w - tw) // 2
-        by = 80
-        cv2.rectangle(frame, (bx-10, by-th-10), (bx+tw+10, by+10), (0, 150, 0), -1)
-        cv2.putText(frame, banner_text, (bx, by), cv2.FONT_HERSHEY_DUPLEX, 1.0, WHITE, 2)
-
+        put_line("ALIGN: LOCKED", GREEN, thickness=1)
+    else:
+        put_line("ALIGN: SEARCHING", (100, 100, 100))
+        
     if wm.brick["seated"]:
-        banner_text = "BRICK SEATED"
-        tw, th = cv2.getTextSize(banner_text, cv2.FONT_HERSHEY_DUPLEX, 1.0, 2)[0]
-        bx = (w - tw) // 2
-        if wm.brick.get("perfect_align") or wm.is_aligned(): by = 140
-        else: by = 80
-        cv2.rectangle(frame, (bx-10, by-th-10), (bx+tw+10, by+10), (0, 0, 150), -1)
-        cv2.putText(frame, banner_text, (bx, by), cv2.FONT_HERSHEY_DUPLEX, 1.0, WHITE, 2)
+        put_line("BRICK: SEATED", (0, 0, 150), thickness=2)
 
     # 7b. Verification Progress
     if wm.verification_stage != "IDLE":
-        v_msg = f"VERIFYING: {wm.verification_stage}..."
-        cv2.putText(frame, v_msg, (w-250, h-20), font, 0.5, YELLOW, 2)
+        put_line(f"VERIFY: {wm.verification_stage}", YELLOW, thickness=1)
 
-    # 8. Extra Messages (Banners)
+    y_cur += 8 # Spacer
+
+    # 8. Extra Messages (Banners -> Moved to Sidebar)
     if extra_messages:
-        y_center = h // 2
         for msg in extra_messages:
-            text_size = cv2.getTextSize(msg, font, 1.2, 2)[0]
-            text_x = (w - text_size[0]) // 2
-            cv2.putText(frame, msg, (text_x, y_center), font, 1.2, GREEN, 2)
-            y_center += 50
+            put_line(msg, GREEN, scale, 1)
+
+
+
+
 
     # 9. GEAR & CONTROLS (Yellow - Bottom Left)
     y_cur = h - 15
