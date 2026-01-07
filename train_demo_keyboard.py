@@ -51,10 +51,13 @@ class AppState:
         print("  P/L: Lift Up/Down")
         print("  F: NEXT ACTION (Fail -> Recover -> Success -> Next Objective)")
         print("  Q: Quit")
+        print("  [DEBUG] Scope restricted to 'FIND' objective only.")
         
         # Telemetry
         self.world = WorldModel()
         self.logger = TelemetryLogger(log_path)
+        self.logger.log_keyframe("JOB_START")
+        self.logger.enabled = False # Wait for OBJ_START
         
         # ID Init
         self.world.run_id = f"run_{timestamp}"
@@ -195,7 +198,7 @@ def keyboard_thread(app_state):
                     app_state.world.attempt_status = "NORMAL"
                     
                     old_obj_enum = app_state.world.objective_state
-                    if old_obj_enum == ObjectiveState.PLACE:
+                    if old_obj_enum == ObjectiveState.FIND: # TEMPORARY: Loop just on FIND
                         # Job Complete
                         app_state.job_success = True
                         app_state.job_success_timer = time.time()
@@ -209,6 +212,7 @@ def keyboard_thread(app_state):
                         app_state.world.reset_mission()
                         app_state.world.attempt_id += 1 
                         app_state.logger.log_keyframe("JOB_START")
+                        app_state.logger.enabled = False # Wait for OBJ_START
                         
                         app_state.job_start = True
                         app_state.job_start_timer = time.time()

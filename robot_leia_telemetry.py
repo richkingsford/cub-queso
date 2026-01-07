@@ -28,7 +28,7 @@ class MotionEvent:
             "type": self.action_type,
             "power": self.power,
             "duration_ms": self.duration_ms,
-            "timestamp": self.timestamp
+            "timestamp": round(self.timestamp, 3)
         }
 
 from pathlib import Path
@@ -324,15 +324,35 @@ class WorldModel:
         return self.objective_state.value
 
     def to_dict(self):
+        # Format Brick Data
+        brick_fmt = self.brick.copy()
+        brick_fmt['dist'] = round(brick_fmt['dist'], 2)
+        brick_fmt['angle'] = round(brick_fmt['angle'], 3)
+        brick_fmt['offset_x'] = round(brick_fmt['offset_x'], 2)
+        brick_fmt['confidence'] = int(brick_fmt['confidence'])
+
+        # Format Wall Origin
+        wall_fmt = None
+        if self.wall_origin:
+            wall_fmt = {
+                'x': round(self.wall_origin['x'], 2),
+                'y': round(self.wall_origin['y'], 2),
+                'theta': round(self.wall_origin['theta'], 3)
+            }
+
         return {
             "type": "state",
-            "timestamp": time.time(),
+            "timestamp": round(time.time(), 3),
             "run_id": self.run_id,
             "attempt_id": self.attempt_id,
-            "robot_pose": {"x": self.x, "y": self.y, "theta": self.theta},
-            "wall_origin": self.wall_origin,
-            "brick": self.brick,
-            "lift_height": self.lift_height
+            "robot_pose": {
+                "x": round(self.x, 2), 
+                "y": round(self.y, 2), 
+                "theta": round(self.theta, 3)
+            },
+            "wall_origin": wall_fmt,
+            "brick": brick_fmt,
+            "lift_height": round(self.lift_height, 2)
         }
 
 class TelemetryLogger:
@@ -358,7 +378,7 @@ class TelemetryLogger:
         
         data = {
             "type": "keyframe",
-            "timestamp": timestamp,
+            "timestamp": round(timestamp, 3),
             "marker": marker
         }
         if objective:
@@ -387,7 +407,7 @@ class TelemetryLogger:
     def close(self):
         """
         Consolidated close method that handles JSON array termination.
-        Removes trailing comma if necessary and appends the closing bracket.
+        Robustly handles crashes by searching backward for the last valid '}'.
         """
         with self.lock:
             if not os.path.exists(self.filename):
@@ -397,20 +417,38 @@ class TelemetryLogger:
                 with open(self.filename, 'rb+') as f:
                     f.seek(0, os.SEEK_END)
                     pos = f.tell()
-                    # Search backwards for the last comma
+                    
+                    found_last_brace = False
+                    # Search backwards for the last '}'
                     while pos > 0:
                         pos -= 1
                         f.seek(pos)
                         char = f.read(1)
-                        if char == b',':
-                            f.seek(pos)
+                        if char == b'}':
+                            # Found the end of a valid JSON object.
+                            # Keep this row, truncate after it.
+                            f.seek(pos + 1)
+                            f.truncate()
+                            found_last_brace = True
+                            break
+                        elif char == b'[': 
+                            # Empty array case
+                            f.seek(pos + 1)
                             f.truncate()
                             break
-                        elif char == b'[': # Empty array case
-                            break
+                    
+                    # Ensure any trailing garbage (like a loose comma) is gone
+                    # We already truncated at '}', so we are good.
+                    
+                    # Add final closing bracket
                     f.seek(0, os.SEEK_END)
-                    f.write(b"\n]\n")
-                print(f"[LOGGER] Log closed: {self.filename}")
+                    if found_last_brace:
+                        f.write(b"\n]\n")
+                    else:
+                        # If list was totally empty or malformed
+                        f.write(b"]\n")
+                        
+                print(f"[LOGGER] Log closed and sanitized: {self.filename}")
             except Exception as e:
                 print(f"[LOGGER] Error closing log: {e}")
 

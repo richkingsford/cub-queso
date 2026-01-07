@@ -68,143 +68,207 @@ def vision_thread():
     app_state.vision = BrickDetector(debug=True, speed_optimize=False)
     consecutive_failures = 0
     while app_state.running:
-        # 1. Get the latest sensor data
         found, angle, dist, offset_x, conf, cam_h = app_state.vision.read()
         
-        # dist == -1 is our sentinel for "Hardware Read Error"
         if not found and dist == -1:
             consecutive_failures += 1
-            print(f"[VISION] WARNING: Camera read failed! ({consecutive_failures}/5)", flush=True)
             if consecutive_failures >= 5:
-                # print("[VISION] FATAL: Camera connection lost. Aborting script.", flush=True)
                 app_state.running = False
                 os._exit(1)
         else:
             consecutive_failures = 0
             
         with app_state.lock:
-            # 3. Telemetry Update
             app_state.world.update_vision(found, dist, angle, conf, offset_x, cam_h)
-            
-            # --- HUD PROCESSING (OPTIONAL) ---
-            if STREAM_ENABLED:
-                if app_state.vision.current_frame is not None:
-                    frame = app_state.vision.current_frame.copy()
-                    messages = [f"AUTO: {app_state.active_objective}", app_state.status_msg]
-                    reminders = ["Ctrl+C to ABORT"]
-                    draw_telemetry_overlay(frame, app_state.world, messages, reminders)
-                    app_state.current_frame = frame
+            if STREAM_ENABLED and app_state.vision.current_frame is not None:
+                frame = app_state.vision.current_frame.copy()
+                messages = [f"AUTO: {app_state.active_objective}", app_state.status_msg]
+                draw_telemetry_overlay(frame, app_state.world, messages)
+                app_state.current_frame = frame
         
-        time.sleep(0.05)  # ~20Hz update rate
+        time.sleep(0.05)
 
 def load_demo(session_name):
-    path = f"demos/{session_name}/a_log.json"
+    # Support both directory-style (old) and flat-file-style (new)
+    path = f"demos/{session_name}"
     if not os.path.exists(path):
-        path = f"demos/{session_name}/log.json"
+        if not session_name.endswith(".json"):
+            path = f"demos/{session_name}.json"
+        else:
+            path = f"demos/{session_name}"
+
+    if os.path.isdir(path):
+        base_path = path
+        path = os.path.join(base_path, "a_log.json")
+        if not os.path.exists(path):
+            path = os.path.join(base_path, "log.json")
     
     if not os.path.exists(path):
         print(f"Error: Session {session_name} not found.")
-        return None
+        return None, None
 
-    raw_events = []
     try:
         with open(path, 'r') as f:
             log_data = json.load(f)
-    except json.JSONDecodeError:
-        # Fallback: The log might be truncated (missing closing ']') if the recorder crashed.
+    except:
+        # Simple healing for truncated JSON
         try:
             with open(path, 'r') as f:
                 content = f.read().strip()
             if not content.endswith(']'):
-                # Try to "healing" the JSON by adding the closing bracket
                 log_data = json.loads(content + '\n]')
             else:
-                raise # Re-raise if it's not a simple truncation
-        except Exception as e:
-            return None
+                raise 
+        except:
+            return None, None
     
-    # Clean up any nulls or invalid entries
     log_data = [x for x in log_data if x is not None and isinstance(x, dict)]
 
-    # --- SUCCESS HEURISTIC EXTRACTION ---
-    # Find the vision state at the moment of transition for each objective
+    # --- HEURISTIC EXTRACTION ---
     heuristics = {}
     current_obj = None
     last_state_entry = None
+    raw_events = []
     
     for entry in log_data:
         etype = entry.get('type')
-        
         if etype == 'keyframe':
             obj_field = entry.get('objective')
-            if obj_field:
-                current_obj = obj_field
-            
+            if obj_field: current_obj = obj_field
             marker = entry.get('marker')
             if marker == 'OBJ_SUCCESS' and current_obj and last_state_entry:
-                # --- Success Visibility / Precision ---
                 prev_state = last_state_entry.get('brick') or {}
-                
                 if current_obj not in heuristics:
-                    heuristics[current_obj] = {
-                        'max_offset_x': 0.0,
-                        'max_angle': 0.0,
-                        'final_visibility': prev_state.get('visible', True),
-                        'max_duration_ms': 0.0,
-                        'samples': 0
-                    }
-                
+                    heuristics[current_obj] = {'max_offset_x': 0.0, 'max_angle': 0.0, 'final_visibility': prev_state.get('visible', True), 'samples': 0}
                 h = heuristics[current_obj]
                 h['max_offset_x'] = max(h['max_offset_x'], abs(prev_state.get('offset_x', 0)))
                 h['max_angle'] = max(h['max_angle'], abs(prev_state.get('angle', 0)))
-                if prev_state.get('visible') is not None:
-                    h['final_visibility'] = prev_state.get('visible')
-                
+                if prev_state.get('visible') is not None: h['final_visibility'] = prev_state.get('visible')
                 h['samples'] += 1
-                # Note: Duration logging logic could be restored here if needed by tracking OBJ_START timestamp
-                
         elif etype == 'state':
             last_state_entry = entry
+            if entry.get('last_event'):
+                raw_events.append({
+                    'obj': current_obj or entry.get('objective'),
+                    'cmd': event_type_to_cmd(entry['last_event']['type']),
+                    'duration': entry['last_event']['duration_ms'] / 1000.0
+                })
 
-    # Final Tuning: If we have heuristics, print them
-    print("\n[LEARNED] Objective Success Gates from Demo:", flush=True)
-    for obj, h in heuristics.items():
-        if h['samples'] > 0:
-            print(f"  {obj:6} > visible={str(h['final_visibility']):5} | offset < {h['max_offset_x']:.1f}px | timeout={h['max_duration_ms']/1000.0:.1f}s", flush=True)
-
-    for entry in log_data:
-        if entry.get('last_event'):
-            raw_events.append({
-                'obj': entry.get('objective'),
-                'cmd': entry['last_event']['type'],
-                'duration': entry['last_event']['duration_ms'] / 1000.0
-            })
+    if heuristics:
+        print("\n[LEARNED] Success Gates from Demo:")
+        for obj, h in heuristics.items():
+            print(f"  {obj:<8} | OffX: {h['max_offset_x']:4.1f} | Ang: {h['max_angle']:4.1f} | Vis: {h['final_visibility']} | n={h['samples']}")
     
-    if not raw_events: return [], {}
+    if not raw_events: return [], heuristics
     
     merged_events = []
-    current_event = raw_events[0].copy()
-    for next_event in raw_events[1:]:
-        if (next_event['obj'] == current_event['obj'] and next_event['cmd'] == current_event['cmd']):
-            current_event['duration'] += next_event['duration']
+    curr = raw_events[0].copy()
+    for nxt in raw_events[1:]:
+        if (nxt.get('obj') == curr.get('obj') and nxt['cmd'] == curr['cmd']):
+            curr['duration'] += nxt['duration']
         else:
-            merged_events.append(current_event)
-            current_event = next_event.copy()
-    merged_events.append(current_event)
+            merged_events.append(curr)
+            curr = nxt.copy()
+    merged_events.append(curr)
     
     return merged_events, heuristics
 
 def event_type_to_cmd(event_type):
-    """Convert logged event type to single-character robot command."""
     mapping = {
-        'forward': 'f',
-        'backward': 'b',
-        'left_turn': 'l',
-        'right_turn': 'r',
-        'mast_up': 'u',
-        'mast_down': 'd'
+        'forward': 'f', 'backward': 'b', 'left_turn': 'l', 'right_turn': 'r', 
+        'mast_up': 'u', 'mast_down': 'd'
     }
     return mapping.get(event_type, None)
+
+def validate_log_integrity(log_path):
+    try:
+        with open(log_path, 'r') as f:
+            log_data = json.load(f)
+    except:
+        return False, {}, ["Failed to parse JSON"]
+
+    stack = []
+    errors = []
+    stats = {}
+    for entry in log_data:
+        if entry.get('type') != 'keyframe': continue
+        marker = entry.get('marker', '')
+        obj = entry.get('objective', 'GLOBAL')
+        if obj not in stats:
+            stats[obj] = {"FAIL": 0, "RECOVER": 0, "COMPLETE": 0}
+        
+        if marker.endswith("_START"):
+            stack.append((marker.replace("_START", ""), obj))
+        elif marker.endswith("_END"):
+            m_type = marker.replace("_END", "")
+            if not stack:
+                errors.append(f"Unexpected {marker}")
+            else:
+                top_type, top_obj = stack.pop()
+                if top_type != m_type:
+                    # Put it back and report error
+                    stack.append((top_type, top_obj))
+                    errors.append(f"Mismatched: {top_type} vs {m_type}")
+                else:
+                    if m_type in stats[obj]: stats[obj][m_type] += 1
+        elif marker == "OBJ_SUCCESS":
+             stats[obj]["COMPLETE"] += 1
+             # Pop any OBJ or OBJ related starts from stack
+             while stack and stack[-1][0] in ["OBJ", "FAIL", "RECOVER", "SUCCESS"]:
+                 stack.pop()
+        elif marker == "JOB_SUCCESS":
+             # Pop everything until the JOB marker
+             while stack:
+                 top_type, _ = stack.pop()
+                 if top_type == "JOB":
+                     break
+             
+    for m_type, m_obj in stack:
+        if m_type != "JOB": # Ignore trailing JOB starts (we auto-start the next run)
+            errors.append(f"Unclosed {m_type}")
+        
+    return len(errors) == 0, stats, errors
+
+def summarize_all_demos():
+    sessions = find_sessions()
+    if not sessions:
+        print("[STATS] No demos found.")
+        return
+
+    print(f"\n{'='*90}")
+    print(f"{'DEMO SESSION':<35} | {'OBJ':<8} | {'FAIL':<5} | {'RECV':<5} | {'DONE':<5} | {'STATUS'}")
+    print(f"{'-'*90}")
+
+    for s in sessions:
+        path = f"demos/{s}"
+        if os.path.isdir(path):
+             p = os.path.join(path, "a_log.json")
+             if not os.path.exists(p): p = os.path.join(path, "log.json")
+             path = p
+        elif not path.endswith(".json"):
+             path += ".json"
+        
+        if not os.path.exists(path): continue
+        ok, stats, _ = validate_log_integrity(path)
+        if not stats: continue
+
+        first = True
+        for obj, sdata in stats.items():
+            if obj == "GLOBAL": continue
+            prefix = f"{s[:33]:<35}" if first else " " * 35
+            status = "PASS" if ok else "FAIL"
+            if not first: status = ""
+            print(f"{prefix} | {obj:<8} | {sdata.get('FAIL',0):<5} | {sdata.get('RECOVER',0):<5} | {sdata.get('COMPLETE',0):<5} | {status}")
+            first = False
+    print(f"{'='*90}\n")
+
+def find_sessions():
+    demos_dir = "demos"
+    if not os.path.exists(demos_dir): return []
+    items = os.listdir(demos_dir)
+    sessions = [f for f in items if f.endswith(".json") or os.path.isdir(os.path.join(demos_dir, f))]
+    sessions.sort(reverse=True)
+    return sessions
 
 def main_autoplay(session_name):
     events, learned_rules = load_demo(session_name)
@@ -213,193 +277,83 @@ def main_autoplay(session_name):
     app_state.robot = Robot()
     app_state.world.learned_rules = learned_rules
     
-    # 1. Start Vision/Web Server
     threading.Thread(target=vision_thread, daemon=True).start()
-    
     if STREAM_ENABLED:
         threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False), daemon=True).start()
-        print(f"[AUTOPLAY] Web Stream: http://<robot-ip>:{WEB_PORT}", flush=True)
-    else:
-        print("[AUTOPLAY] Web Stream: DISABLED (--no-stream)", flush=True)
     
-    print(f"\n[AUTOPLAY] Loaded {len(events)} events from {session_name}", flush=True)
-    print(f"[AUTOPLAY] Safety Check: Defaulting all speeds to GEAR 1 ({GEAR_1_SPEED})", flush=True)
-    
-    # --- VISION WARMUP ---
-    # Wait for the first valid frame or 2 seconds max
-    print("[AUTOPLAY] Warming up vision...", end="", flush=True)
+    print(f"[AUTOPLAY] Loaded {len(events)} events. Warming up vision...")
     warmup_start = time.time()
     while time.time() - warmup_start < 2.0:
         with app_state.lock:
-            if app_state.current_frame is not None:
-                print(" OK!", flush=True)
-                break
+            if app_state.current_frame is not None: break
         time.sleep(0.1)
-    else:
-        print(" (Camera still warming up, proceeding)", flush=True)
 
-    # Group by Objective to show progress
     current_obj = None
-    skip_current_objective = False
-    
+    skip_mode = False
     for i, ev in enumerate(events):
         if not app_state.running: break
-        
-        # (3s pause removed for rapid replay)
-        
-        # If we are skipping, stay in skip mode until the next objective appears
-        if skip_current_objective and ev['obj'] == current_obj:
-            continue
+        if skip_mode and ev.get('obj') == current_obj: continue
             
-        if ev['obj'] != current_obj:
-            current_obj = ev['obj']
-            skip_current_objective = False # Reset skip flag for new objective
-            with app_state.lock:
-                app_state.active_objective = current_obj
-                app_state.world.objective_state = ObjectiveState[current_obj]
+        if ev.get('obj') != current_obj:
+            current_obj = ev.get('obj')
+            skip_mode = False
+            if current_obj in ObjectiveState.__members__:
+                with app_state.lock:
+                    app_state.active_objective = current_obj
+                    app_state.world.objective_state = ObjectiveState[current_obj]
             
-            # --- THINK BEFORE MOVING ---
-            # Check if this new objective is already done!
             if SMART_REPLAY:
                 with app_state.lock:
                     if app_state.world.check_objective_complete():
-                        print(f"\n>>> OBJECTIVE: {current_obj} (ALREADY COMPLETE)", flush=True)
-                        if DEBUG_MODE:
-                            print(f"[DEBUG] Objective satisfied. Pausing for 5s...", flush=True)
-                            app_state.robot.stop()
-                            time.sleep(5.0)
-                        print(f"[SMART] Skipping {current_obj} entirely.", flush=True)
-                        skip_current_objective = True
+                        print(f"\n>>> {current_obj} (ALREADY COMPLETE)")
+                        if DEBUG_MODE: time.sleep(5.0)
+                        skip_mode = True
                         continue
+            print(f"\n>>> {current_obj}")
 
-            print(f"\n>>> OBJECTIVE: {current_obj}", flush=True)
-
-        event_type = ev['cmd']
-        cmd = event_type_to_cmd(event_type)
-        
-        if cmd is None:
-            print(f"  [{i+1}/{len(events)}] Skipping unknown event: {event_type}")
-            continue
-            
-        # Special handling for mast boost (4x as previously requested)
-        speed = GEAR_1_SPEED
-        if cmd in ('u', 'd'):
-            speed = min(1.0, speed * 4.0)
-            
+        cmd = ev['cmd']
         duration = ev['duration'] * SLOWDOWN_FACTOR
+        print(f"  [{i+1}/{len(events)}] {ev['obj']} > {cmd} for {duration:.2f}s")
         
-        with app_state.lock:
-            app_state.status_msg = f"Executing: {event_type} ({duration:.2f}s)"
-        
-        print(f"\n[{current_obj}] > {event_type} ({duration:.2f}s)", flush=True)
-        
-        # Send commands continuously during the duration
         start_time = time.time()
-        command_interval = 0.1
-        last_visible_time = time.time()
-        
-        while True:
-            if not app_state.running:
-                break
-            
-            # --- SMART REPLAY CHECK (PRE-EMPTIVE) ---
+        while time.time() - start_time < duration:
+            if not app_state.running: break
             if SMART_REPLAY:
                 with app_state.lock:
                     if app_state.world.check_objective_complete():
-                        print(f"\n[SMART] Objective {current_obj} Criteria Met! Skipping remaining commands.", flush=True)
-                        if DEBUG_MODE:
-                            print(f"[DEBUG] Objective satisfied. Pausing for 5s...", flush=True)
-                            app_state.robot.stop()
-                            time.sleep(5.0)
-                        skip_current_objective = True
+                        print(f"  [SMART] {current_obj} Criteria Met!")
+                        if DEBUG_MODE: time.sleep(5.0)
+                        skip_mode = True
                         break
-
-            elapsed = time.time() - start_time
-            if elapsed >= duration:
-                break
-
-            # --- INTELLIGENT ALIGNMENT (CLOSED LOOP) ---
-            # If in ALIGN, use the World Model to pick the best direction
-            active_cmd = cmd
-            active_speed = speed
             
-            if current_obj == "SCOOP":
-                with app_state.lock:
-                    off_x = app_state.world.brick.get('offset_x', 0)
-                    visible = app_state.world.brick['visible']
-                    # Use learned threshold or default
-                    align_rules = app_state.world.learned_rules.get("SCOOP", {})
-                    tol_off = align_rules.get("max_offset_x", 10.0) * 1.1 # 10% buffer
-                
-                if visible:
-                    # Slow down for precision
-                    active_speed = GEAR_1_SPEED * 0.6
-                    
-                    if off_x > tol_off: # Brick is to the right
-                        active_cmd = 'r'
-                    elif off_x < -tol_off: # Brick is to the left
-                        active_cmd = 'l'
-                    else:
-                        active_cmd = None # Centered relative to our learned rules!
-                        with app_state.lock:
-                            app_state.status_msg = f"[CENTERED] (Offset: {off_x:.1f}px) Holding stability..."
-            
-            if active_cmd:
-                app_state.robot.send_command(active_cmd, active_speed)
-            else:
-                app_state.robot.stop()
-            
-            # Log this motion in our active world model for HUD/Telemetry
-            m_evt = MotionEvent(event_type, int(active_speed*255), int(command_interval*1000))
-            app_state.world.update_from_motion(m_evt)
-            
-            # Sleep for command interval or remaining time, whichever is shorter
-            remaining = duration - elapsed
-            sleep_time = min(command_interval, remaining)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-        
-        # Stop after the duration
+            speed = GEAR_1_SPEED
+            if cmd in ('u', 'd'): speed = min(1.0, speed * 4.0)
+            app_state.robot.move(cmd, speed)
+            time.sleep(0.05)
         app_state.robot.stop()
 
-    print("\n[AUTOPLAY] Sequence Complete.")
-    app_state.status_msg = "SEQUENCE COMPLETE"
+    print("\n[AUTOPLAY] Finished.")
     app_state.running = False
-    time.sleep(2)
-
-
-
-def find_sessions():
-    demos_dir = "demos"
-    if not os.path.exists(demos_dir):
-        return []
-    sessions = [d for d in os.listdir(demos_dir) if os.path.isdir(os.path.join(demos_dir, d))]
-    sessions.sort(reverse=True)
-    return sessions
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Autonomous Brick Laying Replay")
-    parser.add_argument("session", nargs="?", help="Name of the session to replay (e.g. kbd_...)")
-    parser.add_argument("--no-stream", action="store_true", help="Disable web stream and HUD processing")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode (5s pause after success)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("session", nargs="?")
+    parser.add_argument("--no-stream", action="store_true")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     STREAM_ENABLED = not args.no_stream
     DEBUG_MODE = args.debug
     
-    session = args.session
+    summarize_all_demos()
+    
+    session = args.session or (find_sessions()[0] if find_sessions() else None)
     if not session:
-        available = find_sessions()
-        if available:
-            session = available[0]
-            print(f"[AUTOPLAY] No session specified. Defaulting to latest: {session}")
-        else:
-            print("Error: No sessions found in demos/ folder.")
-            sys.exit(1)
+        print("No sessions found.")
+        sys.exit(1)
     
     try:
         main_autoplay(session)
     except KeyboardInterrupt:
-        print("\n[AUTOPLAY] ABORTED by user.")
         if app_state.robot: app_state.robot.stop()
         app_state.running = False
