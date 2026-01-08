@@ -1,11 +1,11 @@
 import sys
 import threading
 import time
-import os
 import tty
 import termios
 import cv2
 import numpy as np
+from pathlib import Path
 from flask import Flask, Response
 
 from robot_control import Robot
@@ -17,6 +17,11 @@ LOG_RATE_HZ = 10
 GEAR_1_SPEED = 0.32  # 4x faster per user request
 GEAR_9_SPEED = 1.0   # 100% capacity
 HEARTBEAT_TIMEOUT = 0.3 # Stop if no key for 0.3s
+DEMOS_DIR = Path(__file__).resolve().parent / "demos"
+
+def log_line(message):
+    sys.stdout.write(f"{str(message).strip()}\n")
+    sys.stdout.flush()
 
 class AppState:
     def __init__(self):
@@ -41,17 +46,16 @@ class AppState:
         
         # Session Setup
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.demos_dir = os.path.join(os.getcwd(), "demos")
-        if not os.path.exists(self.demos_dir):
-            os.makedirs(self.demos_dir)
-            
-        log_path = os.path.join(self.demos_dir, f"kbd_{timestamp}.json")
-        print(f"[SESSION] Recording Keyboard Demo to: {log_path}")
-        print("  W/S: Forward/Backward          |  A/D: Turn Left/Right")
-        print("  P/L: Lift Up/Down")
-        print("  F: NEXT ACTION (Fail -> Recover -> Success -> Next Objective)")
-        print("  Q: Quit")
-        print("  [DEBUG] Scope restricted to 'FIND' objective only.")
+        self.demos_dir = DEMOS_DIR
+        self.demos_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.demos_dir / f"kbd_{timestamp}.json"
+        log_line(f"[SESSION] Recording Keyboard Demo to: {log_path}")
+        log_line("W/S: Forward/Backward | A/D: Turn Left/Right")
+        log_line("P/L: Lift Up/Down")
+        log_line("F: Next action (Fail -> Recover -> Success; FIND only)")
+        log_line("Q: Quit")
+        log_line("[DEBUG] Scope restricted to 'FIND' objective only.")
+        log_line("NEXT: Press 'f' to begin FAIL for FIND")
         
         # Telemetry
         self.world = WorldModel()
@@ -163,7 +167,8 @@ def keyboard_thread(app_state):
                     app_state.world.attempt_status = "FAIL"
                     evt = MotionEvent("FAIL", 0, 0)
                     app_state.world.update_from_motion(evt)
-                    print(f"[{obj}] -> FAIL_START (Mistake Started)")
+                    log_line(f"[{obj}] -> FAIL_START (Mistake Started)")
+                    log_line("NEXT: Press 'f' to begin RECOVERY")
                     app_state.internal_step = "START_RECOVERY"
                     
                 elif app_state.internal_step == "START_RECOVERY":
@@ -174,7 +179,8 @@ def keyboard_thread(app_state):
                     app_state.world.attempt_status = "RECOVERY"
                     evt = MotionEvent("RECOVERY_START", 0, 0)
                     app_state.world.update_from_motion(evt)
-                    print(f"[{obj}] -> RECOVER_START (Recovery Started)")
+                    log_line(f"[{obj}] -> RECOVER_START (Recovery Started)")
+                    log_line("NEXT: Press 'f' to begin SUCCESS")
                     app_state.internal_step = "START_SUCCESS"
                     
                 elif app_state.internal_step == "START_SUCCESS":
@@ -183,7 +189,8 @@ def keyboard_thread(app_state):
                     app_state.logger.log_keyframe("SUCCESS_START", obj)
                     
                     app_state.world.attempt_status = "NORMAL"
-                    print(f"[{obj}] -> SUCCESS_START (Clean Run Started)")
+                    log_line(f"[{obj}] -> SUCCESS_START (Clean Run Started)")
+                    log_line("NEXT: Press 'f' when SUCCESS demo is complete")
                     app_state.internal_step = "FINISH_OBJ"
 
                 elif app_state.internal_step == "FINISH_OBJ":
@@ -206,7 +213,7 @@ def keyboard_thread(app_state):
                         
                         evt = MotionEvent("JOB_SUCCESS", 0, 0)
                         app_state.world.update_from_motion(evt)
-                        print("[JOB] SUCCESS - Preparing next run...")
+                        log_line("[JOB] SUCCESS - Preparing next run...")
                         
                         # Reset for Next Job
                         app_state.world.reset_mission()
@@ -223,9 +230,10 @@ def keyboard_thread(app_state):
                         evt = MotionEvent("OBJECTIVE_SUCCESS", 0, 0)
                         app_state.world.update_from_motion(evt)
                         new_obj = app_state.world.next_objective()
-                        print(f"[EVENT] Objective Transition -> {new_obj}")
+                        log_line(f"[EVENT] Objective Transition -> {new_obj}")
                     
                     app_state.internal_step = "START_ERROR"
+                    log_line("NEXT: Press 'f' to begin FAIL for FIND")
 
 def control_loop(app_state):
     app_state.robot = Robot()
@@ -276,10 +284,7 @@ def control_loop(app_state):
             frame = app_state.vision.current_frame.copy()
             
             with app_state.lock:
-                draw_telemetry_overlay(
-                    frame, 
-                    app_state.world
-                )
+                draw_telemetry_overlay(frame, app_state.world, show_prompt=False)
                 app_state.current_frame = frame
         
         # Track Motion
@@ -295,6 +300,7 @@ def control_loop(app_state):
             pwr = int(speed * 255)
             evt = MotionEvent(atype, pwr, int(dt*1000))
             app_state.world.update_from_motion(evt)
+            app_state.logger.log_event(evt, app_state.world.objective_state.value)
             
         # 5. Save Log (Image saving removed)
         with app_state.lock:
@@ -319,7 +325,7 @@ if __name__ == "__main__":
         daemon=True
     )
     stream_t.start()
-    print(f"\n[VISION] Stream started at http://localhost:5000")
+    log_line("[VISION] Stream started at http://localhost:5000")
     
     try:
         control_loop(state)
@@ -330,4 +336,4 @@ if __name__ == "__main__":
         if state.robot: state.robot.close()
         if state.vision: state.vision.close()
         state.logger.close()
-        print("\nShutdown complete.")
+        log_line("Shutdown complete.")

@@ -20,10 +20,10 @@ import numpy as np
 from flask import Flask, Response
 from robot_control import Robot
 from train_brick_vision import BrickDetector
-from robot_leia_telemetry import WorldModel, draw_telemetry_overlay
+from robot_leia_telemetry import WorldModel, MotionEvent, draw_telemetry_overlay
 
 # --- CONFIG ---
-ROBOT_SPEED = 0.32 
+GEAR_1_SPEED = 0.32
 HEARTBEAT_TIMEOUT = 0.3 
 
 class TestState:
@@ -71,9 +71,8 @@ def vision_thread(state):
             state.world.update_vision(found, dist, angle, conf, offset_x, h)
             if detector.current_frame is not None:
                 frame = detector.current_frame.copy()
-                messages = ["MODE: MANUAL DEBUG"]
                 reminders = ["W/A/S/D to move", "Q to quit"]
-                draw_telemetry_overlay(frame, state.world, messages, reminders)
+                draw_telemetry_overlay(frame, state.world, reminders=reminders)
                 state.current_frame = frame
         time.sleep(0.05)
 

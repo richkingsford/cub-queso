@@ -4,6 +4,7 @@ import os
 import sys
 import argparse
 from datetime import datetime
+from pathlib import Path
 
 # ANSI Colors
 GREEN = "\033[92m"
@@ -23,20 +24,21 @@ class LogEntry:
         self.brick = d.get('brick', {})
         self.lift = d.get('lift_height', 0)
         self.obj = d.get('objective', 'UNKNOWN')
-        self.evt = d.get('last_event')
         self.img = d.get('image_file')
 
+DEMOS_DIR = Path(__file__).resolve().parent / "demos"
+
 def find_sessions():
-    demos_dir = os.path.join(os.getcwd(), "demos")
-    if not os.path.exists(demos_dir):
+    demos_dir = DEMOS_DIR
+    if not demos_dir.exists():
         return []
     
     sessions = []
     for d in os.listdir(demos_dir):
-        p = os.path.join(demos_dir, d)
-        if os.path.isdir(p):
+        p = demos_dir / d
+        if p.is_dir():
             # Check for either a_log.json or log.json
-            if os.path.exists(os.path.join(p, "a_log.json")) or os.path.exists(os.path.join(p, "log.json")):
+            if (p / "a_log.json").exists() or (p / "log.json").exists():
                 sessions.append(d)
             
     # Sort by name (timestamp based)
@@ -47,11 +49,11 @@ def find_latest_log():
     sessions = find_sessions()
     if not sessions:
         return None
-    latest_dir = os.path.join(os.getcwd(), "demos", sessions[0])
-    a_log = os.path.join(latest_dir, "a_log.json")
-    if os.path.exists(a_log):
-        return a_log
-    return os.path.join(latest_dir, "log.json")
+    latest_dir = DEMOS_DIR / sessions[0]
+    a_log = latest_dir / "a_log.json"
+    if a_log.exists():
+        return str(a_log)
+    return str(latest_dir / "log.json")
 
 def format_pose(pose):
     return f"({pose.get('x',0):.1f}, {pose.get('y',0):.1f}, {pose.get('theta',0):.1f}°)"
@@ -65,11 +67,7 @@ def get_summary_line(entry):
     else:
         vision = f"{RED}Searching...{END}"
         
-    act = "Idle"
-    if entry.evt:
-        act = f"{MAGENTA}{entry.evt.get('type','unknown')}{END} @ {entry.evt.get('power',0)}"
-        
-    return f"{status} | {vision} | {act} | Pose:{format_pose(entry.pose)}"
+    return f"{status} | {vision} | Pose:{format_pose(entry.pose)}"
 
 def summarize_log(path):
     if not os.path.exists(path):
@@ -79,6 +77,7 @@ def summarize_log(path):
     print(f"{BOLD}{BLUE}Reading Log:{END} {path}")
     
     entries = []
+    keyframes = []
     try:
         with open(path, 'r') as f:
             for line in f:
@@ -90,7 +89,14 @@ def summarize_log(path):
                     line = line[:-1]
                 try:
                     data = json.loads(line)
-                    entries.append(LogEntry(data))
+                    entry_type = data.get("type")
+                    if entry_type == "state":
+                        entries.append(LogEntry(data))
+                    elif entry_type == "keyframe":
+                        keyframes.append({
+                            "ts": data.get("timestamp", 0),
+                            "marker": data.get("marker")
+                        })
                 except json.JSONDecodeError:
                     continue
     except Exception as e:
@@ -112,7 +118,6 @@ def summarize_log(path):
     output_lines.append("Timeline Summary:")
 
     def get_period_desc(e):
-        act_type = e.evt.get('type') if e.evt else "Idle"
         vis = e.brick.get('visible', False)
         
         base_desc = ""
@@ -131,9 +136,6 @@ def summarize_log(path):
             base_desc = "Putting down brick..."
         else:
             base_desc = f"Objective: {e.obj}"
-            
-        if act_type != "Idle":
-            base_desc += f" [Moving: {act_type}]"
             
         return base_desc
 
@@ -157,12 +159,10 @@ def summarize_log(path):
         'min_dist': float('inf'),
         'max_dist': float('-inf'),
         'vis_count': 0,
-        'move_types': set()
     }
     
     for i, e in enumerate(entries):
         elapsed = e.ts - start_ts
-        mtype = e.evt.get('type') if e.evt else "Idle"
         dist = e.brick.get('dist', 0) if e.brick.get('visible') else None
         seated = e.brick.get('seated', False)
         held = e.brick.get('held', False)
@@ -177,8 +177,6 @@ def summarize_log(path):
                 current_p['min_dist'] = min(current_p['min_dist'], dist)
                 current_p['max_dist'] = max(current_p['max_dist'], dist)
                 current_p['vis_count'] += 1
-            if mtype != "Idle":
-                current_p['move_types'].add(mtype)
         else:
             # Commit current
             current_p['end'] = elapsed
@@ -193,14 +191,11 @@ def summarize_log(path):
                 'min_dist': float('inf'),
                 'max_dist': float('-inf'),
                 'vis_count': 0,
-                'move_types': set()
             }
             if dist is not None:
                 current_p['min_dist'] = dist
                 current_p['max_dist'] = dist
                 current_p['vis_count'] = 1
-            if mtype != "Idle":
-                current_p['move_types'].add(mtype)
                 
     # Final flush
     current_p['end'] = entries[-1].ts - start_ts
@@ -228,11 +223,6 @@ def summarize_log(path):
         elif p['seated']:
             desc += f" {BOLD}{ORANGE_M}(SEATED){END}"
             
-        # Add movement info if any
-        if p['move_types']:
-            moves = ", ".join(sorted(list(p['move_types'])))
-            desc += f" [Actions: {moves}]"
-        
         # Add vision info
         if p['vis_count'] > 0:
             d_min, d_max = p['min_dist'], p['max_dist']
@@ -249,13 +239,12 @@ def summarize_log(path):
     
     # --- SPECIAL EVENTS ---
     # Highlights for Success/Abort/Wall
-    for e in entries:
-        elapsed = e.ts - start_ts
-        etype = e.evt.get('type') if e.evt else None
-        
-        if etype == "JOB_SUCCESS":
+    for kf in keyframes:
+        elapsed = kf["ts"] - start_ts
+        marker = kf.get("marker")
+        if marker == "JOB_SUCCESS":
             output_lines.append(f"{BOLD}{GREEN}      >>> JOB SUCCESS CONFIRMED at {elapsed:.1f}s <<<{END}")
-        elif etype == "JOB_ABORT":
+        elif marker == "JOB_ABORT":
             output_lines.append(f"{BOLD}{RED}      >>> JOB ABORTED at {elapsed:.1f}s <<<{END}")
             
     wall_set_time = None
@@ -310,7 +299,7 @@ if __name__ == "__main__":
     log_path = args.log_path or find_latest_log()
     
     if not log_path:
-        print("No log files found in demos/. Use the recorder first!")
+        print(f"No log files found in {DEMOS_DIR}. Use the recorder first!")
         sys.exit(1)
         
     summarize_log(log_path)

@@ -7,6 +7,7 @@ import threading
 import cv2
 import numpy as np
 from flask import Flask, Response
+from pathlib import Path
 
 from robot_control import Robot
 from train_brick_vision import BrickDetector
@@ -20,6 +21,7 @@ SLOWDOWN_FACTOR = 1.0 # default to real time
 SMART_REPLAY = True
 STREAM_ENABLED = True # Default, will be updated by args
 DEBUG_MODE = False
+DEMOS_DIR = Path(__file__).resolve().parent / "demos"
 
 # Continuous motion config - never stop moving
 SCAN_SPEED = 0.4  # Constant slow scanning speed
@@ -39,10 +41,9 @@ class AutoplayState:
         
         # Logging
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.demos_dir = os.path.join(os.getcwd(), "demos")
-        if not os.path.exists(self.demos_dir):
-            os.makedirs(self.demos_dir)
-        log_path = os.path.join(self.demos_dir, f"auto_{timestamp}.json")
+        self.demos_dir = DEMOS_DIR
+        self.demos_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.demos_dir / f"auto_{timestamp}.json"
         self.logger = TelemetryLogger(log_path)
         print(f"[SESSION] Recording Auto-Log to: {log_path}")
 
@@ -124,24 +125,24 @@ def vision_thread():
         
         time.sleep(0.05)
 
-def load_demo(session_name):
+def load_demo(session_name, include_attempts=False):
     # Support both directory-style (old) and flat-file-style (new)
-    path = f"demos/{session_name}"
-    if not os.path.exists(path):
+    path = DEMOS_DIR / session_name
+    if not path.exists():
         if not session_name.endswith(".json"):
-            path = f"demos/{session_name}.json"
+            path = DEMOS_DIR / f"{session_name}.json"
         else:
-            path = f"demos/{session_name}"
+            path = DEMOS_DIR / session_name
 
-    if os.path.isdir(path):
+    if path.is_dir():
         base_path = path
-        path = os.path.join(base_path, "a_log.json")
-        if not os.path.exists(path):
-            path = os.path.join(base_path, "log.json")
+        path = base_path / "a_log.json"
+        if not path.exists():
+            path = base_path / "log.json"
     
-    if not os.path.exists(path):
+    if not path.exists():
         print(f"Error: Session {session_name} not found.")
-        return None, None
+        return (None, None, None) if include_attempts else (None, None)
 
     try:
         with open(path, 'r') as f:
@@ -156,9 +157,11 @@ def load_demo(session_name):
             else:
                 raise 
         except:
-            return None, None
+            return (None, None, None) if include_attempts else (None, None)
     
     log_data = [x for x in log_data if x is not None and isinstance(x, dict)]
+
+    attempts = extract_demo_attempts(log_data) if include_attempts else None
 
     # --- HEURISTIC EXTRACTION ---
     heuristics = {}
@@ -183,11 +186,27 @@ def load_demo(session_name):
                 h['samples'] += 1
         elif etype == 'state':
             last_state_entry = entry
-            if entry.get('last_event'):
+        elif etype in ('action', 'event'):
+            if etype == 'action':
+                cmd_name = entry.get('command')
+                power = entry.get('power', 0)
+                duration_ms = entry.get('duration_ms')
+            else:
+                event = entry.get('event') or {}
+                cmd_name = event.get('type')
+                power = event.get('power', 0)
+                duration_ms = event.get('duration_ms')
+
+            event_obj = entry.get('objective')
+            if event_obj:
+                current_obj = event_obj
+            cmd = event_type_to_cmd(cmd_name)
+            if cmd and duration_ms:
                 raw_events.append({
-                    'obj': current_obj or entry.get('objective'),
-                    'cmd': event_type_to_cmd(entry['last_event']['type']),
-                    'duration': entry['last_event']['duration_ms'] / 1000.0
+                    'obj': current_obj,
+                    'cmd': cmd,
+                    'duration': duration_ms / 1000.0,
+                    'speed': (power or 0) / 255.0
                 })
 
     if heuristics:
@@ -195,19 +214,108 @@ def load_demo(session_name):
         for obj, h in heuristics.items():
             print(f"  {obj:<8} | OffX: {h['max_offset_x']:4.1f} | Ang: {h['max_angle']:4.1f} | Vis: {h['final_visibility']} | n={h['samples']}")
     
-    if not raw_events: return [], heuristics
+    if not raw_events:
+        return ([], heuristics, attempts) if include_attempts else ([], heuristics)
     
-    merged_events = []
-    curr = raw_events[0].copy()
-    for nxt in raw_events[1:]:
-        if (nxt.get('obj') == curr.get('obj') and nxt['cmd'] == curr['cmd']):
-            curr['duration'] += nxt['duration']
+    merged_events = merge_demo_events(raw_events)
+    return (merged_events, heuristics, attempts) if include_attempts else (merged_events, heuristics)
+
+ATTEMPT_START_MARKERS = {
+    "FAIL_START": "FAIL",
+    "RECOVER_START": "RECOVER",
+    "SUCCESS_START": "SUCCESS"
+}
+
+ATTEMPT_END_MARKERS = {
+    "FAIL_END": "FAIL",
+    "RECOVER_END": "RECOVER",
+    "SUCCESS_END": "SUCCESS"
+}
+
+def merge_demo_events(events, speed_tol=0.02):
+    if not events:
+        return []
+    merged = []
+    for evt in events:
+        if not merged:
+            merged.append(evt.copy())
+            continue
+        prev = merged[-1]
+        same_cmd = evt.get('cmd') == prev.get('cmd')
+        same_obj = evt.get('obj') == prev.get('obj')
+        speed_match = abs(evt.get('speed', 0) - prev.get('speed', 0)) <= speed_tol
+        if same_cmd and same_obj and speed_match:
+            prev['duration'] += evt.get('duration', 0)
         else:
-            merged_events.append(curr)
-            curr = nxt.copy()
-    merged_events.append(curr)
-    
-    return merged_events, heuristics
+            merged.append(evt.copy())
+    return merged
+
+def extract_demo_attempts(log_data):
+    attempts = {"FAIL": [], "RECOVER": [], "SUCCESS": []}
+    current_obj = None
+    current_type = None
+    current_events = []
+
+    def flush_attempt():
+        nonlocal current_events
+        if current_type and current_events:
+            attempts[current_type].append(merge_demo_events(current_events))
+        current_events = []
+
+    for entry in log_data:
+        if not isinstance(entry, dict):
+            continue
+        etype = entry.get('type')
+        if etype == 'keyframe':
+            obj_field = entry.get('objective')
+            if obj_field:
+                current_obj = obj_field
+            marker = entry.get('marker')
+            if marker in ATTEMPT_START_MARKERS:
+                if current_type != ATTEMPT_START_MARKERS[marker]:
+                    flush_attempt()
+                current_type = ATTEMPT_START_MARKERS[marker]
+            elif marker in ATTEMPT_END_MARKERS:
+                if current_type == ATTEMPT_END_MARKERS[marker]:
+                    flush_attempt()
+                current_type = None
+            continue
+
+        if etype not in ('action', 'event'):
+            continue
+
+        if etype == 'action':
+            cmd_name = entry.get('command')
+            power = entry.get('power', 0)
+            duration_ms = entry.get('duration_ms')
+        else:
+            event = entry.get('event') or {}
+            cmd_name = event.get('type')
+            power = event.get('power', 0)
+            duration_ms = event.get('duration_ms')
+
+        event_obj = entry.get('objective')
+        if event_obj:
+            current_obj = event_obj
+        cmd = event_type_to_cmd(cmd_name)
+        if cmd and duration_ms and current_type:
+            current_events.append({
+                'obj': current_obj,
+                'cmd': cmd,
+                'duration': duration_ms / 1000.0,
+                'speed': (power or 0) / 255.0
+            })
+
+    flush_attempt()
+    return attempts
+
+def pick_best_attempt(attempts, attempt_type):
+    if not attempts:
+        return None
+    sequences = attempts.get(attempt_type, [])
+    if not sequences:
+        return None
+    return max(sequences, key=lambda seq: sum(evt.get('duration', 0) for evt in seq))
 
 def event_type_to_cmd(event_type):
     mapping = {
@@ -276,15 +384,15 @@ def summarize_all_demos():
     print(f"{'-'*90}")
 
     for s in sessions:
-        path = f"demos/{s}"
-        if os.path.isdir(path):
-             p = os.path.join(path, "a_log.json")
-             if not os.path.exists(p): p = os.path.join(path, "log.json")
+        path = DEMOS_DIR / s
+        if path.is_dir():
+             p = path / "a_log.json"
+             if not p.exists(): p = path / "log.json"
              path = p
-        elif not path.endswith(".json"):
-             path += ".json"
+        elif path.suffix != ".json":
+             path = path.with_suffix(".json")
         
-        if not os.path.exists(path): continue
+        if not path.exists(): continue
         ok, stats, _ = validate_log_integrity(path)
         if not stats: continue
 
@@ -299,10 +407,10 @@ def summarize_all_demos():
     print(f"{'='*90}\n")
 
 def find_sessions():
-    demos_dir = "demos"
-    if not os.path.exists(demos_dir): return []
+    demos_dir = DEMOS_DIR
+    if not demos_dir.exists(): return []
     items = os.listdir(demos_dir)
-    sessions = [f for f in items if f.endswith(".json") or os.path.isdir(os.path.join(demos_dir, f))]
+    sessions = [f for f in items if f.endswith(".json") or (demos_dir / f).is_dir()]
     sessions.sort(reverse=True)
     return sessions
 
@@ -316,15 +424,15 @@ def aggregate_heuristics():
     
     for s in sessions:
         # Resolve Path
-        path = f"demos/{s}"
-        if os.path.isdir(path):
-             p = os.path.join(path, "a_log.json")
-             if not os.path.exists(p): p = os.path.join(path, "log.json")
+        path = DEMOS_DIR / s
+        if path.is_dir():
+             p = path / "a_log.json"
+             if not p.exists(): p = path / "log.json"
              path = p
-        elif not path.endswith(".json"):
-             path += ".json"
+        elif path.suffix != ".json":
+             path = path.with_suffix(".json")
         
-        if not os.path.exists(path): continue
+        if not path.exists(): continue
         
         # Load Data
         try:
@@ -395,6 +503,7 @@ def execute_and_track_smooth(cmd, duration, base_speed):
     
     evt = MotionEvent(m_type, pwm, int(duration * 1000))
     app_state.world.update_from_motion(evt)
+    app_state.logger.log_event(evt, app_state.world.objective_state.value)
     
     # 2. Execute with dynamic speed adjustment - NO PAUSES
     start_time = time.time()
@@ -413,6 +522,42 @@ def execute_and_track_smooth(cmd, duration, base_speed):
         current_time = time.time()
         app_state.robot.send_command(cmd, current_speed)
         last_send = current_time 
+
+def replay_demo_attempt(events, objective, attempt_status, start_marker, end_marker, tick_hz=20):
+    if not events:
+        return False
+
+    app_state.logger.log_keyframe(start_marker, objective)
+    with app_state.lock:
+        app_state.world.attempt_status = attempt_status
+        app_state.world.recording_active = True
+
+    dt = 1.0 / tick_hz
+    for evt in events:
+        if not app_state.running:
+            break
+        cmd = evt.get('cmd')
+        speed = max(0.0, min(1.0, evt.get('speed', 0.0)))
+        duration = evt.get('duration', 0.0) * SLOWDOWN_FACTOR
+        if not cmd or duration <= 0:
+            continue
+        elapsed = 0.0
+        while elapsed < duration and app_state.running:
+            step = min(dt, duration - elapsed)
+            app_state.robot.send_command(cmd, speed)
+            motion_evt = MotionEvent(cmd_to_motion_type(cmd), int(speed * 255), int(step * 1000))
+            with app_state.lock:
+                app_state.world.update_from_motion(motion_evt)
+            app_state.logger.log_event(motion_evt, objective)
+            time.sleep(step)
+            elapsed += step
+
+    app_state.robot.stop()
+    app_state.logger.log_keyframe(end_marker, objective)
+    with app_state.lock:
+        app_state.world.attempt_status = "NORMAL"
+        app_state.world.recording_active = False
+    return True
 
 
 
@@ -658,6 +803,13 @@ def main_autoplay(session_name):
     print("  Sequence: SUCCESS → FAIL → RECOVER → SUCCESS\n")
     
     learned_rules = aggregate_heuristics()
+    demo_attempts = None
+    demo_fail = None
+    demo_recover = None
+    if SMART_REPLAY and session_name:
+        _, _, demo_attempts = load_demo(session_name, include_attempts=True)
+        demo_fail = pick_best_attempt(demo_attempts, "FAIL")
+        demo_recover = pick_best_attempt(demo_attempts, "RECOVER")
     
     # Initialize (done once for all scenarios)
     app_state.robot = Robot()
@@ -679,6 +831,8 @@ def main_autoplay(session_name):
         scenario_type = "recover" if name == "RECOVER" else ("fail" if name == "FAIL" else "normal")
         min_success_time = 1.0
         min_success_cycles = 5
+        use_demo_fail = scenario_type == "fail" and demo_fail
+        use_demo_recover = scenario_type == "recover" and demo_recover
         
         print(f"{'='*70}")
         print(f"SCENARIO {idx}/4: {name} (timeout={timeout}s, type={scenario_type})")
@@ -686,52 +840,64 @@ def main_autoplay(session_name):
         
         # Log start
         if scenario_type == "recover":
-            app_state.logger.log_keyframe("RECOVER_START", "FIND")
+            if not use_demo_recover:
+                app_state.logger.log_keyframe("RECOVER_START", "FIND")
         else:
             app_state.logger.log_keyframe("OBJ_START", "FIND")
         
         with app_state.lock:
             app_state.world.reset_mission()
             app_state.world.objective_state = ObjectiveState.FIND
+            if use_demo_fail:
+                app_state.world.attempt_status = "FAIL"
+            elif use_demo_recover:
+                app_state.world.attempt_status = "RECOVERY"
         
-        # Run scenario
-        current_velocity = {'linear': 0.0, 'angular': 0.1}
-        run_start = time.time()
-        cycle_count = 0
-        success_flag = False
-        
-        while time.time() - run_start < timeout:
-            with app_state.lock:
-                allow_success = cycle_count >= min_success_cycles and (time.time() - run_start) >= min_success_time
-                if allow_success and app_state.world.check_objective_complete():
-                    print(f"  ✓ Objective complete! ({cycle_count} cycles)\n")
-                    app_state.logger.log_keyframe("OBJ_SUCCESS", "FIND")
-                    success_flag = True
-                    break
-                
-                brick_visible = app_state.world.brick['visible']
-                angle = app_state.world.brick['angle']
-                offset_x = app_state.world.brick['offset_x']
-                dist = app_state.world.brick['dist']
+        if use_demo_fail:
+            print("  → Replaying FAIL demo attempt")
+            replay_demo_attempt(demo_fail, "FIND", "FAIL", "FAIL_START", "FAIL_END")
+        elif use_demo_recover:
+            print("  → Replaying RECOVERY demo attempt")
+            replay_demo_attempt(demo_recover, "FIND", "RECOVERY", "RECOVER_START", "RECOVER_END")
+        else:
+            # Run scenario
+            current_velocity = {'linear': 0.0, 'angular': 0.1}
+            run_start = time.time()
+            cycle_count = 0
+            success_flag = False
             
-            target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist)
-            smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
-            cmd, speed = velocity_to_command(smoothed_velocity)
-            app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
-            current_velocity = smoothed_velocity
-            cycle_count += 1
-            time.sleep(0.05)  # 20Hz
-        
-        total_time = time.time() - run_start
-        app_state.robot.stop()
-        
-        # Log result
-        if not success_flag:
-            print(f"  ✗ Failed: Timeout {total_time:.1f}s\n")
-            app_state.logger.log_keyframe("FAIL_START", "FIND")
-            app_state.logger.log_keyframe("FAIL_END", "FIND")
-        elif scenario_type == "recover":
-            app_state.logger.log_keyframe("RECOVER_END", "FIND")
+            while time.time() - run_start < timeout:
+                with app_state.lock:
+                    allow_success = cycle_count >= min_success_cycles and (time.time() - run_start) >= min_success_time
+                    if allow_success and app_state.world.check_objective_complete():
+                        print(f"  ✓ Objective complete! ({cycle_count} cycles)\n")
+                        app_state.logger.log_keyframe("OBJ_SUCCESS", "FIND")
+                        success_flag = True
+                        break
+                    
+                    brick_visible = app_state.world.brick['visible']
+                    angle = app_state.world.brick['angle']
+                    offset_x = app_state.world.brick['offset_x']
+                    dist = app_state.world.brick['dist']
+                
+                target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist)
+                smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
+                cmd, speed = velocity_to_command(smoothed_velocity)
+                app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
+                current_velocity = smoothed_velocity
+                cycle_count += 1
+                time.sleep(0.05)  # 20Hz
+            
+            total_time = time.time() - run_start
+            app_state.robot.stop()
+            
+            # Log result
+            if not success_flag:
+                print(f"  ✗ Failed: Timeout {total_time:.1f}s\n")
+                app_state.logger.log_keyframe("FAIL_START", "FIND")
+                app_state.logger.log_keyframe("FAIL_END", "FIND")
+            elif scenario_type == "recover":
+                app_state.logger.log_keyframe("RECOVER_END", "FIND")
         
         # Pause between scenarios
         if idx < 4:

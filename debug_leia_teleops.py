@@ -111,7 +111,7 @@ class TeleopManager:
                 if action:
                     event = MotionEvent(action, pwr, duration_ms)
                     self.world.update_from_motion(event)
-                    # self.logger.log_event(event) # Optional: Log every micro-event? Might span logs.
+                    self.logger.log_event(event, self.world.objective_state.value)
                 
             elif self.state == RobotState.AUTONOMOUS:
                 pass

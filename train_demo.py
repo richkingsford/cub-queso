@@ -12,7 +12,7 @@ import time
 import sys
 import enum
 import cv2
-import os
+from pathlib import Path
 from flask import Flask, Response
 
 from robot_control import Robot
@@ -25,6 +25,7 @@ TCP_PORT = 65432
 WEB_PORT = 5000
 LOG_RATE_HZ = 10
 CMD_TIMEOUT = 0.2 # If no command for 0.2s, stop motors
+DEMOS_DIR = Path(__file__).resolve().parent / "demos"
 
 # --- FLASK ---
 flask_app = Flask(__name__)
@@ -80,15 +81,14 @@ class AppState:
         
         # Session Setup
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.session_dir = os.path.join(os.getcwd(), "demos", timestamp)
-        if not os.path.exists(self.session_dir):
-            os.makedirs(self.session_dir)
+        self.session_dir = DEMOS_DIR / timestamp
+        self.session_dir.mkdir(parents=True, exist_ok=True)
             
         print(f"[SESSION] Recording to: {self.session_dir}")
         
         # Telemetry
         self.world = WorldModel()
-        log_path = os.path.join(self.session_dir, "a_log.json")
+        log_path = self.session_dir / "a_log.json"
         self.logger = TelemetryLogger(log_path)
         self.vision = None
         self.robot = None
@@ -219,6 +219,7 @@ def control_loop():
             pwr = int(app_state.active_speed * 255)
             evt = MotionEvent(atype, pwr, int(dt*1000))
             app_state.world.update_from_motion(evt)
+            app_state.logger.log_event(evt, app_state.world.objective_state.value)
 
         # 5. Log
         app_state.logger.log_state(app_state.world)

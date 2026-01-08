@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+from pathlib import Path
 import sys
 
 def validate_session(session_path):
@@ -78,20 +79,20 @@ def validate_session(session_path):
     return True, f"READY: {complete_runs}/{total_runs} runs, {len(entries)} entries"
 
 def main():
-    demos_dir = os.path.join(os.getcwd(), "demos")
-    if not os.path.exists(demos_dir):
+    demos_dir = Path(__file__).resolve().parent / "demos"
+    if not demos_dir.exists():
         print(f"Error: {demos_dir} not found.")
         return
 
-    sessions = [d for d in os.listdir(demos_dir) if os.path.isdir(os.path.join(demos_dir, d))]
+    sessions = [d for d in os.listdir(demos_dir) if (demos_dir / d).is_dir()]
     sessions.sort(reverse=True)
 
     print(f"{'SESSION':<30} | {'STATUS':<10} | {'REASON/STATS'}")
     print("-" * 70)
 
     for s in sessions:
-        path = os.path.join(demos_dir, s)
-        ok, reason = validate_session(path)
+        path = demos_dir / s
+        ok, reason = validate_session(str(path))
         status = "PASS" if ok else "FAIL"
         print(f"{s:<30} | {status:<10} | {reason}")
 

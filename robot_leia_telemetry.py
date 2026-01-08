@@ -31,6 +31,15 @@ class MotionEvent:
             "timestamp": round(self.timestamp, 3)
         }
 
+MOTION_EVENT_TYPES = {
+    "forward",
+    "backward",
+    "left_turn",
+    "right_turn",
+    "mast_up",
+    "mast_down"
+}
+
 from pathlib import Path
 WORLD_MODEL_FILE = Path(__file__).parent / "world_model.json"
 
@@ -88,8 +97,6 @@ class WorldModel:
         
         self.last_dist = 999.0 # Track last distance for seated heuristic
         
-        # Helper for Event Tracking
-        self.last_event = None
         self.last_image_file = None
         
         # Wiggle Verification
@@ -121,8 +128,6 @@ class WorldModel:
         Updates pose based on motion events (Dead Reckoning).
         Also manages "Wiggle Verification" state machine.
         """
-        self.last_event = event # Track last event
-        
         dt = event.duration_ms / 1000.0
         power_ratio = event.power / 255.0 
         dist_pulse = 0.0
@@ -344,15 +349,6 @@ class WorldModel:
                 'theta': round(self.wall_origin['theta'], 3)
             }
 
-        # Format Last Event
-        evt_fmt = None
-        if self.last_event:
-            evt_fmt = self.last_event.to_dict()
-            # Round event data
-            evt_fmt['power'] = int(evt_fmt['power'])
-            evt_fmt['duration_ms'] = int(evt_fmt['duration_ms'])
-            evt_fmt['timestamp'] = round(evt_fmt['timestamp'], 3)
-
         return {
             "type": "state",
             "timestamp": round(time.time(), 3),
@@ -365,8 +361,7 @@ class WorldModel:
             },
             "wall_origin": wall_fmt,
             "brick": brick_fmt,
-            "lift_height": round(self.lift_height, 2),
-            "last_event": evt_fmt
+            "lift_height": round(self.lift_height, 2)
         }
 
 class TelemetryLogger:
@@ -409,14 +404,28 @@ class TelemetryLogger:
                 self.first_entry = False
 
     def log_event(self, event: MotionEvent, objective=None):
-        """Deprecated: Use log_keyframe or rely on log_state for continuous motion."""
-        # For now, we'll map motion events to keyframes if they are semantic
         semantic_events = ['FAIL', 'RECOVERY_START', 'OBJECTIVE_SUCCESS', 'JOB_SUCCESS', 'JOB_START']
         if event.action_type in semantic_events:
             self.log_keyframe(event.action_type, objective, event.timestamp)
-        else:
-            # Low-level motion is already captured in the high-frequency state logs
-            pass
+            return
+
+        if not self.enabled:
+            return
+
+        if event.action_type not in MOTION_EVENT_TYPES:
+            return
+
+        data = {
+            "type": "action",
+            "timestamp": round(event.timestamp, 3),
+            "command": event.action_type,
+            "power": int(event.power),
+            "duration_ms": int(event.duration_ms)
+        }
+        if objective:
+            data["objective"] = objective
+
+        self._write_row(data)
 
     def close(self):
         """
@@ -470,8 +479,6 @@ class TelemetryLogger:
         p = data.get('robot_pose', {'x':0, 'y':0, 'theta':0})
         b = data.get('brick', {})
         wall = "SET" if data.get('wall_origin') else "UNSET"
-        evt = data.get('last_event')
-        
         print(f"{'='*40}")
         print(f"TIME: {data.get('timestamp', 0):.2f}s")
         if 'objective' in data:
@@ -493,20 +500,12 @@ class TelemetryLogger:
             print(f"  Confidence: {b.get('confidence', 0):.2f}%")
         print(f"{'-'*40}")
         
-        if evt:
-            age = data.get('timestamp', 0) - evt.get('timestamp', 0)
-            print(f"LAST EVENT: {evt.get('type', 'unknown')}")
-            print(f"  Power: {evt.get('power', 0)}")
-            print(f"  Duration: {evt.get('duration_ms', 0):.2f}ms")
-            print(f"  Age: {age:.2f}s")
-        else:
-            print(f"LAST EVENT: None")
         print(f"{'='*40}")
 
 # --- SHARED VISUALIZATION ---
 import cv2
 
-def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders=None, gear=None):
+def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders=None, gear=None, show_prompt=True):
     """
     Simplified HUD renderer.
     - Merged objective/checklist/status into single-line prompt.
@@ -552,28 +551,41 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders
     status_label = f" ({wm.attempt_status})" if wm.attempt_status != "NORMAL" else ""
     put_line(f"OBJ: {state_label}{status_label}", GREEN, 0.45, 1) # Objective Header
     
-    # Prompts based on attempt status and recording state
-    if wm.attempt_status == "NORMAL":
-        if not wm.recording_active:
-            prompt = f"Press 'f' to BEGIN {state_label} (FAIL version)"
+    if show_prompt:
+        # Prompts based on attempt status and recording state
+        if wm.attempt_status == "NORMAL":
+            if not wm.recording_active:
+                prompt = f"Press 'f' to BEGIN {state_label} (FAIL version)"
+            else:
+                prompt = f"Show clean {state_label} (+ Press 'f' when done)"
+        elif wm.attempt_status == "FAIL":
+            prompt = f"Press 'f' to BEGIN RECOVERY for {state_label}"
+        elif wm.attempt_status == "RECOVERY":
+            prompt = f"Press 'f' to finish recovery & start SUCCESS demo"
         else:
-            prompt = f"Show clean {state_label} (+ Press 'f' when done)"
-    elif wm.attempt_status == "FAIL":
-        prompt = f"Press 'f' to BEGIN RECOVERY for {state_label}"
-    elif wm.attempt_status == "RECOVERY":
-        prompt = f"Press 'f' to finish recovery & start SUCCESS demo"
+            prompt = f"Current focus: {state_label}"
+        
+        # Override with specific override if provided (e.g. from Keyboard Demo)
+        if extra_messages:
+            if isinstance(extra_messages, list): prompt = extra_messages[-1]
+            else: prompt = extra_messages
+
+        put_line(prompt, (0, 255, 255), 0.38, 1)
+        y_cur += 10
     else:
-        prompt = f"Current focus: {state_label}"
-    
-    # Override with specific override if provided (e.g. from Keyboard Demo)
-    if extra_messages:
-        if isinstance(extra_messages, list): prompt = extra_messages[-1]
-        else: prompt = extra_messages
+        y_cur += 5
 
-    put_line(prompt, (0, 255, 255), 0.38, 1)
-    y_cur += 10
+    # 4. Reminders
+    if reminders:
+        put_line("--- REMINDERS ---", WHITE, 0.35, 1)
+        if isinstance(reminders, list):
+            for msg in reminders:
+                put_line(str(msg), WHITE, 0.35, 1)
+        else:
+            put_line(str(reminders), WHITE, 0.35, 1)
+        y_cur += 5
 
-    # 4. Position Info
+    # 5. Position Info
     put_line("--- BRICK[0] TELEMETRY ---", WHITE, 0.35, 1)
     put_line(f"OFFSET: {wm.brick['offset_x']:.1f} mm", GREEN, 0.38, 1)
     put_line(f"ANGLE:  {wm.brick['angle']:.1f} deg", GREEN, 0.38, 1)
@@ -586,7 +598,7 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders
     put_line(f"THETA:  {wm.theta:.1f} deg", (200, 200, 255), 0.38, 1)
     put_line(f"LIFT:   {wm.lift_height:.0f} mm", (200, 200, 255), 0.38, 1)
     
-    # 5. CONTROLS (Moved up below telemetry)
+    # 6. CONTROLS (Moved up below telemetry)
     y_cur += 10
     put_line("--- CONTROLS ---", WHITE, 0.35, 1)
     put_line("W/S: DRIVE (Fwd/Bwd)", WHITE, 0.35, 1)
@@ -595,31 +607,24 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders
     put_line("F: NEXT ACTION Cycle", WHITE, 0.35, 1)
     put_line("Q: QUIT", WHITE, 0.35, 1)
 
-    # 6. Vision Info
+    # 7. Vision Info
     y_cur += 15
     vis_txt = "VISION: LOCKED" if wm.brick['visible'] else "VISION: SEARCHING"
     vis_col = ORANGE if wm.brick['visible'] else (0, 0, 255)
     put_line(vis_txt, vis_col, 0.38, 1)
     
-    # 7. Action Tracking
-    y_cur += 10
-    if wm.last_event:
-        put_line(f"ACT: {wm.last_event.action_type}", (255, 0, 255), 0.35, 1)
-    else:
-        put_line("ACT: IDLE", (100, 100, 100), 0.35, 1)
-
-    # 7b. Verification Progress
+    # 8. Verification Progress
     if wm.verification_stage != "IDLE":
         put_line(f"VERIFY: {wm.verification_stage}", YELLOW, thickness=1)
 
     y_cur += 8 # Spacer
 
-    # 8. Extra Messages (Banners -> Moved to Sidebar)
+    # 9. Extra Messages (Banners -> Moved to Sidebar)
     if extra_messages:
         y_cur = h - 20
         for msg in extra_messages:
              put_line(f"! {msg}", (0, 0, 255), 0.4, 2)
 
-    # 9. GEAR Display
+    # 10. GEAR Display
     if gear:
         cv2.putText(frame, f"GEAR: {gear}", (x_base, h - 35), font, 0.4, YELLOW, 2)
