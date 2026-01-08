@@ -378,32 +378,7 @@ def aggregate_heuristics():
             
     return merged_heuristics
 
-def main_autoplay(session_name):
-    all_events, _ = load_demo(session_name)
-    if not all_events: return
-    
-    # Filter for FIND only as requested
-    find_events = [e for e in all_events if e.get('obj') == 'FIND']
-    if not find_events:
-        print("[AUTOPLAY] No 'FIND' events in this demo.")
-        return
 
-    # Use global learning instead of just local demo rules
-    learned_rules = aggregate_heuristics()
-
-    app_state.robot = Robot()
-    app_state.world.learned_rules = learned_rules
-    
-    threading.Thread(target=vision_thread, daemon=True).start()
-    if STREAM_ENABLED:
-        threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False), daemon=True).start()
-    
-    print(f"[AUTOPLAY] Loaded {len(find_events)} FIND events. Warming up vision...")
-    warmup_start = time.time()
-    while time.time() - warmup_start < 2.0:
-        with app_state.lock:
-            if app_state.current_frame is not None: break
-        time.sleep(0.1)
 
 def cmd_to_motion_type(cmd):
     m = {'f': 'forward', 'b': 'backward', 'l': 'left_turn', 'r': 'right_turn', 'u': 'mast_up', 'd': 'mast_down'}
@@ -571,17 +546,26 @@ def continuous_autoplay(learned_rules):
     CONTROL_HZ = 20  # 20 Hz control loop
     CONTROL_DT = 1.0 / CONTROL_HZ
     
+    # Failure detection parameters
+    MAX_RUN_DURATION = 60.0  # Max time before timeout failure
+    MAX_BRICK_LOST_TIME = 10.0  # Max time without seeing brick
+    
     # State variables
     current_velocity = {'linear': 0.0, 'angular': 0.1}  # Start with slow turn
     run_start = time.time()
-    max_run_duration = 60.0
     cycle_count = 0
     last_log_time = run_start
     
+    # Failure tracking
+    brick_first_seen_time = None
+    brick_last_seen_time = None
+    failure_reason = None
+    
     print(f"  └─ Running at {CONTROL_HZ}Hz | Min speed: 10% | Velocity smoothing: EMA")
+    print(f"  └─ Failure detection: Timeout={MAX_RUN_DURATION}s | Brick lost={MAX_BRICK_LOST_TIME}s")
     
     # MAIN CONTROL LOOP - Fixed frequency
-    while time.time() - run_start < max_run_duration:
+    while time.time() - run_start < MAX_RUN_DURATION:
         cycle_start = time.time()
         
         if not app_state.running:
@@ -601,6 +585,21 @@ def continuous_autoplay(learned_rules):
             angle = app_state.world.brick['angle']
             offset_x = app_state.world.brick['offset_x']
             dist = app_state.world.brick['dist']
+        
+        # Track brick visibility for failure detection
+        current_time = time.time()
+        if brick_visible:
+            if brick_first_seen_time is None:
+                brick_first_seen_time = current_time
+                print(f"  ✓ First brick detection at {cycle_count} cycles")
+            brick_last_seen_time = current_time
+        
+        # FAILURE DETECTION: Lost brick for too long
+        if brick_first_seen_time is not None and brick_last_seen_time is not None:
+            time_since_brick_seen = current_time - brick_last_seen_time
+            if time_since_brick_seen > MAX_BRICK_LOST_TIME:
+                failure_reason = f"Lost brick for {time_since_brick_seen:.1f}s"
+                break
         
         # 2. COMPUTE TARGET VELOCITY VECTOR
         target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist)
@@ -632,24 +631,115 @@ def continuous_autoplay(learned_rules):
         if sleep_time > 0:
             time.sleep(sleep_time)
     
-    # Clean shutdown
-    app_state.robot.stop()
-    app_state.logger.log_keyframe("JOB_SUCCESS")
-    
+    # Check for timeout failure
     total_time = time.time() - run_start
+    if total_time >= MAX_RUN_DURATION and failure_reason is None:
+        failure_reason = f"Timeout: {total_time:.1f}s"
+    
+    # Clean shutdown with failure logging
+    app_state.robot.stop()
+    
+    if failure_reason:
+        print(f"\n✗ FIND Objective FAILED: {failure_reason}")
+        app_state.logger.log_keyframe("FAIL_START", "FIND")
+        app_state.logger.log_keyframe("FAIL_END", "FIND")
+    
+    app_state.logger.log_keyframe("JOB_SUCCESS")  # Job completes even if objective failed
+    
     avg_hz = cycle_count / total_time if total_time > 0 else 0
-    print(f"\n[AUTOPLAY] Run complete: {cycle_count} cycles in {total_time:.1f}s (avg {avg_hz:.1f}Hz)")
+    status_icon = "✗" if failure_reason else "✓"
+    print(f"\n[AUTOPLAY] {status_icon} Run complete: {cycle_count} cycles in {total_time:.1f}s (avg {avg_hz:.1f}Hz)")
     app_state.logger.close()
     app_state.running = False
 
 def main_autoplay(session_name):
-    # We don't load demos anymore - we use learned rules for success criteria only
-    print("[AUTOPLAY] Using continuous predictive control (not replaying demos)")
+    # Multi-scenario training: SUCCESS → FAIL → RECOVER → SUCCESS
+    print("\n[AUTOPLAY] Multi-scenario training mode")
+    print("  Sequence: SUCCESS → FAIL → RECOVER → SUCCESS\n")
     
-    # Use global learning for success criteria
     learned_rules = aggregate_heuristics()
-
-    continuous_autoplay(learned_rules)
+    
+    # Initialize (done once for all scenarios)
+    app_state.robot = Robot()
+    app_state.world.learned_rules = learned_rules
+    threading.Thread(target=vision_thread, daemon=True).start()
+    if STREAM_ENABLED:
+        threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False), daemon=True).start()
+    
+    # Warmup
+    print("Warming up vision...")
+    warmup_start = time.time()
+    while time.time() - warmup_start < 2.0:
+        with app_state.lock:
+            if app_state.current_frame is not None: break
+        time.sleep(0.1)
+    
+    # Run 4 training scenarios
+    for idx, (name, timeout) in enumerate([("SUCCESS #1", 60), ("FAIL", 5), ("RECOVER", 60), ("SUCCESS #2", 60)], 1):
+        scenario_type = "recover" if name == "RECOVER" else ("fail" if name == "FAIL" else "normal")
+        
+        print(f"{'='*70}")
+        print(f"SCENARIO {idx}/4: {name} (timeout={timeout}s, type={scenario_type})")
+        print(f"{'='*70}\n")
+        
+        # Log start
+        if scenario_type == "recover":
+            app_state.logger.log_keyframe("RECOVER_START", "FIND")
+        else:
+            app_state.logger.log_keyframe("OBJ_START", "FIND")
+        
+        with app_state.lock:
+            app_state.world.objective_state = ObjectiveState.FIND
+        
+        # Run scenario
+        current_velocity = {'linear': 0.0, 'angular': 0.1}
+        run_start = time.time()
+        cycle_count = 0
+        success_flag = False
+        
+        while time.time() - run_start < timeout:
+            with app_state.lock:
+                if app_state.world.check_objective_complete():
+                    print(f"  ✓ Objective complete! ({cycle_count} cycles)\n")
+                    app_state.logger.log_keyframe("OBJ_SUCCESS", "FIND")
+                    success_flag = True
+                    break
+                
+                brick_visible = app_state.world.brick['visible']
+                angle = app_state.world.brick['angle']
+                offset_x = app_state.world.brick['offset_x']
+                dist = app_state.world.brick['dist']
+            
+            target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist)
+            smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
+            cmd, speed = velocity_to_command(smoothed_velocity)
+            app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
+            current_velocity = smoothed_velocity
+            cycle_count += 1
+            time.sleep(0.05)  # 20Hz
+        
+        total_time = time.time() - run_start
+        app_state.robot.stop()
+        
+        # Log result
+        if not success_flag:
+            print(f"  ✗ Failed: Timeout {total_time:.1f}s\n")
+            app_state.logger.log_keyframe("FAIL_START", "FIND")
+            app_state.logger.log_keyframe("FAIL_END", "FIND")
+        elif scenario_type == "recover":
+            app_state.logger.log_keyframe("RECOVER_END", "FIND")
+        
+        # Pause between scenarios
+        if idx < 4:
+            print("  → Pausing 2s before next scenario...\n")
+            time.sleep(2.0)
+    
+    app_state.logger.close()
+    app_state.running = False
+    
+    print(f"\n{'='*70}")
+    print("✓ ALL TRAINING SCENARIOS COMPLETE") 
+    print(f"{'='*70}\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
