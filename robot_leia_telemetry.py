@@ -266,27 +266,31 @@ class WorldModel:
         return self.stability_count >= self.stability_threshold
 
     def check_objective_complete(self):
-        """Checks if success criteria are met using ONLY learned rules from demos."""
+        """Checks if success criteria are met using learned rules from demos."""
         obj_name = self.objective_state.value
         learned = self.learned_rules.get(obj_name, {})
         
         if not learned:
-            # If we don't have learned data for this objective (e.g. PLACE at the very end)
-            # just return False to let it run its recorded duration.
             return False
-            
-        # 1. Logic-based Criteria
-        if obj_name == "ALIGN":
-            # ALIGN is complete when the data-driven 'perfect_align' flag is set
-            if self.brick.get("perfect_align"):
-                return True
-        
-        elif "final_visibility" in learned:
-            # For FIND / SCOOP, check if we've reached the desired visibility state
-            if self.brick["visible"] == learned["final_visibility"]:
-                return True
 
-        return False
+        # Check Visibility First
+        target_vis = learned.get("final_visibility", True)
+        if self.brick["visible"] != target_vis:
+            return False
+
+        # If we need to see it, check tolerances
+        if target_vis:
+            # Check Offset X
+            max_x = learned.get("max_offset_x", 0)
+            if abs(self.brick["offset_x"]) > max_x:
+                return False
+            
+            # Check Angle
+            max_ang = learned.get("max_angle", 0)
+            if abs(self.brick["angle"]) > max_ang:
+                return False
+
+        return True
 
     def next_objective(self):
         """Cycles through the 4-step mission: FIND -> SCOOP -> LIFT -> PLACE"""
@@ -340,6 +344,15 @@ class WorldModel:
                 'theta': round(self.wall_origin['theta'], 3)
             }
 
+        # Format Last Event
+        evt_fmt = None
+        if self.last_event:
+            evt_fmt = self.last_event.to_dict()
+            # Round event data
+            evt_fmt['power'] = int(evt_fmt['power'])
+            evt_fmt['duration_ms'] = int(evt_fmt['duration_ms'])
+            evt_fmt['timestamp'] = round(evt_fmt['timestamp'], 3)
+
         return {
             "type": "state",
             "timestamp": round(time.time(), 3),
@@ -352,7 +365,8 @@ class WorldModel:
             },
             "wall_origin": wall_fmt,
             "brick": brick_fmt,
-            "lift_height": round(self.lift_height, 2)
+            "lift_height": round(self.lift_height, 2),
+            "last_event": evt_fmt
         }
 
 class TelemetryLogger:
@@ -560,11 +574,17 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders
     y_cur += 10
 
     # 4. Position Info
-    put_line("--- TELEMETRY ---", WHITE, 0.35, 1)
+    put_line("--- BRICK[0] TELEMETRY ---", WHITE, 0.35, 1)
     put_line(f"OFFSET: {wm.brick['offset_x']:.1f} mm", GREEN, 0.38, 1)
     put_line(f"ANGLE:  {wm.brick['angle']:.1f} deg", GREEN, 0.38, 1)
     put_line(f"DIST:   {wm.brick['dist']:.0f} mm", GREEN, 0.38, 1)
-    put_line(f"LIFT:   {wm.lift_height:.0f} mm", GREEN, 0.38, 1)
+    
+    y_cur += 5
+    put_line("--- LEIA TELEMETRY ---", WHITE, 0.35, 1)
+    put_line(f"X:      {wm.x:.1f} mm", (200, 200, 255), 0.38, 1)
+    put_line(f"Y:      {wm.y:.1f} mm", (200, 200, 255), 0.38, 1)
+    put_line(f"THETA:  {wm.theta:.1f} deg", (200, 200, 255), 0.38, 1)
+    put_line(f"LIFT:   {wm.lift_height:.0f} mm", (200, 200, 255), 0.38, 1)
     
     # 5. CONTROLS (Moved up below telemetry)
     y_cur += 10

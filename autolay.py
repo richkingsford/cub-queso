@@ -13,13 +13,18 @@ from train_brick_vision import BrickDetector
 from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
 
 # --- CONFIG ---
-GEAR_1_SPEED = 0.32
+GEAR_1_SPEED = 1.0  # Full speed instead of 0.32
 WEB_PORT = 5000  # Port 5000 to match recording scripts
 HEARTBEAT_RATE = 20 # Hz for internal loop
 SLOWDOWN_FACTOR = 1.0 # default to real time
 SMART_REPLAY = True
 STREAM_ENABLED = True # Default, will be updated by args
 DEBUG_MODE = False
+
+# Continuous motion config - never stop moving
+SCAN_SPEED = 0.4  # Constant slow scanning speed
+BRICK_SPOTTED_SPEED = 0.15  # Even slower when brick is visible  
+ALIGNMENT_SPEED = 0.2  # Speed for fine adjustments
 
 class AutoplayState:
     def __init__(self):
@@ -31,6 +36,15 @@ class AutoplayState:
         self.vision = None
         self.active_objective = "UNKNOWN"
         self.status_msg = "Initializing..."
+        
+        # Logging
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.demos_dir = os.path.join(os.getcwd(), "demos")
+        if not os.path.exists(self.demos_dir):
+            os.makedirs(self.demos_dir)
+        log_path = os.path.join(self.demos_dir, f"auto_{timestamp}.json")
+        self.logger = TelemetryLogger(log_path)
+        print(f"[SESSION] Recording Auto-Log to: {log_path}")
 
 app_state = AutoplayState()
 flask_app = Flask(__name__)
@@ -39,10 +53,10 @@ def generate_frames():
     while True:
         with app_state.lock:
             if app_state.current_frame is None:
-                # Create NO SIGNAL placeholder
+                # Placeholder if no frame yet
                 frame_to_send = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(frame_to_send, "NO SIGNAL", (200, 240), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+                cv2.putText(frame_to_send, "WAITING FOR CAMERA...", (120, 240), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             else:
                 frame_to_send = app_state.current_frame.copy()
         
@@ -58,7 +72,25 @@ def generate_frames():
 
 @flask_app.route("/")
 def index():
-    return "<html><body style='background:#111; color:#eee; font-family:sans-serif; text-align:center;'><h1>Robot Eyes (AUTOPILOT)</h1><img src='/video_feed' style='border:2px solid #555; border-radius:10px;'></body></html>"
+    return """
+    <html>
+        <head>
+            <title>Robot Leia - Autopilot</title>
+            <style>
+                body { background: #1a1a1a; color: #eee; font-family: sans-serif; text-align: center; margin-top: 50px; }
+                .stream-container { display: inline-block; border: 5px solid #333; border-radius: 8px; overflow: hidden; }
+                h1 { color: #f0ad4e; }
+            </style>
+        </head>
+        <body>
+            <h1>Robot Leia - Autopilot</h1>
+            <div class="stream-container">
+                <img src="/video_feed" width="800">
+            </div>
+            <p>Robot is running autonomously. Keep this window open to monitor status.</p>
+        </body>
+    </html>
+    """
 
 @flask_app.route("/video_feed")
 def video_feed():
@@ -80,6 +112,10 @@ def vision_thread():
             
         with app_state.lock:
             app_state.world.update_vision(found, dist, angle, conf, offset_x, cam_h)
+            
+            # Log State (Auto-Log)
+            app_state.logger.log_state(app_state.world)
+
             if STREAM_ENABLED and app_state.vision.current_frame is not None:
                 frame = app_state.vision.current_frame.copy()
                 messages = [f"AUTO: {app_state.active_objective}", app_state.status_msg]
@@ -270,9 +306,90 @@ def find_sessions():
     sessions.sort(reverse=True)
     return sessions
 
+
+
+def aggregate_heuristics():
+    sessions = find_sessions()
+    merged_heuristics = {}
+    
+    print(f"[LEARNING] Scanning {len(sessions)} logs for heuristics...")
+    
+    for s in sessions:
+        # Resolve Path
+        path = f"demos/{s}"
+        if os.path.isdir(path):
+             p = os.path.join(path, "a_log.json")
+             if not os.path.exists(p): p = os.path.join(path, "log.json")
+             path = p
+        elif not path.endswith(".json"):
+             path += ".json"
+        
+        if not os.path.exists(path): continue
+        
+        # Load Data
+        try:
+            with open(path, 'r') as f:
+                log_data = json.load(f)
+        except: continue
+        
+        # Extract Specs
+        current_obj = None
+        last_state_entry = None
+        
+        for entry in log_data:
+            if not isinstance(entry, dict): continue
+            
+            etype = entry.get('type')
+            if etype == 'keyframe':
+                obj_field = entry.get('objective')
+                if obj_field: current_obj = obj_field
+                
+                marker = entry.get('marker')
+                # We learn from both explicit OBJ_SUCCESS and implicit (next OBJ_START means prev success?)
+                # Sticking to explicit OBJ_SUCCESS for safety.
+                if marker == 'OBJ_SUCCESS' and current_obj and last_state_entry:
+                    prev_state = last_state_entry.get('brick') or {}
+                    
+                    if current_obj not in merged_heuristics:
+                        merged_heuristics[current_obj] = {
+                            'max_offset_x': 0.0, 
+                            'max_angle': 0.0, 
+                            'final_visibility': prev_state.get('visible', True), 
+                            'samples': 0
+                        }
+                    
+                    h = merged_heuristics[current_obj]
+                    
+                    # Update MAX tolerances (Efficiency: If we succeeded with X, X is acceptable)
+                    curr_off = abs(prev_state.get('offset_x', 0))
+                    curr_ang = abs(prev_state.get('angle', 0))
+                    
+                    h['max_offset_x'] = max(h['max_offset_x'], curr_off)
+                    h['max_angle'] = max(h['max_angle'], curr_ang)
+                    h['samples'] += 1
+                    
+            elif etype == 'state':
+                last_state_entry = entry
+
+    if merged_heuristics:
+        print("\n[LEARNED] Aggregated Success Gates:")
+        for obj, h in merged_heuristics.items():
+            print(f"  {obj:<8} | OffX: ~0-{h['max_offset_x']:.1f} | Ang: ~0-{h['max_angle']:.1f} | Vis: {h['final_visibility']} | n={h['samples']}")
+            
+    return merged_heuristics
+
 def main_autoplay(session_name):
-    events, learned_rules = load_demo(session_name)
-    if not events: return
+    all_events, _ = load_demo(session_name)
+    if not all_events: return
+    
+    # Filter for FIND only as requested
+    find_events = [e for e in all_events if e.get('obj') == 'FIND']
+    if not find_events:
+        print("[AUTOPLAY] No 'FIND' events in this demo.")
+        return
+
+    # Use global learning instead of just local demo rules
+    learned_rules = aggregate_heuristics()
 
     app_state.robot = Robot()
     app_state.world.learned_rules = learned_rules
@@ -281,59 +398,258 @@ def main_autoplay(session_name):
     if STREAM_ENABLED:
         threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False), daemon=True).start()
     
-    print(f"[AUTOPLAY] Loaded {len(events)} events. Warming up vision...")
+    print(f"[AUTOPLAY] Loaded {len(find_events)} FIND events. Warming up vision...")
     warmup_start = time.time()
     while time.time() - warmup_start < 2.0:
         with app_state.lock:
             if app_state.current_frame is not None: break
         time.sleep(0.1)
 
-    current_obj = None
-    skip_mode = False
-    for i, ev in enumerate(events):
+def cmd_to_motion_type(cmd):
+    m = {'f': 'forward', 'b': 'backward', 'l': 'left_turn', 'r': 'right_turn', 'u': 'mast_up', 'd': 'mast_down'}
+    return m.get(cmd, 'wait')
+
+def execute_and_track_smooth(cmd, duration, base_speed):
+    """Executes command with smooth continuous motion, dynamically adjusting speed based on brick detection"""
+    # 1. Update World (Dead Reckoning)
+    m_type = cmd_to_motion_type(cmd)
+    
+    # Calculate approximate PWM same as Robot class
+    pwm = int(60 + (255 - 60) * abs(base_speed))
+    if cmd in ['u', 'd', 'wait']: pwm = 255 # Simple Approx
+    
+    evt = MotionEvent(m_type, pwm, int(duration * 1000))
+    app_state.world.update_from_motion(evt)
+    
+    # 2. Execute with dynamic speed adjustment - NO PAUSES
+    start_time = time.time()
+    last_send = 0
+    
+    while time.time() - start_time < duration:
         if not app_state.running: break
-        if skip_mode and ev.get('obj') == current_obj: continue
-            
-        if ev.get('obj') != current_obj:
-            current_obj = ev.get('obj')
-            skip_mode = False
-            if current_obj in ObjectiveState.__members__:
-                with app_state.lock:
-                    app_state.active_objective = current_obj
-                    app_state.world.objective_state = ObjectiveState[current_obj]
-            
-            if SMART_REPLAY:
-                with app_state.lock:
-                    if app_state.world.check_objective_complete():
-                        print(f"\n>>> {current_obj} (ALREADY COMPLETE)")
-                        if DEBUG_MODE: time.sleep(5.0)
-                        skip_mode = True
-                        continue
-            print(f"\n>>> {current_obj}")
-
-        cmd = ev['cmd']
-        duration = ev['duration'] * SLOWDOWN_FACTOR
-        print(f"  [{i+1}/{len(events)}] {ev['obj']} > {cmd} for {duration:.2f}s")
         
-        start_time = time.time()
-        while time.time() - start_time < duration:
-            if not app_state.running: break
-            if SMART_REPLAY:
-                with app_state.lock:
-                    if app_state.world.check_objective_complete():
-                        print(f"  [SMART] {current_obj} Criteria Met!")
-                        if DEBUG_MODE: time.sleep(5.0)
-                        skip_mode = True
-                        break
-            
-            speed = GEAR_1_SPEED
-            if cmd in ('u', 'd'): speed = min(1.0, speed * 4.0)
-            app_state.robot.move(cmd, speed)
-            time.sleep(0.05)
-        app_state.robot.stop()
+        # Dynamic speed: slow down if brick is detected
+        with app_state.lock:
+            brick_visible = app_state.world.brick['visible']
+        
+        current_speed = base_speed * BRICK_DETECTED_SLOWDOWN if brick_visible else base_speed
+        
+        # Send command continuously without any sleep
+        current_time = time.time()
+        app_state.robot.send_command(cmd, current_speed)
+        last_send = current_time 
 
-    print("\n[AUTOPLAY] Finished.")
+
+
+def decide_next_action(world, attempt_speed):
+    """
+    Decide what the robot should do based on current state.
+    Returns: (command, duration, reason)
+    """
+    brick = world.brick
+    
+    # If brick is visible, work on alignment
+    if brick['visible']:
+        angle = brick['angle']
+        offset_x = brick['offset_x']
+        
+        # Check if already aligned
+        if abs(angle) <= 5.0 and abs(offset_x) <= 12.0:
+            return None, 0, "ALIGNED - OBJECTIVE COMPLETE"
+        
+        # Prioritize angle correction
+        if abs(angle) > 5.0:
+            # Turn toward the brick
+            cmd = 'l' if angle > 0 else 'r'
+            # Duration proportional to error (but cap at 2 seconds)
+            duration = min(abs(angle) / 90.0, 2.0)
+            return cmd, duration, f"Correcting angle: {angle:.1f}°"
+        
+        # Then correct offset
+        if abs(offset_x) > 12.0:
+            # Assume we need to turn slightly to adjust offset
+            # This is a simplification - could be improved with better kinematics
+            cmd = 'l' if offset_x > 0 else 'r'
+            duration = min(abs(offset_x) / 100.0, 2.0)
+            return cmd, duration, f"Correcting offset: {offset_x:.1f}mm"
+    
+    # If no brick visible, search for one
+    # Default: turn left to scan
+    return 'l', 2.0, "Searching for brick..."
+
+def smooth_velocity(current_vel, target_vel, alpha=0.3):
+    """Exponential moving average for smooth velocity transitions"""
+    return {
+        'linear': alpha * target_vel['linear'] + (1 - alpha) * current_vel['linear'],
+        'angular': alpha * target_vel['angular'] + (1 - alpha) * current_vel['angular']
+    }
+
+def compute_target_velocity(brick_visible, angle, offset_x, dist):
+    """
+    Compute target velocity vector based on current perception.
+    Returns: {'linear': forward_speed, 'angular': turn_speed}
+    Range: -1.0 to 1.0 for both
+    """
+    MIN_SPEED = 0.1  # Always moving at least 10%
+    
+    if brick_visible:
+        # Brick detected - align while moving forward slowly
+        linear = 0.15  # Slow forward motion
+        
+        # Angular velocity proportional to angle error
+        angular = 0.0
+        if abs(angle) > 5.0:
+            # Turn to align (proportional control)
+            angular = max(-0.4, min(0.4, angle / 90.0))
+        elif abs(offset_x) > 12.0:
+            # Adjust for offset
+            angular = max(-0.2, min(0.2, offset_x / 100.0))
+        
+        return {'linear': linear, 'angular': angular}
+    else:
+        # No brick - slow scanning turn
+        return {'linear': 0.0, 'angular': 0.3}  # Turn left to scan
+
+def velocity_to_command(velocity):
+    """
+    Convert velocity vector to robot command.
+    Returns: (cmd, speed) where cmd is 'f', 'b', 'l', 'r' and speed is 0-1
+    """
+    linear = velocity['linear']
+    angular = velocity['angular']
+    
+    # Prioritize angular over linear (can be changed)
+    if abs(angular) > 0.05:
+        # Turning
+        if angular > 0:
+            return 'l', abs(angular)
+        else:
+            return 'r', abs(angular)
+    elif abs(linear) > 0.05:
+        # Moving forward/backward
+        if linear > 0:
+            return 'f', abs(linear)
+        else:
+            return 'b', abs(linear)
+    else:
+        # Default: very slow left turn (never fully stop)
+        return 'l', 0.1
+
+def continuous_autoplay(learned_rules):
+    """
+    True continuous velocity-based control.
+    Robot flows toward target using smooth velocity corrections.
+    Runs at fixed Hz with parallel perception - no blocking, no stops.
+    """
+    app_state.robot = Robot()
+    app_state.world.learned_rules = learned_rules
+    
+    threading.Thread(target=vision_thread, daemon=True).start()
+    if STREAM_ENABLED:
+        threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False), daemon=True).start()
+    
+    print(f"[AUTOPLAY] Continuous velocity control @ 20Hz")
+    warmup_start = time.time()
+    while time.time() - warmup_start < 2.0:
+        with app_state.lock:
+            if app_state.current_frame is not None: break
+        time.sleep(0.1)
+
+    print(f"\n{'='*60}")
+    print(f"CONTINUOUS VELOCITY CONTROL - Smooth flow toward target")
+    print(f"{'='*60}")
+    
+    # Set objective
+    with app_state.lock:
+        app_state.active_objective = "FIND"
+        app_state.world.objective_state = ObjectiveState.FIND
+    
+    app_state.logger.log_keyframe("JOB_START")
+    app_state.logger.log_keyframe("OBJ_START", "FIND")
+    
+    # Control parameters
+    CONTROL_HZ = 20  # 20 Hz control loop
+    CONTROL_DT = 1.0 / CONTROL_HZ
+    
+    # State variables
+    current_velocity = {'linear': 0.0, 'angular': 0.1}  # Start with slow turn
+    run_start = time.time()
+    max_run_duration = 60.0
+    cycle_count = 0
+    last_log_time = run_start
+    
+    print(f"  └─ Running at {CONTROL_HZ}Hz | Min speed: 10% | Velocity smoothing: EMA")
+    
+    # MAIN CONTROL LOOP - Fixed frequency
+    while time.time() - run_start < max_run_duration:
+        cycle_start = time.time()
+        
+        if not app_state.running:
+            break
+        
+        # 1. GET TELEMETRY (non-blocking read from shared state)
+        with app_state.lock:
+            # Check completion
+            if app_state.world.check_objective_complete():
+                print(f"\n✓ FIND Objective Complete! (after {cycle_count} cycles)")
+                app_state.logger.log_keyframe("OBJ_SUCCESS", "FIND")
+                app_state.robot.stop()
+                break
+            
+            # Get current perception
+            brick_visible = app_state.world.brick['visible']
+            angle = app_state.world.brick['angle']
+            offset_x = app_state.world.brick['offset_x']
+            dist = app_state.world.brick['dist']
+        
+        # 2. COMPUTE TARGET VELOCITY VECTOR
+        target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist)
+        
+        # 3. SMOOTH VELOCITY (blend with previous)
+        smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
+        
+        # 4. CONVERT TO COMMAND
+        cmd, speed = velocity_to_command(smoothed_velocity)
+        
+        # 5. SEND COMMAND (non-blocking)
+        actual_speed = GEAR_1_SPEED * speed
+        app_state.robot.send_command(cmd, actual_speed)
+        
+        # Update state
+        current_velocity = smoothed_velocity
+        cycle_count += 1
+        
+        # Periodic logging (every 2 seconds)
+        if time.time() - last_log_time > 2.0:
+            status = "🟡 ALIGNING" if brick_visible else "🟢 SCANNING"
+            vel_str = f"v=({smoothed_velocity['linear']:.2f}, {smoothed_velocity['angular']:.2f})"
+            print(f"  {status} | {cmd}@{speed:.2f} | {vel_str} | {cycle_count} cycles")
+            last_log_time = time.time()
+        
+        # 6. MAINTAIN FIXED FREQUENCY (non-blocking sleep)
+        cycle_elapsed = time.time() - cycle_start
+        sleep_time = CONTROL_DT - cycle_elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+    
+    # Clean shutdown
+    app_state.robot.stop()
+    app_state.logger.log_keyframe("JOB_SUCCESS")
+    
+    total_time = time.time() - run_start
+    avg_hz = cycle_count / total_time if total_time > 0 else 0
+    print(f"\n[AUTOPLAY] Run complete: {cycle_count} cycles in {total_time:.1f}s (avg {avg_hz:.1f}Hz)")
+    app_state.logger.close()
     app_state.running = False
+
+def main_autoplay(session_name):
+    # We don't load demos anymore - we use learned rules for success criteria only
+    print("[AUTOPLAY] Using continuous predictive control (not replaying demos)")
+    
+    # Use global learning for success criteria
+    learned_rules = aggregate_heuristics()
+
+    continuous_autoplay(learned_rules)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
