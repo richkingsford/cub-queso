@@ -677,6 +677,8 @@ def main_autoplay(session_name):
     # Run 4 training scenarios
     for idx, (name, timeout) in enumerate([("SUCCESS #1", 60), ("FAIL", 5), ("RECOVER", 60), ("SUCCESS #2", 60)], 1):
         scenario_type = "recover" if name == "RECOVER" else ("fail" if name == "FAIL" else "normal")
+        min_success_time = 1.0
+        min_success_cycles = 5
         
         print(f"{'='*70}")
         print(f"SCENARIO {idx}/4: {name} (timeout={timeout}s, type={scenario_type})")
@@ -689,6 +691,7 @@ def main_autoplay(session_name):
             app_state.logger.log_keyframe("OBJ_START", "FIND")
         
         with app_state.lock:
+            app_state.world.reset_mission()
             app_state.world.objective_state = ObjectiveState.FIND
         
         # Run scenario
@@ -699,7 +702,8 @@ def main_autoplay(session_name):
         
         while time.time() - run_start < timeout:
             with app_state.lock:
-                if app_state.world.check_objective_complete():
+                allow_success = cycle_count >= min_success_cycles and (time.time() - run_start) >= min_success_time
+                if allow_success and app_state.world.check_objective_complete():
                     print(f"  ✓ Objective complete! ({cycle_count} cycles)\n")
                     app_state.logger.log_keyframe("OBJ_SUCCESS", "FIND")
                     success_flag = True
