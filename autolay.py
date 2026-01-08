@@ -677,6 +677,9 @@ def main_autoplay(session_name):
     # Run 4 training scenarios
     for idx, (name, timeout) in enumerate([("SUCCESS #1", 60), ("FAIL", 5), ("RECOVER", 60), ("SUCCESS #2", 60)], 1):
         scenario_type = "recover" if name == "RECOVER" else ("fail" if name == "FAIL" else "normal")
+        min_success_time = 1.0
+        min_success_cycles = 5
+        fail_brick_lost_time = 1.0
         
         print(f"{'='*70}")
         print(f"SCENARIO {idx}/4: {name} (timeout={timeout}s, type={scenario_type})")
@@ -689,6 +692,7 @@ def main_autoplay(session_name):
             app_state.logger.log_keyframe("OBJ_START", "FIND")
         
         with app_state.lock:
+            app_state.world.reset_mission()
             app_state.world.objective_state = ObjectiveState.FIND
         
         # Run scenario
@@ -696,10 +700,14 @@ def main_autoplay(session_name):
         run_start = time.time()
         cycle_count = 0
         success_flag = False
+        failure_confirmed = False
+        brick_first_seen = None
+        brick_last_seen = None
         
         while time.time() - run_start < timeout:
             with app_state.lock:
-                if app_state.world.check_objective_complete():
+                allow_success = cycle_count >= min_success_cycles and (time.time() - run_start) >= min_success_time
+                if scenario_type != "fail" and allow_success and app_state.world.check_objective_complete():
                     print(f"  ✓ Objective complete! ({cycle_count} cycles)\n")
                     app_state.logger.log_keyframe("OBJ_SUCCESS", "FIND")
                     success_flag = True
@@ -709,10 +717,38 @@ def main_autoplay(session_name):
                 angle = app_state.world.brick['angle']
                 offset_x = app_state.world.brick['offset_x']
                 dist = app_state.world.brick['dist']
+
+            current_time = time.time()
+            if brick_visible:
+                brick_last_seen = current_time
+                if brick_first_seen is None:
+                    brick_first_seen = current_time
             
-            target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist)
-            smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
-            cmd, speed = velocity_to_command(smoothed_velocity)
+            if scenario_type == "fail":
+                if brick_first_seen is not None and not brick_visible and brick_last_seen is not None:
+                    time_since_seen = current_time - brick_last_seen
+                    if time_since_seen >= fail_brick_lost_time:
+                        failure_confirmed = True
+                        print(f"  ✗ Failed: Brick lost for {time_since_seen:.1f}s\n")
+                        break
+            
+            if scenario_type == "fail":
+                if brick_visible:
+                    cmd, speed = 'b', 0.35
+                else:
+                    cmd, speed = 'l', 0.25
+                smoothed_velocity = smooth_velocity(current_velocity, {'linear': 0.0, 'angular': 0.0}, alpha=0.3)
+            elif scenario_type == "recover":
+                if brick_visible:
+                    target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist)
+                else:
+                    target_velocity = {'linear': 0.0, 'angular': 0.35}
+                smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
+                cmd, speed = velocity_to_command(smoothed_velocity)
+            else:
+                target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist)
+                smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
+                cmd, speed = velocity_to_command(smoothed_velocity)
             app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
             current_velocity = smoothed_velocity
             cycle_count += 1
@@ -722,7 +758,10 @@ def main_autoplay(session_name):
         app_state.robot.stop()
         
         # Log result
-        if not success_flag:
+        if scenario_type == "fail" and failure_confirmed:
+            app_state.logger.log_keyframe("FAIL_START", "FIND")
+            app_state.logger.log_keyframe("FAIL_END", "FIND")
+        elif not success_flag:
             print(f"  ✗ Failed: Timeout {total_time:.1f}s\n")
             app_state.logger.log_keyframe("FAIL_START", "FIND")
             app_state.logger.log_keyframe("FAIL_END", "FIND")
