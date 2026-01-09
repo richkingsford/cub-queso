@@ -27,6 +27,9 @@ DEMOS_DIR = Path(__file__).resolve().parent / "demos"
 SCAN_SPEED = 0.4  # Constant slow scanning speed
 BRICK_SPOTTED_SPEED = 0.15  # Even slower when brick is visible  
 ALIGNMENT_SPEED = 0.2  # Speed for fine adjustments
+SCOOP_APPROACH_SPEED = 0.25  # Forward push when scooping
+SCOOP_ALIGN_SPEED = 0.18  # Approach speed while correcting alignment
+SCOOP_VERIFY_SPEED = 0.25  # Wiggle verification speed
 
 class AutoplayState:
     def __init__(self):
@@ -317,6 +320,24 @@ def pick_best_attempt(attempts, attempt_type):
         return None
     return max(sequences, key=lambda seq: sum(evt.get('duration', 0) for evt in seq))
 
+def pick_best_attempt_for_objective(attempts, attempt_type, objective):
+    if not attempts:
+        return None
+    sequences = attempts.get(attempt_type, [])
+    if not sequences:
+        return None
+
+    best_seq = None
+    best_duration = 0.0
+    for seq in sequences:
+        obj_events = [evt for evt in seq if evt.get('obj') == objective]
+        duration = sum(evt.get('duration', 0) for evt in obj_events)
+        if obj_events and duration > best_duration:
+            best_duration = duration
+            best_seq = merge_demo_events(obj_events)
+
+    return best_seq
+
 def event_type_to_cmd(event_type):
     mapping = {
         'forward': 'f', 'backward': 'b', 'left_turn': 'l', 'right_turn': 'r', 
@@ -492,6 +513,24 @@ def cmd_to_motion_type(cmd):
     m = {'f': 'forward', 'b': 'backward', 'l': 'left_turn', 'r': 'right_turn', 'u': 'mast_up', 'd': 'mast_down'}
     return m.get(cmd, 'wait')
 
+def objective_complete(world):
+    if world.objective_state == ObjectiveState.SCOOP:
+        if world.verification_stage == "IDLE" and world.brick.get("seated"):
+            return True
+    return world.check_objective_complete()
+
+def get_scoop_verification_command(world):
+    if world.objective_state != ObjectiveState.SCOOP:
+        return None
+    stage = world.verification_stage
+    if stage == "BACK":
+        return 'b', SCOOP_VERIFY_SPEED, "VERIFY_BACK"
+    if stage == "LEFT":
+        return 'l', SCOOP_VERIFY_SPEED, "VERIFY_LEFT"
+    if stage == "RIGHT":
+        return 'r', SCOOP_VERIFY_SPEED, "VERIFY_RIGHT"
+    return None
+
 def execute_and_track_smooth(cmd, duration, base_speed):
     """Executes command with smooth continuous motion, dynamically adjusting speed based on brick detection"""
     # 1. Update World (Dead Reckoning)
@@ -604,17 +643,18 @@ def smooth_velocity(current_vel, target_vel, alpha=0.3):
         'angular': alpha * target_vel['angular'] + (1 - alpha) * current_vel['angular']
     }
 
-def compute_target_velocity(brick_visible, angle, offset_x, dist):
+def compute_target_velocity(brick_visible, angle, offset_x, dist, objective_state):
     """
     Compute target velocity vector based on current perception.
     Returns: {'linear': forward_speed, 'angular': turn_speed}
     Range: -1.0 to 1.0 for both
     """
-    MIN_SPEED = 0.1  # Always moving at least 10%
-    
     if brick_visible:
-        # Brick detected - align while moving forward slowly
-        linear = 0.15  # Slow forward motion
+        aligned = abs(angle) <= 5.0 and abs(offset_x) <= 12.0
+        if objective_state == ObjectiveState.SCOOP:
+            linear = SCOOP_APPROACH_SPEED if aligned else SCOOP_ALIGN_SPEED
+        else:
+            linear = 0.15  # Slow forward motion
         
         # Angular velocity proportional to angle error
         angular = 0.0
@@ -628,6 +668,8 @@ def compute_target_velocity(brick_visible, angle, offset_x, dist):
         return {'linear': linear, 'angular': angular}
     else:
         # No brick - slow scanning turn
+        if objective_state == ObjectiveState.SCOOP:
+            return {'linear': 0.0, 'angular': 0.25}  # Slower scan during scoop
         return {'linear': 0.0, 'angular': 0.3}  # Turn left to scan
 
 def velocity_to_command(velocity):
@@ -679,13 +721,15 @@ def continuous_autoplay(learned_rules):
     print(f"CONTINUOUS VELOCITY CONTROL - Smooth flow toward target")
     print(f"{'='*60}")
     
-    # Set objective
+    objectives = [ObjectiveState.FIND, ObjectiveState.SCOOP]
+    objective_index = 0
     with app_state.lock:
-        app_state.active_objective = "FIND"
-        app_state.world.objective_state = ObjectiveState.FIND
+        app_state.active_objective = objectives[objective_index].value
+        app_state.status_msg = f"Objective: {objectives[objective_index].value}"
+        app_state.world.objective_state = objectives[objective_index]
     
     app_state.logger.log_keyframe("JOB_START")
-    app_state.logger.log_keyframe("OBJ_START", "FIND")
+    app_state.logger.log_keyframe("OBJ_START", app_state.world.objective_state.value)
     
     # Control parameters
     CONTROL_HZ = 20  # 20 Hz control loop
@@ -698,6 +742,7 @@ def continuous_autoplay(learned_rules):
     # State variables
     current_velocity = {'linear': 0.0, 'angular': 0.1}  # Start with slow turn
     run_start = time.time()
+    objective_start = run_start
     cycle_count = 0
     last_log_time = run_start
     
@@ -710,7 +755,8 @@ def continuous_autoplay(learned_rules):
     print(f"  └─ Failure detection: Timeout={MAX_RUN_DURATION}s | Brick lost={MAX_BRICK_LOST_TIME}s")
     
     # MAIN CONTROL LOOP - Fixed frequency
-    while time.time() - run_start < MAX_RUN_DURATION:
+    failure_objective = app_state.world.objective_state.value
+    while app_state.running:
         cycle_start = time.time()
         
         if not app_state.running:
@@ -718,11 +764,31 @@ def continuous_autoplay(learned_rules):
         
         # 1. GET TELEMETRY (non-blocking read from shared state)
         with app_state.lock:
+            current_objective = app_state.world.objective_state
+            current_objective_label = current_objective.value
             # Check completion
-            if app_state.world.check_objective_complete():
-                print(f"\n✓ FIND Objective Complete! (after {cycle_count} cycles)")
-                app_state.logger.log_keyframe("OBJ_SUCCESS", "FIND")
+            if objective_complete(app_state.world):
+                print(f"\n✓ {current_objective_label} Objective Complete! (after {cycle_count} cycles)")
+                app_state.logger.log_keyframe("OBJ_SUCCESS", current_objective_label)
                 app_state.robot.stop()
+                if objective_index < len(objectives) - 1:
+                    objective_index += 1
+                    next_obj = objectives[objective_index]
+                    app_state.active_objective = next_obj.value
+                    app_state.status_msg = f"Objective: {next_obj.value}"
+                    app_state.world.objective_state = next_obj
+                    if next_obj == ObjectiveState.SCOOP:
+                        app_state.world.brick["seated"] = False
+                        app_state.world.verification_stage = "IDLE"
+                        app_state.world.verify_dist_mm = 0.0
+                        app_state.world.verify_turn_deg = 0.0
+                        app_state.world.verify_vision_hits = 0
+                    app_state.logger.log_keyframe("OBJ_START", next_obj.value)
+                    objective_start = time.time()
+                    brick_first_seen_time = None
+                    brick_last_seen_time = None
+                    current_velocity = {'linear': 0.0, 'angular': 0.1}
+                    continue
                 break
             
             # Get current perception
@@ -730,43 +796,68 @@ def continuous_autoplay(learned_rules):
             angle = app_state.world.brick['angle']
             offset_x = app_state.world.brick['offset_x']
             dist = app_state.world.brick['dist']
+            verification_cmd = get_scoop_verification_command(app_state.world)
         
         # Track brick visibility for failure detection
         current_time = time.time()
-        if brick_visible:
-            if brick_first_seen_time is None:
-                brick_first_seen_time = current_time
-                print(f"  ✓ First brick detection at {cycle_count} cycles")
-            brick_last_seen_time = current_time
+        if current_time - objective_start > MAX_RUN_DURATION:
+            failure_reason = f"Timeout: {current_time - objective_start:.1f}s"
+            failure_objective = current_objective_label
+            break
+        if current_objective == ObjectiveState.FIND:
+            if brick_visible:
+                if brick_first_seen_time is None:
+                    brick_first_seen_time = current_time
+                    print(f"  ✓ First brick detection at {cycle_count} cycles")
+                brick_last_seen_time = current_time
+            
+            # FAILURE DETECTION: Lost brick for too long
+            if brick_first_seen_time is not None and brick_last_seen_time is not None:
+                time_since_brick_seen = current_time - brick_last_seen_time
+                if time_since_brick_seen > MAX_BRICK_LOST_TIME:
+                    failure_reason = f"Lost brick for {time_since_brick_seen:.1f}s"
+                    failure_objective = current_objective_label
+                    break
         
-        # FAILURE DETECTION: Lost brick for too long
-        if brick_first_seen_time is not None and brick_last_seen_time is not None:
-            time_since_brick_seen = current_time - brick_last_seen_time
-            if time_since_brick_seen > MAX_BRICK_LOST_TIME:
-                failure_reason = f"Lost brick for {time_since_brick_seen:.1f}s"
-                break
-        
-        # 2. COMPUTE TARGET VELOCITY VECTOR
-        target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist)
-        
-        # 3. SMOOTH VELOCITY (blend with previous)
-        smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
-        
-        # 4. CONVERT TO COMMAND
-        cmd, speed = velocity_to_command(smoothed_velocity)
-        
-        # 5. SEND COMMAND (non-blocking)
-        actual_speed = GEAR_1_SPEED * speed
-        app_state.robot.send_command(cmd, actual_speed)
+        if verification_cmd:
+            cmd, speed, reason = verification_cmd
+            actual_speed = GEAR_1_SPEED * speed
+            app_state.robot.send_command(cmd, actual_speed)
+            evt = MotionEvent(cmd_to_motion_type(cmd), int(speed * 255), int(CONTROL_DT * 1000))
+            with app_state.lock:
+                app_state.world.update_from_motion(evt)
+                app_state.status_msg = f"SCOOP {reason}"
+        else:
+            # 2. COMPUTE TARGET VELOCITY VECTOR
+            target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, current_objective)
+            
+            # 3. SMOOTH VELOCITY (blend with previous)
+            smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
+            
+            # 4. CONVERT TO COMMAND
+            cmd, speed = velocity_to_command(smoothed_velocity)
+            
+            # 5. SEND COMMAND (non-blocking)
+            actual_speed = GEAR_1_SPEED * speed
+            app_state.robot.send_command(cmd, actual_speed)
+            evt = MotionEvent(cmd_to_motion_type(cmd), int(speed * 255), int(CONTROL_DT * 1000))
+            with app_state.lock:
+                app_state.world.update_from_motion(evt)
+                app_state.status_msg = "ALIGNING" if brick_visible else "SCANNING"
         
         # Update state
-        current_velocity = smoothed_velocity
+        if not verification_cmd:
+            current_velocity = smoothed_velocity
         cycle_count += 1
         
         # Periodic logging (every 2 seconds)
         if time.time() - last_log_time > 2.0:
-            status = "🟡 ALIGNING" if brick_visible else "🟢 SCANNING"
-            vel_str = f"v=({smoothed_velocity['linear']:.2f}, {smoothed_velocity['angular']:.2f})"
+            if verification_cmd:
+                status = "VERIFYING"
+                vel_str = f"cmd={cmd}@{speed:.2f}"
+            else:
+                status = "ALIGNING" if brick_visible else "SCANNING"
+                vel_str = f"v=({smoothed_velocity['linear']:.2f}, {smoothed_velocity['angular']:.2f})"
             print(f"  {status} | {cmd}@{speed:.2f} | {vel_str} | {cycle_count} cycles")
             last_log_time = time.time()
         
@@ -776,18 +867,15 @@ def continuous_autoplay(learned_rules):
         if sleep_time > 0:
             time.sleep(sleep_time)
     
-    # Check for timeout failure
     total_time = time.time() - run_start
-    if total_time >= MAX_RUN_DURATION and failure_reason is None:
-        failure_reason = f"Timeout: {total_time:.1f}s"
     
     # Clean shutdown with failure logging
     app_state.robot.stop()
     
     if failure_reason:
-        print(f"\n✗ FIND Objective FAILED: {failure_reason}")
-        app_state.logger.log_keyframe("FAIL_START", "FIND")
-        app_state.logger.log_keyframe("FAIL_END", "FIND")
+        print(f"\n✗ {failure_objective} Objective FAILED: {failure_reason}")
+        app_state.logger.log_keyframe("FAIL_START", failure_objective)
+        app_state.logger.log_keyframe("FAIL_END", failure_objective)
     
     app_state.logger.log_keyframe("JOB_SUCCESS")  # Job completes even if objective failed
     
@@ -797,19 +885,25 @@ def continuous_autoplay(learned_rules):
     app_state.logger.close()
     app_state.running = False
 
-def main_autoplay(session_name):
-    # Multi-scenario training: SUCCESS → FAIL → RECOVER → SUCCESS
-    print("\n[AUTOPLAY] Multi-scenario training mode")
-    print("  Sequence: SUCCESS → FAIL → RECOVER → SUCCESS\n")
+def main_autoplay(session_name, scenarios=None):
+    if scenarios is None:
+        scenarios = [("SUCCESS #1", 60), ("SUCCESS #2", 60)]
+    scenario_names = " -> ".join(name for name, _ in scenarios)
+    print("\n[AUTOPLAY] Training mode")
+    print(f"  Sequence: {scenario_names}\n")
     
     learned_rules = aggregate_heuristics()
     demo_attempts = None
     demo_fail = None
     demo_recover = None
-    if SMART_REPLAY and session_name:
+    needs_fail = any(name == "FAIL" for name, _ in scenarios)
+    needs_recover = any(name == "RECOVER" for name, _ in scenarios)
+    if SMART_REPLAY and session_name and (needs_fail or needs_recover):
         _, _, demo_attempts = load_demo(session_name, include_attempts=True)
-        demo_fail = pick_best_attempt(demo_attempts, "FAIL")
-        demo_recover = pick_best_attempt(demo_attempts, "RECOVER")
+        if needs_fail:
+            demo_fail = pick_best_attempt(demo_attempts, "FAIL")
+        if needs_recover:
+            demo_recover = pick_best_attempt(demo_attempts, "RECOVER")
     
     # Initialize (done once for all scenarios)
     app_state.robot = Robot()
@@ -826,8 +920,9 @@ def main_autoplay(session_name):
             if app_state.current_frame is not None: break
         time.sleep(0.1)
     
-    # Run 4 training scenarios
-    for idx, (name, timeout) in enumerate([("SUCCESS #1", 60), ("FAIL", 5), ("RECOVER", 60), ("SUCCESS #2", 60)], 1):
+    # Run training scenarios
+    total_scenarios = len(scenarios)
+    for idx, (name, timeout) in enumerate(scenarios, 1):
         scenario_type = "recover" if name == "RECOVER" else ("fail" if name == "FAIL" else "normal")
         min_success_time = 1.0
         min_success_cycles = 5
@@ -835,19 +930,22 @@ def main_autoplay(session_name):
         use_demo_recover = scenario_type == "recover" and demo_recover
         
         print(f"{'='*70}")
-        print(f"SCENARIO {idx}/4: {name} (timeout={timeout}s, type={scenario_type})")
+        print(f"SCENARIO {idx}/{total_scenarios}: {name} (timeout={timeout}s, type={scenario_type})")
         print(f"{'='*70}\n")
         
         # Log start
         if scenario_type == "recover":
             if not use_demo_recover:
                 app_state.logger.log_keyframe("RECOVER_START", "FIND")
-        else:
+        elif scenario_type == "fail":
             app_state.logger.log_keyframe("OBJ_START", "FIND")
         
         with app_state.lock:
             app_state.world.reset_mission()
             app_state.world.objective_state = ObjectiveState.FIND
+            app_state.active_objective = ObjectiveState.FIND.value
+            app_state.status_msg = f"Objective: {ObjectiveState.FIND.value}"
+            app_state.world.attempt_status = "NORMAL"
             if use_demo_fail:
                 app_state.world.attempt_status = "FAIL"
             elif use_demo_recover:
@@ -861,46 +959,131 @@ def main_autoplay(session_name):
             replay_demo_attempt(demo_recover, "FIND", "RECOVERY", "RECOVER_START", "RECOVER_END")
         else:
             # Run scenario
-            current_velocity = {'linear': 0.0, 'angular': 0.1}
             run_start = time.time()
+            scenario_deadline = run_start + timeout
             cycle_count = 0
-            success_flag = False
-            
-            while time.time() - run_start < timeout:
-                with app_state.lock:
-                    allow_success = cycle_count >= min_success_cycles and (time.time() - run_start) >= min_success_time
-                    if allow_success and app_state.world.check_objective_complete():
-                        print(f"  ✓ Objective complete! ({cycle_count} cycles)\n")
-                        app_state.logger.log_keyframe("OBJ_SUCCESS", "FIND")
-                        success_flag = True
+            success_flag = True
+            failed_objective = None
+
+            if scenario_type == "normal":
+                objectives = [ObjectiveState.FIND, ObjectiveState.SCOOP]
+                for obj in objectives:
+                    with app_state.lock:
+                        app_state.world.objective_state = obj
+                        app_state.active_objective = obj.value
+                        app_state.status_msg = f"Objective: {obj.value}"
+                        if obj == ObjectiveState.SCOOP:
+                            app_state.world.brick["seated"] = False
+                            app_state.world.verification_stage = "IDLE"
+                            app_state.world.verify_dist_mm = 0.0
+                            app_state.world.verify_turn_deg = 0.0
+                            app_state.world.verify_vision_hits = 0
+
+                    app_state.logger.log_keyframe("OBJ_START", obj.value)
+                    current_velocity = {'linear': 0.0, 'angular': 0.1}
+                    obj_start = time.time()
+                    obj_cycles = 0
+                    objective_success = False
+
+                    while time.time() < scenario_deadline:
+                        with app_state.lock:
+                            allow_success = obj_cycles >= min_success_cycles and (time.time() - obj_start) >= min_success_time
+                            if allow_success and objective_complete(app_state.world):
+                                print(f"  ✓ {obj.value} Objective complete! ({obj_cycles} cycles)\n")
+                                app_state.logger.log_keyframe("OBJ_SUCCESS", obj.value)
+                                objective_success = True
+                                break
+
+                            brick_visible = app_state.world.brick['visible']
+                            angle = app_state.world.brick['angle']
+                            offset_x = app_state.world.brick['offset_x']
+                            dist = app_state.world.brick['dist']
+                            objective_state = app_state.world.objective_state
+                            verification_cmd = get_scoop_verification_command(app_state.world)
+
+                        if verification_cmd:
+                            cmd, speed, reason = verification_cmd
+                            app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
+                            evt = MotionEvent(cmd_to_motion_type(cmd), int(speed * 255), 50)
+                            with app_state.lock:
+                                app_state.world.update_from_motion(evt)
+                                app_state.status_msg = f"SCOOP {reason}"
+                        else:
+                            target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, objective_state)
+                            smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
+                            cmd, speed = velocity_to_command(smoothed_velocity)
+                            app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
+                            evt = MotionEvent(cmd_to_motion_type(cmd), int(speed * 255), 50)
+                            with app_state.lock:
+                                app_state.world.update_from_motion(evt)
+                                app_state.status_msg = "ALIGNING" if brick_visible else "SCANNING"
+                            current_velocity = smoothed_velocity
+
+                        obj_cycles += 1
+                        cycle_count += 1
+                        time.sleep(0.05)  # 20Hz
+
+                    app_state.robot.stop()
+
+                    if not objective_success:
+                        success_flag = False
+                        failed_objective = obj.value
                         break
-                    
-                    brick_visible = app_state.world.brick['visible']
-                    angle = app_state.world.brick['angle']
-                    offset_x = app_state.world.brick['offset_x']
-                    dist = app_state.world.brick['dist']
-                
-                target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist)
-                smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
-                cmd, speed = velocity_to_command(smoothed_velocity)
-                app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
-                current_velocity = smoothed_velocity
-                cycle_count += 1
-                time.sleep(0.05)  # 20Hz
-            
+            else:
+                current_velocity = {'linear': 0.0, 'angular': 0.1}
+                success_flag = False
+                while time.time() < scenario_deadline:
+                    with app_state.lock:
+                        allow_success = cycle_count >= min_success_cycles and (time.time() - run_start) >= min_success_time
+                        if allow_success and objective_complete(app_state.world):
+                            print(f"  ✓ Objective complete! ({cycle_count} cycles)\n")
+                            app_state.logger.log_keyframe("OBJ_SUCCESS", "FIND")
+                            success_flag = True
+                            break
+
+                        brick_visible = app_state.world.brick['visible']
+                        angle = app_state.world.brick['angle']
+                        offset_x = app_state.world.brick['offset_x']
+                        dist = app_state.world.brick['dist']
+                        objective_state = app_state.world.objective_state
+                        verification_cmd = get_scoop_verification_command(app_state.world)
+
+                    if verification_cmd:
+                        cmd, speed, reason = verification_cmd
+                        app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
+                        evt = MotionEvent(cmd_to_motion_type(cmd), int(speed * 255), 50)
+                        with app_state.lock:
+                            app_state.world.update_from_motion(evt)
+                            app_state.status_msg = f"SCOOP {reason}"
+                    else:
+                        target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, objective_state)
+                        smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
+                        cmd, speed = velocity_to_command(smoothed_velocity)
+                        app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
+                        evt = MotionEvent(cmd_to_motion_type(cmd), int(speed * 255), 50)
+                        with app_state.lock:
+                            app_state.world.update_from_motion(evt)
+                            app_state.status_msg = "ALIGNING" if brick_visible else "SCANNING"
+                        current_velocity = smoothed_velocity
+
+                    cycle_count += 1
+                    time.sleep(0.05)  # 20Hz
+
+                app_state.robot.stop()
+
             total_time = time.time() - run_start
-            app_state.robot.stop()
-            
+
             # Log result
             if not success_flag:
                 print(f"  ✗ Failed: Timeout {total_time:.1f}s\n")
-                app_state.logger.log_keyframe("FAIL_START", "FIND")
-                app_state.logger.log_keyframe("FAIL_END", "FIND")
+                fail_obj = failed_objective or "FIND"
+                app_state.logger.log_keyframe("FAIL_START", fail_obj)
+                app_state.logger.log_keyframe("FAIL_END", fail_obj)
             elif scenario_type == "recover":
                 app_state.logger.log_keyframe("RECOVER_END", "FIND")
         
         # Pause between scenarios
-        if idx < 4:
+        if idx < total_scenarios:
             print("  → Pausing 2s before next scenario...\n")
             time.sleep(2.0)
     
