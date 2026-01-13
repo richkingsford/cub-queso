@@ -2,21 +2,14 @@
 """
 Test script to verify objective state changes are being logged correctly.
 """
-import json
 import sys
+
+from helper_demo_log_utils import read_demo_log, normalize_objective_label
 
 def test_log(log_path):
     """Check if a log file has objective transitions."""
-    entries = []
     try:
-        with open(log_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line in ["[", "]"]: 
-                    continue
-                if line.endswith(","): 
-                    line = line[:-1]
-                entries.append(json.loads(line))
+        entries = read_demo_log(log_path, strict=True)
     except Exception as e:
         print(f"Error reading log: {e}")
         return
@@ -28,7 +21,7 @@ def test_log(log_path):
     # Track objective transitions
     objectives = []
     for e in entries:
-        obj = e.get('objective', 'UNKNOWN')
+        obj = normalize_objective_label(e.get('objective')) if e.get('objective') else "UNKNOWN"
         if not objectives or objectives[-1] != obj:
             objectives.append(obj)
             timestamp = e.get('timestamp', 0)
@@ -40,8 +33,8 @@ def test_log(log_path):
     print(f"  Transitions: {' -> '.join(objectives)}")
     
     # Check if all required objectives are present
-    required = {"FIND", "ALIGN", "SCOOP", "LIFT", "PLACE"}
-    found = set(e.get('objective') for e in entries)
+    required = {"FIND_BRICK", "ALIGN_BRICK", "SCOOP", "LIFT", "POSITION_BRICK", "PLACE"}
+    found = set(normalize_objective_label(e.get('objective')) for e in entries if e.get('objective'))
     missing = required - found
     
     if missing:

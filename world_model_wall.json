@@ -1,0 +1,14 @@
+{
+    "wall": {
+        "x": null,
+        "y": null,
+        "angle_deg": 0.0,
+        "immutable": true,
+        "allow_auto_origin": true,
+        "lock_objective": "FIND_WALL",
+        "min_confidence": 80.0,
+        "max_origin_drift_mm": 75.0,
+        "max_angle_drift_deg": 10.0,
+        "place_offset_mm": 25.0
+    }
+}

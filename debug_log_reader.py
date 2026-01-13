@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-import json
 import os
 import sys
 import argparse
 from datetime import datetime
 from pathlib import Path
 
+from helper_demo_log_utils import read_demo_log, normalize_objective_label
 # ANSI Colors
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -23,7 +23,7 @@ class LogEntry:
         self.wall = d.get('wall_origin')
         self.brick = d.get('brick', {})
         self.lift = d.get('lift_height', 0)
-        self.obj = d.get('objective', 'UNKNOWN')
+        self.obj = normalize_objective_label(d.get('objective')) if d.get('objective') else "UNKNOWN"
         self.img = d.get('image_file')
 
 DEMOS_DIR = Path(__file__).resolve().parent / "demos"
@@ -78,30 +78,15 @@ def summarize_log(path):
     
     entries = []
     keyframes = []
-    try:
-        with open(path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line == "[" or line == "]":
-                    continue
-                # Remove trailing comma
-                if line.endswith(","):
-                    line = line[:-1]
-                try:
-                    data = json.loads(line)
-                    entry_type = data.get("type")
-                    if entry_type == "state":
-                        entries.append(LogEntry(data))
-                    elif entry_type == "keyframe":
-                        keyframes.append({
-                            "ts": data.get("timestamp", 0),
-                            "marker": data.get("marker")
-                        })
-                except json.JSONDecodeError:
-                    continue
-    except Exception as e:
-        print(f"Error reading file: {e}")
-        return
+    for data in read_demo_log(path):
+        entry_type = data.get("type")
+        if entry_type == "state":
+            entries.append(LogEntry(data))
+        elif entry_type == "keyframe":
+            keyframes.append({
+                "ts": data.get("timestamp", 0),
+                "marker": data.get("marker")
+            })
 
     if not entries:
         print(f"{RED}Log is empty or unreadable.{END}")
@@ -121,13 +106,19 @@ def summarize_log(path):
         vis = e.brick.get('visible', False)
         
         base_desc = ""
-        if e.obj == "FIND":
+        if e.obj == "FIND_BRICK":
             if not vis:
                 base_desc = "Searching for a brick..."
             else:
                 base_desc = "Found a brick!"
-        elif e.obj == "ALIGN":
+        elif e.obj == "ALIGN_BRICK":
             base_desc = "Aligning with brick..."
+        elif e.obj == "FIND_WALL":
+            base_desc = "Finding the wall..."
+        elif e.obj == "FIND_WALL2":
+            base_desc = "Finding wall (return)..."
+        elif e.obj == "POSITION_BRICK":
+            base_desc = "Positioning brick..."
         elif e.obj == "SCOOP":
             base_desc = "Approaching/Scooping brick..."
         elif e.obj == "LIFT":
@@ -203,10 +194,13 @@ def summarize_log(path):
 
     # --- FORMAT OUTPUT ---
     obj_map = {
-        "FIND": "Looking for brick (FIND)",
-        "ALIGN": "Aligning with brick (ALIGN)",
+        "FIND_WALL": "Finding wall (FIND_WALL)",
+        "FIND_BRICK": "Looking for brick (FIND_BRICK)",
+        "ALIGN_BRICK": "Aligning with brick (ALIGN_BRICK)",
         "SCOOP": "Seating brick (SCOOP)",
         "LIFT": "Lifting brick (LIFT)",
+        "FIND_WALL2": "Finding wall again (FIND_WALL2)",
+        "POSITION_BRICK": "Positioning brick (POSITION_BRICK)",
         "PLACE": "Lowering brick (PLACE)"
     }
     

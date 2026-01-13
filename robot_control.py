@@ -59,11 +59,15 @@ class Robot:
         pwm = min(pwm, 255)
 
         # 3. Hardware Inversion Correction
-        # The robot wiring is currently swapped: 'f' moves backward, 'b' moves forward.
+        # The robot wiring is currently swapped:
+        # - 'f' moves backward, 'b' moves forward
+        # - 'l' turns right, 'r' turns left
         # We fix this here so all high-level scripts (autolay, recording, etc) can use logical commands.
         real_hw_cmd = cmd_char
         if cmd_char == 'f': real_hw_cmd = 'b'
         elif cmd_char == 'b': real_hw_cmd = 'f'
+        elif cmd_char == 'l': real_hw_cmd = 'r'
+        elif cmd_char == 'r': real_hw_cmd = 'l'
 
         # 4. Send
         self._send(f"{real_hw_cmd} {pwm} {self.CMD_DURATION}\n")

@@ -18,7 +18,7 @@ from flask import Flask, Response
 # Import our capabilities
 from robot_control import Robot
 from train_brick_vision import BrickDetector
-from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
+from telemetry_robot import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
 
 # --- CONFIG ---
 WEB_PORT = 5000
@@ -66,11 +66,11 @@ class TeleopManager:
             loop_start = time.time()
             
             # A. Read Vision
-            found, angle, dist, offset_x, conf, cam_h = self.vision.read()
+            found, angle, dist, offset_x, conf, cam_h, brick_above, brick_below = self.vision.read()
             view_frame = self.vision.current_frame
             
             # Update World Model with Vision
-            self.world.update_vision(found, dist, angle, conf, offset_x, cam_h)
+            self.world.update_vision(found, dist, angle, conf, offset_x, cam_h, brick_above, brick_below)
             
             # B. Robot Control & Motion Tracking
             if self.state == RobotState.IDLE:

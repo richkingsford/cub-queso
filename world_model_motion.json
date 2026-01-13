@@ -1,0 +1,12 @@
+{
+  "calibration": {
+    "motion": {
+      "mm_per_tick": 8.024793388429751,
+      "deg_per_tick": 3.5517241379310347,
+      "mm_per_tick_mast": 3.6724137931034484,
+      "source": "setup_calibrate_motion.py",
+      "timestamp": "20260110_143249",
+      "samples": 34
+    }
+  }
+}

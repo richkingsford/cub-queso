@@ -1,0 +1,53 @@
+{
+    "objectives": {
+        "FIND_WALL": {
+            "start_gates": {},
+            "success_gates": {
+                "visible": {
+                    "min": 1.0
+                }
+            },
+            "fail_gates": {}
+        },
+        "FIND_BRICK": {
+            "start_gates": {},
+            "success_gates": {},
+            "fail_gates": {}
+        },
+        "ALIGN_BRICK": {
+            "start_gates": {},
+            "success_gates": {},
+            "fail_gates": {}
+        },
+        "SCOOP": {
+            "start_gates": {},
+            "success_gates": {},
+            "fail_gates": {}
+        },
+        "LIFT": {
+            "start_gates": {},
+            "success_gates": {},
+            "fail_gates": {}
+        },
+        "FIND_WALL2": {
+            "start_gates": {},
+            "success_gates": {},
+            "fail_gates": {}
+        },
+        "POSITION_BRICK": {
+            "start_gates": {},
+            "success_gates": {},
+            "fail_gates": {}
+        },
+        "PLACE": {
+            "start_gates": {},
+            "success_gates": {},
+            "fail_gates": {}
+        },
+        "RETREAT": {
+            "start_gates": {},
+            "success_gates": {},
+            "fail_gates": {}
+        }
+    }
+}

@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
-import json
 import os
 from pathlib import Path
 import sys
 
-def validate_session(session_path):
-    log_path = os.path.join(session_path, "a_log.json")
-    if not os.path.exists(log_path):
-        log_path = os.path.join(session_path, "log.json")
-    
-    if not os.path.exists(log_path):
-        return False, "Missing log file"
+from helper_demo_log_utils import read_demo_log, resolve_session_log, normalize_objective_label
 
-    entries = []
+
+def validate_session(session_path):
+    log_path = resolve_session_log(session_path)
+    if not log_path:
+        return False, "Missing log file"
+    
     try:
-        with open(log_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line in ["[", "]"]: continue
-                if line.endswith(","): line = line[:-1]
-                entries.append(json.loads(line))
+        entries = read_demo_log(log_path, strict=True)
     except Exception as e:
         return False, f"JSON Error: {e}"
 
@@ -29,13 +22,13 @@ def validate_session(session_path):
     # Track objective transitions to detect runs
     objectives_sequence = []
     for e in entries:
-        obj = e.get('objective', '')
+        obj = normalize_objective_label(e.get('objective', '')) if e.get('objective') else ''
         if not objectives_sequence or objectives_sequence[-1] != obj:
             objectives_sequence.append(obj)
     
     # Check for all required objectives across the entire session
     found_objs = set(objectives_sequence)
-    required_objs = {"FIND", "ALIGN", "SCOOP", "LIFT", "PLACE"}
+    required_objs = {"FIND_BRICK", "ALIGN_BRICK", "SCOOP", "LIFT", "POSITION_BRICK", "PLACE"}
     missing = required_objs - found_objs
     if missing:
         return False, f"Missing Objectives: {missing}"
@@ -46,11 +39,11 @@ def validate_session(session_path):
     current_run_objs = []
     
     for obj in objectives_sequence:
-        if obj == "FIND" and current_run_objs:
+        if obj == "FIND_BRICK" and current_run_objs:
             # Starting a new run, check if previous was complete
             if "PLACE" in current_run_objs:
                 complete_runs += 1
-            current_run_objs = ["FIND"]
+            current_run_objs = ["FIND_BRICK"]
         else:
             current_run_objs.append(obj)
     
@@ -61,21 +54,21 @@ def validate_session(session_path):
     if complete_runs == 0:
         return False, f"No complete runs (sequence: {' -> '.join(objectives_sequence)})"
 
-    # Check for Vision Stability in ALIGN/SCOOP
+    # Check for Vision Stability in ALIGN_BRICK/SCOOP
     align_vision_hits = 0
     scoop_vision_hits = 0
     for e in entries:
-        obj = e.get('objective')
+        obj = normalize_objective_label(e.get('objective'))
         visible = e.get('brick', {}).get('visible', False)
         if visible:
-            if obj == "ALIGN": align_vision_hits += 1
+            if obj == "ALIGN_BRICK": align_vision_hits += 1
             elif obj == "SCOOP": scoop_vision_hits += 1
 
     if align_vision_hits < 5:
-        return False, f"Poor ALIGN vision ({align_vision_hits} hits)"
+        return False, f"Poor ALIGN_BRICK vision ({align_vision_hits} hits)"
     
     # Success!
-    total_runs = objectives_sequence.count("FIND")
+    total_runs = objectives_sequence.count("FIND_BRICK")
     return True, f"READY: {complete_runs}/{total_runs} runs, {len(entries)} entries"
 
 def main():

@@ -20,7 +20,7 @@ import numpy as np
 from flask import Flask, Response
 from robot_control import Robot
 from train_brick_vision import BrickDetector
-from robot_leia_telemetry import WorldModel, MotionEvent, draw_telemetry_overlay
+from telemetry_robot import WorldModel, MotionEvent, draw_telemetry_overlay
 
 # --- CONFIG ---
 GEAR_1_SPEED = 0.32
@@ -65,10 +65,10 @@ def video_feed():
 def vision_thread(state):
     detector = BrickDetector(debug=True, speed_optimize=False)
     while state.running:
-        found, angle, dist, offset_x, conf, h = detector.read()
+        found, angle, dist, offset_x, conf, h, brick_above, brick_below = detector.read()
         
         with state.lock:
-            state.world.update_vision(found, dist, angle, conf, offset_x, h)
+            state.world.update_vision(found, dist, angle, conf, offset_x, h, brick_above, brick_below)
             if detector.current_frame is not None:
                 frame = detector.current_frame.copy()
                 reminders = ["W/A/S/D to move", "Q to quit"]
