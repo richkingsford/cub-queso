@@ -234,18 +234,9 @@ def print_command_help(app_state=None):
     log_line("[CMD] Example: :4f (scoop fail)")
     log_line("[CMD] Auto-run: :auto 4f")
     log_line("[CMD] Auto-run: :auto 4f")
-    log_line("[CMD] Camera (ranges): :cam exp [-10..0], :cam hue [0..50], :cam sat/val [0..255]")
-    log_line("[CMD] Save: :cam save (Required to persist changes!)")
-    
-    if app_state and app_state.vision:
-        v = app_state.vision
-        exp = getattr(v, 'cam_exposure', 'N/A')
-        c = getattr(v, 'brick_color_config', {})
-        h_m = c.get('hue', 'N/A')
-        s_m = c.get('sat', 'N/A')
-        v_m = c.get('val', 'N/A')
-        log_line(f"[STATE] Current: Exp={exp}, Hue={h_m}, Sat={s_m}, Val={v_m}")
-
+    log_line("[CMD] Example: :4f (scoop fail)")
+    log_line("[CMD] Auto-run: :auto 4f")
+    log_line("[CMD] Auto-run: :auto 4f")
     log_line("[CMD] End attempt: repeat the command or use :end")
 
 def command_mode_exit_messages(app_state):
@@ -284,39 +275,7 @@ def handle_command_line(app_state, cmd):
             if ok:
                 ended_info = (obj_enum, attempt_type)
                 ended_info = (obj_enum, attempt_type)
-        elif cmd_lower.startswith("cam ") or cmd_lower.startswith(":cam "):
-             # Cam Tuning
-             parts = cmd_lower.split()
-             # Skip ':cam' or 'cam'
-             if parts[0] in (":cam", "cam"): parts = parts[1:]
-             
-             if not parts:
-                 messages.append("[CAM] Usage: :cam [exp|hue|sat|val] [value] OR :cam save")
-             else:
-                 op = parts[0]
-                 val = int(parts[1]) if len(parts) > 1 and parts[1].lstrip('-').isdigit() else None
-                 
-                 if op == "save":
-                     if app_state.vision.save_settings():
-                         messages.append("[CAM] Settings Saved to world_model_brick.json!")
-                     else:
-                         messages.append("[CAM] Save Failed.")
-                 elif val is None:
-                     messages.append(f"[CAM] Missing value for {op}.")
-                 elif op in ("exp", "exposure"):
-                     app_state.vision.update_settings(exposure=val)
-                     messages.append(f"[CAM] Exposure set to {val}")
-                 elif op in ("hue", "h"):
-                     app_state.vision.update_settings(hue_margin=val)
-                     messages.append(f"[CAM] Hue Margin set to {val}")
-                 elif op in ("sat", "s"):
-                     app_state.vision.update_settings(sat_margin=val)
-                     messages.append(f"[CAM] Saturation Margin set to {val}")
-                 elif op in ("val", "v"):
-                     app_state.vision.update_settings(val_margin=val)
-                     messages.append(f"[CAM] Value Margin set to {val}")
-                 else:
-                     messages.append(f"[CAM] Unknown property: {op}")
+                ended_info = (obj_enum, attempt_type)
         else:
             auto_mode, obj_enum, attempt_type, err = parse_text_command(cmd)
             if err:
@@ -662,23 +621,6 @@ def control_loop(app_state):
             was_moving = False
             continue
         
-        # 1a. Config Hot-Reload Check (Every 1s)
-        if time.time() - app_state.last_config_check > 1.0:
-            app_state.last_config_check = time.time()
-            try:
-                # Use absolute path relative to this script
-                p = Path(__file__).parent / "world_model_brick.json"
-                if p.exists():
-                     mtime = p.stat().st_mtime
-                     if mtime > app_state.config_mtime:
-                         if app_state.config_mtime > 0: # Skip first check
-                             log_line("[CONFIG] Change detected. Reloading...")
-                             if app_state.vision.reload_from_file():
-                                 log_line("[CONFIG] Reloaded successfully.")
-                         app_state.config_mtime = mtime
-            except Exception:
-                pass
-
         # 1. Heartbeat Check
         with app_state.lock:
             if time.time() - app_state.last_key_time > HEARTBEAT_TIMEOUT:
