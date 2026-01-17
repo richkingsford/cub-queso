@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from telemetry_envelope import GateCheck
+from telemetry_brick import GateCheck, _objective_name, build_envelope
 
 import telemetry_brick
 import telemetry_wall
@@ -34,14 +34,6 @@ class MotionDelta:
     lift_mm: float = 0.0
 
 
-def build_envelope(process_rules, learned_rules, objective):
-    obj_name = objective.value if hasattr(objective, "value") else str(objective)
-    process = (process_rules or {}).get(obj_name, {})
-    learned = learned_rules.get(obj_name, {}) if learned_rules else {}
-    learned_gates = learned.get("gates", {})
-    success = process.get("success_gates") or learned_gates.get("success", {}).get("metrics", {})
-    failure = process.get("fail_gates") or learned_gates.get("failure", {}).get("metrics", {})
-    return {"success": success, "failure": failure}
 
 
 def evaluate_start_gates(world, objective, learned_rules, process_rules=None):
@@ -49,7 +41,7 @@ def evaluate_start_gates(world, objective, learned_rules, process_rules=None):
 
 
 def evaluate_success_gates(world, objective, learned_rules, process_rules=None):
-    obj_name = objective.value if hasattr(objective, "value") else str(objective)
+    obj_name = _objective_name(objective)
     if obj_name not in METRICS_BY_OBJECTIVE:
         return GateCheck(ok=True)
     envelope = build_envelope(process_rules or {}, learned_rules or {}, objective)
@@ -68,7 +60,7 @@ def evaluate_success_gates(world, objective, learned_rules, process_rules=None):
 
 
 def evaluate_failure_gates(world, objective, learned_rules, process_rules=None):
-    obj_name = objective.value if hasattr(objective, "value") else str(objective)
+    obj_name = _objective_name(objective)
     if obj_name not in METRICS_BY_OBJECTIVE:
         return GateCheck(ok=True)
     envelope = build_envelope(process_rules or {}, learned_rules or {}, objective)

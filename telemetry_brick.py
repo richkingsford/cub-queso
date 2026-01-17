@@ -1,7 +1,7 @@
 import math
 import time
-
-from telemetry_envelope import GateCheck
+from dataclasses import dataclass, field
+from typing import List
 
 START_GATE_MIN_CONFIDENCE = 25.0
 ALIGN_CONFIDENCE_MIN = 25.0
@@ -35,6 +35,27 @@ METRIC_DIRECTIONS = {
 }
 
 VISIBILITY_REQUIRED_METRICS = {"angle_abs", "offset_abs", "dist"}
+
+
+@dataclass
+class GateCheck:
+    ok: bool
+    reasons: List[str] = field(default_factory=list)
+
+    def reason_str(self):
+        return "; ".join(self.reasons) if self.reasons else ""
+
+
+def combine_gate_checks(*checks):
+    ok = True
+    reasons = []
+    for check in checks:
+        if check is None:
+            continue
+        if not check.ok:
+            ok = False
+            reasons.extend(check.reasons)
+    return GateCheck(ok=ok, reasons=reasons)
 
 
 def _objective_name(objective):

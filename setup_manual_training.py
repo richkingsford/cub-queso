@@ -10,7 +10,7 @@ import autostack
 from robot_control import Robot
 from helper_demo_log_utils import prune_log_file
 from helper_stream_server import StreamServer, format_stream_url
-from train_brick_vision import BrickDetector
+from helper_vision_aruco import ArucoBrickVision
 from telemetry_robot import (
     WorldModel,
     TelemetryLogger,
@@ -133,10 +133,11 @@ def ensure_log_open(app_state):
     if app_state.logger is None or app_state.logger_closed:
         open_new_log(app_state)
 
-def close_log(app_state, marker="JOB_END"):
+def close_log(app_state, marker=None):
     if app_state.logger is None or app_state.logger_closed:
         return
-    app_state.logger.log_keyframe(marker)
+    if marker:
+        app_state.logger.log_keyframe(marker)
     app_state.logger.enabled = False
     app_state.logger.close()
     app_state.logger_closed = True
@@ -231,13 +232,9 @@ def print_command_help(app_state=None):
     )
     log_line(f"[CMD] Objective codes: {codes}")
     log_line("[CMD] Attempt codes: f=fail, s=success, r=recover")
-    log_line("[CMD] Example: :4f (scoop fail)")
-    log_line("[CMD] Auto-run: :auto 4f")
-    log_line("[CMD] Auto-run: :auto 4f")
-    log_line("[CMD] Example: :4f (scoop fail)")
-    log_line("[CMD] Auto-run: :auto 4f")
-    log_line("[CMD] Auto-run: :auto 4f")
-    log_line("[CMD] End attempt: repeat the command or use :end")
+    log_line("[CMD] Example: :4s (scoop success), :4f (scoop fail)")
+    log_line("[CMD] Auto-run: :auto 4s")
+    log_line("[CMD] End attempt: just press ENTER or ':' again, or repeat the command.")
 
 def command_mode_exit_messages(app_state):
     if app_state.active_attempt:
@@ -250,19 +247,21 @@ def handle_command_line(app_state, cmd):
     do_help = False
     exit_mode = False
     ended_info = None
-    should_close = False
-
-    if cmd_lower in ("", ":"):
-        exit_mode = True
-        return exit_mode, do_help, messages, ended_info, should_close
-    if cmd_lower in ("q", "quit", "exit"):
-        with app_state.lock:
-            app_state.running = False
-        messages.append("Stopping manual recording...")
-        exit_mode = True
-        return exit_mode, do_help, messages, ended_info, should_close
 
     with app_state.lock:
+        if cmd_lower in ("", ":"):
+            if app_state.active_attempt:
+                ok, msg, obj_enum, attempt_type, should_close = end_attempt(app_state)
+                messages.append(msg)
+                if ok:
+                    ended_info = (obj_enum, attempt_type)
+            exit_mode = True
+            return exit_mode, do_help, messages, ended_info
+        if cmd_lower in ("q", "quit", "exit"):
+            app_state.running = False
+            messages.append("Stopping manual recording...")
+            exit_mode = True
+            return exit_mode, do_help, messages, ended_info
         if cmd_lower in ("help", "h", "?"):
             do_help = True
         elif cmd_lower in ("status", "state"):
@@ -273,8 +272,6 @@ def handle_command_line(app_state, cmd):
             ok, msg, obj_enum, attempt_type, should_close = end_attempt(app_state)
             messages.append(msg)
             if ok:
-                ended_info = (obj_enum, attempt_type)
-                ended_info = (obj_enum, attempt_type)
                 ended_info = (obj_enum, attempt_type)
         else:
             auto_mode, obj_enum, attempt_type, err = parse_text_command(cmd)
@@ -293,39 +290,19 @@ def handle_command_line(app_state, cmd):
                 if app_state.autostack_active or app_state.autostack_request:
                     messages.append("[AUTO] Autostack pending; wait to issue manual commands.")
                 else:
-                    ok, msg, ended, should_close = handle_attempt_command(app_state, obj_enum, attempt_type)
+                    ok, msg, ended, should_close_val = handle_attempt_command(app_state, obj_enum, attempt_type)
                     messages.append(msg)
+                    should_close = should_close_val # Propagate
+                    if ok:
+                        # Return to driving mode immediately on start/stop
+                        exit_mode = True
+                        if app_state.active_attempt:
+                            messages.append("[CMD] Press ':' again or enter an empty command to finish.")
                     if ended:
                         ended_info = ended
-                    if ok and app_state.active_attempt:
-                        messages.append("[CMD] Press ':' when finished recording.")
-                        exit_mode = True
 
-    return exit_mode, do_help, messages, ended_info, should_close
+    return exit_mode, do_help, messages, ended_info
 
-
-def prompt_keep_discard(obj_enum, attempt_type):
-    obj_label = objective_label(obj_enum)
-    prompt = f"[KEEP] Keep {attempt_type} attempt for {obj_label}? [y/N]: "
-    while True:
-        try:
-            answer = input(prompt).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return False
-        if answer in ("y", "yes"):
-            return True
-        if answer in ("", "n", "no", "d", "discard"):
-            return False
-        print("Please enter y or n.")
-
-
-def record_attempt_discard(app_state, obj_enum, attempt_type):
-    if app_state.logger_closed:
-        return
-    marker = f"{attempt_type}_DISCARD"
-    prev_enabled = app_state.logger.enabled
-    app_state.logger.log_keyframe(marker, objective_label(obj_enum))
-    app_state.logger.enabled = prev_enabled
 
 def start_attempt(app_state, obj_enum, attempt_type):
     obj_label = objective_label(obj_enum)
@@ -360,34 +337,42 @@ def end_attempt(app_state, complete_objective=True):
             current_obj = app_state.world.objective_state
             app_state.world.reset_mission()
             app_state.world.objective_state = current_obj
-            should_close = True
         app_state.world.recording_active = False
     else:
+        # For FAIL/RECOVER, we keep it open by default to allow retry,
+        # UNLESS we are explicitly closing the objective.
+        if complete_objective:
+            app_state.objective_open = False
+            app_state.open_objective = None
         app_state.world.recording_active = False
 
     app_state.world.attempt_status = "NORMAL"
     app_state.active_attempt = None
     app_state.logger.enabled = False
-    return True, f"[OBJ] {obj_label} attempt ended.", obj_enum, attempt_type, should_close
+    return True, f"[OBJ] {obj_label} {attempt_type} finished.", obj_enum, attempt_type, False
 
 def handle_attempt_command(app_state, obj_enum, attempt_type):
     obj_label = objective_label(obj_enum)
-    if app_state.objective_open and app_state.open_objective != obj_enum:
-        return False, f"[OBJ] Finish {objective_label(app_state.open_objective)} before switching objectives.", None, False
+    ended_info = None
+    ended_close = False
 
-    if app_state.active_attempt == attempt_type:
-        ok, msg, ended_obj, ended_attempt, should_close = end_attempt(app_state)
-        ended_info = (ended_obj, ended_attempt) if ok else None
-        return ok, msg, ended_info, should_close
-
+    # 1. If ANY recording is active, end it first.
     if app_state.active_attempt:
-        ok, msg, ended_obj, ended_attempt, should_close = end_attempt(app_state)
-        ended_info = (ended_obj, ended_attempt) if ok else None
-        ended_close = should_close
-    else:
-        ended_info = None
-        ended_close = False
+        ok, msg, ended_obj, ended_attempt, should_close = end_attempt(app_state, complete_objective=(app_state.active_attempt == attempt_type))
+        if ok:
+            ended_info = (ended_obj, ended_attempt)
+            ended_close = should_close
+            log_line(msg)
 
+    # 2. Check Objective Constraints for the NEW attempt
+    if app_state.objective_open and app_state.open_objective != obj_enum:
+        return False, f"[OBJ] Finish {objective_label(app_state.open_objective)} before switching objectives.", ended_info, ended_close
+
+    # 3. If they were just toggling OFF the same thing, we are done.
+    if ended_info and ended_info[0] == obj_enum and ended_info[1] == attempt_type:
+        return True, f"[OBJ] {obj_label} finished.", ended_info, ended_close
+
+    # 4. Start the new attempt
     ok, msg = start_attempt(app_state, obj_enum, attempt_type)
     return ok, msg, ended_info, ended_close
 
@@ -416,7 +401,6 @@ class AppState:
         self.active_attempt = None
         self.autostack_request = None
         self.autostack_active = False
-        self.pending_review = None
         
         # Session Setup
         self.demos_dir = DEMOS_DIR
@@ -449,24 +433,6 @@ def getch():
 
 def keyboard_thread(app_state):
     while app_state.running:
-        pending_review = None
-        with app_state.lock:
-            if app_state.pending_review:
-                pending_review = app_state.pending_review
-                app_state.pending_review = None
-        if pending_review:
-            obj_enum, attempt_type, should_close = pending_review
-            keep = prompt_keep_discard(obj_enum, attempt_type)
-            if not keep:
-                with app_state.lock:
-                    record_attempt_discard(app_state, obj_enum, attempt_type)
-                log_line(f"[KEEP] Discarded {attempt_type} attempt for {objective_label(obj_enum)}.")
-            else:
-                log_line(f"[KEEP] Keeping {attempt_type} attempt for {objective_label(obj_enum)}.")
-            if should_close:
-                with app_state.lock:
-                    close_log(app_state, marker="JOB_END")
-
         ch = getch()
         if not ch:
             continue
@@ -481,9 +447,14 @@ def keyboard_thread(app_state):
         elif ch_lower == ':':
             with app_state.lock:
                 app_state.last_key_time = time.time()
+                if app_state.active_attempt:
+                    ok, msg, _, _, _ = end_attempt(app_state, complete_objective=True)
+                    log_line(msg)
+                    continue
+
                 app_state.active_command = None
                 app_state.active_speed = 0.0
-            log_line("[CMD] Enter command (ex: 4f, auto 4f, help). Use ':' or blank to exit.")
+            log_line("[CMD] Enter command (ex: 4s, 4f, help). Use ':' or blank to exit.")
             
             # Force enable ECHO and ICANON so input() is visible
             fd_term = sys.stdin.fileno()
@@ -496,26 +467,22 @@ def keyboard_thread(app_state):
                     cmd = input("[CMD] > ")
                 except (EOFError, KeyboardInterrupt):
                     cmd = ""
-                exit_mode, do_help, messages, ended_info, should_close = handle_command_line(app_state, cmd)
+                exit_mode, do_help, messages, ended_info = handle_command_line(app_state, cmd)
                 if do_help:
                     print_command_help(app_state)
                 for msg in messages:
                     log_line(msg)
                 if ended_info:
-                    obj_enum, attempt_type = ended_info
-                    keep = prompt_keep_discard(obj_enum, attempt_type)
-                    if not keep:
-                        with app_state.lock:
-                            record_attempt_discard(app_state, obj_enum, attempt_type)
-                        log_line(f"[KEEP] Discarded {attempt_type} attempt for {objective_label(obj_enum)}.")
-                    else:
-                        log_line(f"[KEEP] Keeping {attempt_type} attempt for {objective_label(obj_enum)}.")
-                    if should_close:
-                        with app_state.lock:
-                            close_log(app_state, marker="JOB_END")
+                    pass
                 if exit_mode:
                     for msg in command_mode_exit_messages(app_state):
                         log_line(msg)
+                    # Flush and CLEAR messages to prevent double-printing at bottom of thread
+                    messages = []
+                    try:
+                        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+                    except:
+                        pass
                     break
         else:
             with app_state.lock:
@@ -561,6 +528,10 @@ def run_auto_attempt(app_state, obj_enum, attempt_type):
     if not ok:
         return False
 
+    # Log initial state immediately to capture conditions at the start of the attempt
+    with app_state.lock:
+        app_state.logger.log_state(app_state.world)
+
     def frame_callback(frame):
         if frame is None:
             return
@@ -585,16 +556,13 @@ def run_auto_attempt(app_state, obj_enum, attempt_type):
     if attempt_type == "SUCCESS":
         complete_obj = ok
     with app_state.lock:
-        _, _, ended_obj, ended_attempt, should_close = end_attempt(app_state, complete_objective=complete_obj)
-    if ended_obj and ended_attempt:
-        with app_state.lock:
-            app_state.pending_review = (ended_obj, ended_attempt, should_close)
+        _, _, ended_obj, ended_attempt, _ = end_attempt(app_state, complete_objective=complete_obj)
     return ok
 
 def control_loop(app_state):
     app_state.robot = Robot()
     # speed_optimize=False so we get the debug markers drawn on the frame
-    app_state.vision = BrickDetector(debug=True, speed_optimize=False)
+    app_state.vision = ArucoBrickVision(debug=True)
     print_command_help(app_state)
     
     dt = 1.0 / LOG_RATE_HZ
@@ -738,5 +706,5 @@ if __name__ == "__main__":
         state.running = False
         if state.robot: state.robot.close()
         if state.vision: state.vision.close()
-        close_log(state, marker="JOB_ABORT")
+        close_log(state, marker=None)
         log_line("Shutdown complete.")

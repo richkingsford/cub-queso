@@ -16,7 +16,7 @@ import telemetry_robot as telemetry_robot_module
 import telemetry_wall
 from telemetry_robot import WorldModel, MotionEvent, ObjectiveState
 from helper_stream_server import StreamServer
-from train_brick_vision import BrickDetector
+from helper_vision_aruco import ArucoBrickVision
 
 # --- CONFIG ---
 DEMO_DIR = Path(__file__).resolve().parent / "demos"
@@ -387,7 +387,7 @@ def run_demo_attempt(objective, attempt_type, session_name=None, robot=None, vis
         robot = Robot()
         created_robot = True
     if vision is None:
-        vision = BrickDetector(debug=False)
+        vision = ArucoBrickVision(debug=False)
         created_vision = True
     if world is None:
         world = WorldModel()
@@ -772,6 +772,7 @@ def update_world_model(world, vision, stream_state=None, frame_callback=None):
         cam_h = 0.0
         brick_above = False
         brick_below = False
+    # Signature: update_vision(self, found, dist, angle, conf, ...)
     world.update_vision(found, dist, angle, conf, offset_x, cam_h, brick_above, brick_below)
     if stream_state is not None:
         with stream_state["lock"]:

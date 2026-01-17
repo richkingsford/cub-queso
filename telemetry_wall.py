@@ -5,15 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from telemetry_envelope import GateCheck
+from telemetry_brick import GateCheck, OBJECTIVE_ALIASES, _objective_name
 
 WALL_MODEL_FILE = Path(__file__).parent / "world_model_wall.json"
 
-OBJECTIVE_ALIASES = {
-    "FIND": "FIND_BRICK",
-    "ALIGN": "ALIGN_BRICK",
-    "CARRY": "FIND_WALL2",
-}
 
 @dataclass
 class WallEnvelope:
@@ -90,13 +85,6 @@ def init_wall_state(envelope: WallEnvelope):
     }
 
 
-def _objective_name(objective):
-    if hasattr(objective, "value"):
-        name = objective.value
-    else:
-        name = str(objective)
-    key = name.strip().upper()
-    return OBJECTIVE_ALIASES.get(key, key)
 
 
 def _needs_wall_origin(obj_name):
