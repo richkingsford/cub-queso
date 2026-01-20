@@ -90,6 +90,7 @@ ATTEMPT_CODES = {
     "f": "FAIL",
     "s": "SUCCESS",
     "r": "RECOVER",
+    "n": "NOMINAL",
 }
 
 ATTEMPT_NAMES = {
@@ -98,18 +99,22 @@ ATTEMPT_NAMES = {
     "success": "SUCCESS",
     "recover": "RECOVER",
     "recovery": "RECOVER",
+    "nominal": "NOMINAL",
+    "nom": "NOMINAL",
 }
 
 ATTEMPT_MARKERS = {
     "FAIL": ("FAIL_START", "FAIL_END"),
     "RECOVER": ("RECOVER_START", "RECOVER_END"),
     "SUCCESS": ("SUCCESS_START", "SUCCESS_END"),
+    "NOMINAL": ("NOMINAL_START", "NOMINAL_END"),
 }
 
 ATTEMPT_STATUS = {
     "FAIL": "FAIL",
     "RECOVER": "RECOVERY",
     "SUCCESS": "NORMAL",
+    "NOMINAL": "NOMINAL",
 }
 
 def objective_label(obj_enum):
@@ -231,10 +236,10 @@ def print_command_help(app_state=None):
         f"{idx + 1}={obj.value.lower()}" for idx, obj in enumerate(DEMO_OBJECTIVES)
     )
     log_line(f"[CMD] Objective codes: {codes}")
-    log_line("[CMD] Attempt codes: f=fail, s=success, r=recover")
-    log_line("[CMD] Example: :4s (scoop success), :4f (scoop fail)")
+    log_line("[CMD] Attempt codes: f=fail, s=success, r=recover, n=nominal")
+    log_line("[CMD] Example: :4s (scoop success), :4n (scoop nominal)")
     log_line("[CMD] Auto-run: :auto 4s")
-    log_line("[CMD] End attempt: just press ENTER or ':' again, or repeat the command.")
+    log_line("[CMD] End attempt: press ':' to finish and return to the command prompt.")
 
 def command_mode_exit_messages(app_state):
     if app_state.active_attempt:
@@ -297,7 +302,7 @@ def handle_command_line(app_state, cmd):
                         # Return to driving mode immediately on start/stop
                         exit_mode = True
                         if app_state.active_attempt:
-                            messages.append("[CMD] Press ':' again or enter an empty command to finish.")
+                            messages.append("[CMD] Press ':' to finish and return to the command prompt.")
                     if ended:
                         ended_info = ended
 
@@ -439,7 +444,7 @@ def keyboard_thread(app_state):
         ch_lower = ch.lower()
 
         messages = []
-        if ch_lower == 'q':
+        if ch == 'Q':
             with app_state.lock:
                 app_state.last_key_time = time.time()
                 app_state.running = False
@@ -447,13 +452,15 @@ def keyboard_thread(app_state):
         elif ch_lower == ':':
             with app_state.lock:
                 app_state.last_key_time = time.time()
+                end_msg = None
                 if app_state.active_attempt:
                     ok, msg, _, _, _ = end_attempt(app_state, complete_objective=True)
-                    log_line(msg)
-                    continue
+                    end_msg = msg
 
                 app_state.active_command = None
                 app_state.active_speed = 0.0
+            if end_msg:
+                log_line(end_msg)
             log_line("[CMD] Enter command (ex: 4s, 4f, help). Use ':' or blank to exit.")
             
             # Force enable ECHO and ICANON so input() is visible
@@ -488,7 +495,7 @@ def keyboard_thread(app_state):
             with app_state.lock:
                 app_state.last_key_time = time.time()
                 if app_state.autostack_active or app_state.autostack_request:
-                    if ch_lower in ('w', 's', 'a', 'd', 'z', 'c', 'p', 'l'):
+                    if ch_lower in ('w', 's', 'a', 'd', 'q', 'e', 'z', 'c', 'p', 'l'):
                         messages.append("[AUTO] Autostack active; manual controls paused.")
                 else:
                     # MOVEMENT (Heartbeat triggers)
@@ -501,7 +508,13 @@ def keyboard_thread(app_state):
                         app_state.turn_speed_multiplier = 1.0
                     elif ch_lower == 'd':
                         app_state.active_command = 'r'
-                        app_state.turn_speed_multiplier = 0.5
+                        app_state.turn_speed_multiplier = 1.0
+                    elif ch_lower == 'q':
+                        app_state.active_command = 'l'
+                        app_state.turn_speed_multiplier = 1.0 / 3.0
+                    elif ch_lower == 'e':
+                        app_state.active_command = 'r'
+                        app_state.turn_speed_multiplier = 1.0 / 3.0
                     elif ch_lower == 'z':
                         app_state.active_command = 'l'
                         app_state.turn_speed_multiplier = 2.0

@@ -145,7 +145,6 @@ def summarize_log(path):
     current_p = {
         'start': 0,
         'obj': entries[0].obj,
-        'seated': entries[0].brick.get('seated', False),
         'held': entries[0].brick.get('held', False),
         'min_dist': float('inf'),
         'max_dist': float('-inf'),
@@ -155,12 +154,10 @@ def summarize_log(path):
     for i, e in enumerate(entries):
         elapsed = e.ts - start_ts
         dist = e.brick.get('dist', 0) if e.brick.get('visible') else None
-        seated = e.brick.get('seated', False)
         held = e.brick.get('held', False)
         
         # Merge if Objective AND State Flags are same
         state_match = (e.obj == current_p['obj'] and 
-                       seated == current_p['seated'] and 
                        held == current_p['held'])
         
         if state_match:
@@ -177,7 +174,6 @@ def summarize_log(path):
             current_p = {
                 'start': elapsed,
                 'obj': e.obj,
-                'seated': seated,
                 'held': held,
                 'min_dist': float('inf'),
                 'max_dist': float('-inf'),
@@ -197,7 +193,7 @@ def summarize_log(path):
         "FIND_WALL": "Finding wall (FIND_WALL)",
         "FIND_BRICK": "Looking for brick (FIND_BRICK)",
         "ALIGN_BRICK": "Aligning with brick (ALIGN_BRICK)",
-        "SCOOP": "Seating brick (SCOOP)",
+        "SCOOP": "Scooping brick (SCOOP)",
         "LIFT": "Lifting brick (LIFT)",
         "FIND_WALL2": "Finding wall again (FIND_WALL2)",
         "POSITION_BRICK": "Positioning brick (POSITION_BRICK)",
@@ -205,7 +201,6 @@ def summarize_log(path):
     }
     
     # ANSI for internal color markers
-    ORANGE_M = "\033[38;5;208m"
     GREEN_M = "\033[32m"
     
     for p in periods:
@@ -214,9 +209,6 @@ def summarize_log(path):
         # Add state markers
         if p['held']:
             desc += f" {BOLD}{GREEN_M}(HELD){END}"
-        elif p['seated']:
-            desc += f" {BOLD}{ORANGE_M}(SEATED){END}"
-            
         # Add vision info
         if p['vis_count'] > 0:
             d_min, d_max = p['min_dist'], p['max_dist']
@@ -225,8 +217,8 @@ def summarize_log(path):
             else:
                 desc += f". Distance was between {d_min:.0f} and {d_max:.0f}mm"
         else:
-            # If we are seated/held, we don't necessarily care about "No brick seen" noise
-            if not p['seated'] and not p['held']:
+            # If we are held, we don't necessarily care about "No brick seen" noise
+            if not p['held']:
                 desc += ". (No brick seen)"
         
         output_lines.append(f"Sec {p['start']:4.1f} - {p['end']:4.1f}: {desc}")

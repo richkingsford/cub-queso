@@ -1,53 +1,76 @@
 {
     "objectives": {
         "FIND_WALL": {
-            "start_gates": {},
+            "scan_direction": "r",
             "success_gates": {
                 "visible": {
-                    "min": 1.0
+                    "min": true
+                },
+                "angle_abs": {
+                    "min": -3.03,
+                    "max": 8.49
+                },
+                "offset_abs": {
+                    "min": -42.08,
+                    "max": 63.97
+                },
+                "dist": {
+                    "min": 57.62,
+                    "max": 99.72
+                }
+            }
+        },
+        "EXIT_WALL": {
+            "scan_direction": "r",
+            "start_gates": {
+                "visible": {
+                    "min": true
                 }
             },
-            "fail_gates": {}
+            "success_gates": {
+                "visible": {
+                    "min": false
+                }
+            }
         },
         "FIND_BRICK": {
-            "start_gates": {},
-            "success_gates": {},
-            "fail_gates": {}
+            "scan_direction": "r",
+            "success_gates": {
+                "visible": {
+                    "min": false
+                }
+            }
         },
         "ALIGN_BRICK": {
-            "start_gates": {},
-            "success_gates": {},
-            "fail_gates": {}
+            "start_gates": {
+                "visible": {
+                    "min": true
+                }
+            },
+            "success_gates": {
+                "visible": {
+                    "min": true
+                },
+                "angle_abs": {
+                    "min": -3.25,
+                    "max": 8.82
+                },
+                "offset_abs": {
+                    "min": -16.4,
+                    "max": 24.7
+                },
+                "dist": {
+                    "min": 31.7,
+                    "max": 98.05
+                }
+            }
         },
         "SCOOP": {
-            "start_gates": {},
-            "success_gates": {},
-            "fail_gates": {}
+            "nominalDemosOnly": true
         },
-        "LIFT": {
-            "start_gates": {},
-            "success_gates": {},
-            "fail_gates": {}
-        },
-        "FIND_WALL2": {
-            "start_gates": {},
-            "success_gates": {},
-            "fail_gates": {}
-        },
-        "POSITION_BRICK": {
-            "start_gates": {},
-            "success_gates": {},
-            "fail_gates": {}
-        },
-        "PLACE": {
-            "start_gates": {},
-            "success_gates": {},
-            "fail_gates": {}
-        },
-        "RETREAT": {
-            "start_gates": {},
-            "success_gates": {},
-            "fail_gates": {}
-        }
+        "FIND_WALL2": {},
+        "POSITION_BRICK": {},
+        "PLACE": {},
+        "RETREAT": {}
     }
 }

@@ -11,11 +11,13 @@ ATTEMPT_START_MARKERS = {
     "SUCCESS_START": "SUCCESS",
     "FAIL_START": "FAIL",
     "RECOVER_START": "RECOVER",
+    "NOMINAL_START": "NOMINAL",
 }
 ATTEMPT_END_MARKERS = {
     "SUCCESS_END": "SUCCESS",
     "FAIL_END": "FAIL",
     "RECOVER_END": "RECOVER",
+    "NOMINAL_END": "NOMINAL",
 }
 ALWAYS_KEEP_KEYFRAMES = {
     "JOB_START",
@@ -134,6 +136,7 @@ def extract_attempt_segments(log_data):
         "SUCCESS_DISCARD": "SUCCESS",
         "FAIL_DISCARD": "FAIL",
         "RECOVER_DISCARD": "RECOVER",
+        "NOMINAL_DISCARD": "NOMINAL",
     }
     segments = []
     active = {}

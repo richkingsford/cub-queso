@@ -18,6 +18,52 @@ from telemetry_robot import WorldModel, MotionEvent, ObjectiveState
 from helper_stream_server import StreamServer
 from helper_vision_aruco import ArucoBrickVision
 
+# ANSI colors for terminal highlights.
+COLOR_RESET = "\033[0m"
+COLOR_GREEN = "\033[32m"
+COLOR_RED = "\033[31m"
+
+def format_headline(headline, color, details=""):
+    if details is None:
+        details = ""
+    return f"{color}{headline}{COLOR_RESET}{details}"
+
+def log_action(phase, label, cmd=None, speed=None, duration=None):
+    line = f"[ACT] {phase}: {label}"
+    details = []
+    if cmd is not None:
+        details.append(str(cmd))
+    if speed is not None:
+        details.append(f"{speed:.2f}")
+    if duration is not None:
+        details.append(f"{duration:.2f}s")
+    if details:
+        line += " (" + " ".join(details) + ")"
+    print(line)
+
+WORLD_MODEL_PROCESS_FILE = Path(__file__).resolve().parent / "world_model_process.json"
+
+def load_process_sequence(model_path=WORLD_MODEL_PROCESS_FILE):
+    if not model_path.exists():
+        return list(PHASE_SEQUENCE)
+    try:
+        with open(model_path, "r") as f:
+            model = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return list(PHASE_SEQUENCE)
+    objectives = model.get("objectives")
+    if not isinstance(objectives, dict) or not objectives:
+        return list(PHASE_SEQUENCE)
+    sequence = []
+    seen = set()
+    for name in objectives.keys():
+        normalized = normalize_objective_label(name)
+        if not normalized or normalized in seen:
+            continue
+        sequence.append(normalized)
+        seen.add(normalized)
+    return sequence or list(PHASE_SEQUENCE)
+
 # --- CONFIG ---
 DEMO_DIR = Path(__file__).resolve().parent / "demos"
 WEB_PORT = 5000
@@ -58,6 +104,7 @@ RECOVERY_MAX_S = 6.0
 MAX_PHASE_ATTEMPTS = 5
 
 GATE_MIN_SAMPLES = 5
+GATE_STABILITY_FRAMES = 5
 BRICK_HEIGHT_MIN_MM = 5.0
 BRICK_HEIGHT_MAX_MM = 150.0
 BRICK_HEIGHT_MAX_ADJUST_FRACTION = 0.7
@@ -71,6 +118,7 @@ METRIC_DIRECTIONS = {
 }
 
 PHASE_METRICS = {
+    "EXIT_WALL": ("angle_abs", "offset_abs", "dist", "visible"),
     "FIND_BRICK": ("angle_abs", "offset_abs", "dist", "visible"),
     "ALIGN_BRICK": ("angle_abs", "offset_abs", "dist", "visible"),
     "SCOOP": ("angle_abs", "offset_abs", "dist", "visible"),
@@ -78,6 +126,8 @@ PHASE_METRICS = {
 }
 
 PHASE_SEQUENCE = [
+    "FIND_WALL",
+    "EXIT_WALL",
     "FIND_BRICK",
     "ALIGN_BRICK",
     "SCOOP",
@@ -89,6 +139,7 @@ PHASE_SEQUENCE = [
 ]
 
 PERCEPTION_PHASES = {"FIND_BRICK", "ALIGN_BRICK"}
+START_GATE_BRICK_PHASES = {"ALIGN_BRICK", "SCOOP"}
 
 DEFAULT_GATE_TEMPLATES = {
     "FIND_BRICK": {
@@ -115,6 +166,8 @@ DEFAULT_GATE_TEMPLATES = {
 
 
 class Phase(Enum):
+    FIND_WALL = "FIND_WALL"
+    EXIT_WALL = "EXIT_WALL"
     FIND_BRICK = "FIND_BRICK"
     ALIGN_BRICK = "ALIGN_BRICK"
     SCOOP = "SCOOP"
@@ -138,6 +191,7 @@ class PhaseResult:
     success: bool
     reason: str
     elapsed: float
+    start_gate_failed: bool = False
 
 
 @dataclass
@@ -230,7 +284,7 @@ ACTION_CMD_MAP = {
     "mast_down": "d",
 }
 
-ATTEMPT_TYPES = {"SUCCESS", "FAIL", "RECOVER"}
+ATTEMPT_TYPES = {"SUCCESS", "FAIL", "RECOVER", "NOMINAL"}
 
 
 def _normalize_attempt_type(attempt_type):
@@ -516,6 +570,83 @@ def average_forward_speed(events, start_time, end_time):
     return weighted / total
 
 
+def collect_attempt_segments(logs, attempt_type):
+    target_type = _normalize_attempt_type(attempt_type)
+    if not target_type:
+        return []
+    segments = []
+    for _, data in logs:
+        for seg in extract_attempt_segments(data):
+            if seg.get("type") == target_type:
+                segments.append(seg)
+    return segments
+
+
+def collect_attempt_types_by_objective(logs):
+    attempt_types = {}
+    for _, data in logs:
+        for seg in extract_attempt_segments(data):
+            obj = normalize_objective_label(seg.get("objective"))
+            if not obj:
+                continue
+            seg_type = _normalize_attempt_type(seg.get("type"))
+            if not seg_type:
+                continue
+            attempt_types.setdefault(obj, set()).add(seg_type)
+    return attempt_types
+
+
+def learn_scan_preferences(logs, attempt_types=("SUCCESS", "NOMINAL")):
+    prefs = {}
+    for _, data in logs:
+        for seg in extract_attempt_segments(data):
+            if seg.get("type") not in attempt_types:
+                continue
+            obj = normalize_objective_label(seg.get("objective"))
+            if not obj:
+                continue
+            summary = _segment_motion_summary(seg.get("events") or [])
+            if not summary:
+                continue
+            left = summary.get("l", {}).get("duration", 0.0)
+            right = summary.get("r", {}).get("duration", 0.0)
+            if left <= 0 and right <= 0:
+                continue
+            totals = prefs.setdefault(obj, {"l": 0.0, "r": 0.0})
+            totals["l"] += left
+            totals["r"] += right
+
+    resolved = {}
+    for obj, totals in prefs.items():
+        left = totals.get("l", 0.0)
+        right = totals.get("r", 0.0)
+        if left == right:
+            continue
+        resolved[obj] = "l" if left > right else "r"
+    return resolved
+
+
+def _segment_motion_summary(events):
+    sequence = build_motion_sequence(events or [])
+    if not sequence:
+        return {}
+    per_cmd = {}
+    for primitive in sequence:
+        entry = per_cmd.setdefault(primitive.cmd, {"duration": 0.0, "speed_weighted": 0.0})
+        entry["duration"] += primitive.duration_s
+        entry["speed_weighted"] += primitive.speed * primitive.duration_s
+    summary = {}
+    for cmd, entry in per_cmd.items():
+        duration = entry["duration"]
+        if duration <= 0:
+            continue
+        summary[cmd] = {
+            "duration": duration,
+            "speed": entry["speed_weighted"] / duration,
+        }
+    return summary
+
+
 def learn_gates_from_logs(logs):
     gate_acc = {"success": {}, "failure": {}, "success_times": {}, "failure_times": {}}
     success_segments = []
@@ -682,6 +813,23 @@ def resolve_phase_gates(phase, learned):
     return DEFAULT_GATE_TEMPLATES.get(phase, {})
 
 
+def resolve_runtime_gates(phase, learned, process_rules):
+    gates = resolve_phase_gates(phase, learned)
+    obj_name = normalize_objective_label(phase)
+    process_cfg = (process_rules or {}).get(obj_name) or {}
+    if not isinstance(process_cfg, dict):
+        return gates
+    success = process_cfg.get("success_gates") or {}
+    failure = process_cfg.get("fail_gates") or {}
+    if success or failure:
+        return {
+            "success": success or gates.get("success", {}),
+            "failure": failure or gates.get("failure", {}),
+            "temporal": gates.get("temporal", {}),
+        }
+    return gates
+
+
 def _fmt_gate_value(value):
     if value is None:
         return None
@@ -740,10 +888,172 @@ def format_gate_summary(phase, gates):
     return f"success gate: {success_desc}; fail gate: {fail_desc}; time gate: {time_desc}"
 
 
-def compute_alignment_command(world, gates):
+def _objective_process_config(phase_name, process_rules):
+    obj_name = normalize_objective_label(phase_name)
+    cfg = (process_rules or {}).get(obj_name)
+    if isinstance(cfg, dict):
+        return cfg
+    return {}
+
+
+def _format_gate_metric(metric, stats, direction, kind):
+    if not stats or not isinstance(stats, dict):
+        return None
+    mu = stats.get("mu")
+    sigma = stats.get("sigma")
+    if mu is not None and sigma is not None:
+        return f"{metric}~{_fmt_gate_value(mu)}+/-{_fmt_gate_value(sigma)}"
+    min_val = stats.get("min")
+    max_val = stats.get("max")
+    if metric == "visible":
+        if isinstance(min_val, bool):
+            return f"{metric}={'true' if min_val else 'false'}"
+        if isinstance(max_val, bool):
+            return f"{metric}={'true' if max_val else 'false'}"
+    if min_val is not None and max_val is not None:
+        return f"{_fmt_gate_value(min_val)}<={metric}<={_fmt_gate_value(max_val)}"
+    if min_val is not None:
+        return f"{metric}>={_fmt_gate_value(min_val)}"
+    if max_val is not None:
+        if kind == "fail":
+            if direction == "low":
+                return f"{metric}>={_fmt_gate_value(max_val)}"
+            if direction == "high":
+                return f"{metric}<={_fmt_gate_value(max_val)}"
+        return f"{metric}<={_fmt_gate_value(max_val)}"
+    return None
+
+
+def format_gate_metrics(phase_name, metrics, kind):
+    if not metrics:
+        return "none"
+    metric_order = list(PHASE_METRICS.get(phase_name, ()))
+    for metric in metrics:
+        if metric not in metric_order:
+            metric_order.append(metric)
+    parts = []
+    for metric in metric_order:
+        if metric not in metrics:
+            continue
+        stats = metrics.get(metric) or {}
+        entry = _format_gate_metric(metric, stats, METRIC_DIRECTIONS.get(metric), kind)
+        if entry:
+            parts.append(entry)
+    return ", ".join(parts) if parts else "none"
+
+
+def format_process_gate_lines(phase_name, process_rules):
+    process_cfg = _objective_process_config(phase_name, process_rules)
+    success_metrics = process_cfg.get("success_gates") or {}
+    failure_metrics = process_cfg.get("fail_gates") or {}
+    return (
+        format_gate_metrics(phase_name, success_metrics, "success"),
+        format_gate_metrics(phase_name, failure_metrics, "fail"),
+    )
+
+
+def _metric_snapshot_value(world, metric):
+    brick = world.brick or {}
+    if metric == "confidence":
+        return brick.get("confidence")
+    if metric == "lift_height":
+        return getattr(world, "lift_height", None)
+    return _metric_value(brick, metric)
+
+
+def _format_metric_snapshot(metrics, world):
+    parts = []
+    for metric in metrics:
+        val = _metric_snapshot_value(world, metric)
+        if val is None:
+            continue
+        if metric == "visible":
+            parts.append(f"{metric}={1 if val else 0}")
+        elif metric in ("angle_abs", "offset_abs"):
+            parts.append(f"{metric}={val:.1f}")
+        elif metric in ("dist", "lift_height"):
+            parts.append(f"{metric}={val:.1f}mm")
+        elif metric == "confidence":
+            parts.append(f"{metric}={val:.0f}")
+        elif isinstance(val, (int, float)):
+            parts.append(f"{metric}={val:.1f}")
+        else:
+            parts.append(f"{metric}={val}")
+    return ", ".join(parts)
+
+
+def format_start_gate_details(phase_name, world):
+    metrics = []
+    if phase_name in START_GATE_BRICK_PHASES:
+        metrics = list(PHASE_METRICS.get(phase_name, ()))
+        if metrics and "confidence" not in metrics:
+            metrics.append("confidence")
+    parts = []
+    metric_detail = _format_metric_snapshot(metrics, world)
+    if metric_detail:
+        parts.append(metric_detail)
+    wall = getattr(world, "wall", None) or {}
+    if wall.get("origin") is not None and wall.get("valid", False):
+        parts.append("wall=ok")
+    if parts:
+        return ", ".join(parts)
+    return "ready"
+
+
+def format_success_gate_details(phase_name, world, gates):
+    metrics = list((gates or {}).get("success", {}).keys())
+    if not metrics:
+        metrics = list(PHASE_METRICS.get(phase_name, ()))
+    detail = _format_metric_snapshot(metrics, world)
+    return detail or "ok"
+
+
+def _normalize_scan_direction(value):
+    if value is None:
+        return None
+    key = str(value).strip().lower()
+    if key in ("l", "left"):
+        return "l"
+    if key in ("r", "right"):
+        return "r"
+    return None
+
+
+def _lookup_scan_pref(process_rules, phase_name):
+    if not process_rules:
+        return None
+    obj_name = normalize_objective_label(phase_name)
+    cfg = process_rules.get(obj_name)
+    if isinstance(cfg, dict):
+        scan_pref = _normalize_scan_direction(cfg.get("scan_direction"))
+        if scan_pref:
+            return scan_pref
+    for key, cfg in process_rules.items():
+        if normalize_objective_label(key) != obj_name:
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        scan_pref = _normalize_scan_direction(cfg.get("scan_direction"))
+        if scan_pref:
+            return scan_pref
+    return None
+
+
+def resolve_scan_direction(world, phase):
+    phase_name = phase.value if isinstance(phase, Phase) else str(phase)
+    scan_pref = _lookup_scan_pref(getattr(world, "process_rules", None), phase_name)
+    if scan_pref:
+        return scan_pref
+    if normalize_objective_label(phase_name) == "FIND_WALL":
+        return "r"
+    return "l"
+
+
+def compute_alignment_command(world, gates, phase=None):
     brick = world.brick or {}
     if not brick.get("visible"):
-        return "l", SCAN_SPEED, "scan"
+        scan_direction = resolve_scan_direction(world, phase)
+        return scan_direction, SCAN_SPEED, "scan"
 
     angle = brick.get("angle") or 0.0
     offset_x = brick.get("offset_x") or 0.0
@@ -811,14 +1121,19 @@ def _cmd_to_motion_type(cmd):
 def recover_phase(phase, world, robot, vision, stream_state, logger, learned_gates):
     start = time.time()
     logger.log_phase(phase, "RECOVER_START", world)
-    gates = resolve_phase_gates(phase, learned_gates)
+    gates = resolve_runtime_gates(phase, learned_gates, world.process_rules)
     step = 0
+    good_frames = 0
     while time.time() - start < RECOVERY_MAX_S:
         update_world_model(world, vision, stream_state=stream_state)
         gate_eval = check_gates(phase, world, gates, time.time() - start)
         if not gate_eval.fail and (gate_eval.success or gate_eval.correction):
-            logger.log_phase(phase, "RECOVER_END", world, status="success")
-            return True
+            good_frames += 1
+            if good_frames >= GATE_STABILITY_FRAMES:
+                logger.log_phase(phase, "RECOVER_END", world, status="success")
+                return True
+        else:
+            good_frames = 0
 
         cmd = "l" if step % 2 == 0 else "b"
         speed = RECOVERY_TURN_SPEED if cmd == "l" else RECOVERY_BACK_SPEED
@@ -919,7 +1234,7 @@ def format_motion_plan(plan):
 def _brick_height_adjust_s(world, speed):
     if world is None:
         return 0.0
-    height = (world.brick or {}).get("height_mm")
+    height = getattr(world, "height_mm", None)
     if height is None or height < BRICK_HEIGHT_MIN_MM:
         return 0.0
     height = min(height, BRICK_HEIGHT_MAX_MM)
@@ -970,7 +1285,86 @@ def motion_plan_for_phase(phase, learned_profiles, world=None):
     return []
 
 
-def learn_motion_profiles(success_segments, commit_profile):
+def _learn_nominal_profiles(nominal_segments):
+    if not nominal_segments:
+        return {}
+
+    def mean_or_none(values):
+        if not values:
+            return None
+        return statistics.mean(values)
+
+    per_obj = {}
+    for seg in nominal_segments:
+        obj = normalize_objective_label(seg.get("objective"))
+        if not obj:
+            continue
+        summary = _segment_motion_summary(seg.get("events") or [])
+        if not summary:
+            continue
+        obj_stats = per_obj.setdefault(obj, {})
+        for cmd, stats in summary.items():
+            cmd_stats = obj_stats.setdefault(cmd, {"durations": [], "speeds": []})
+            cmd_stats["durations"].append(stats["duration"])
+            cmd_stats["speeds"].append(stats["speed"])
+
+    profiles = {}
+    for obj, cmd_stats in per_obj.items():
+        profile = {}
+        if obj == "SCOOP":
+            if "f" in cmd_stats:
+                speed = mean_or_none(cmd_stats["f"]["speeds"])
+                duration = mean_or_none(cmd_stats["f"]["durations"])
+                if speed is not None:
+                    profile["speed"] = speed
+                if duration is not None:
+                    profile["drive_time"] = duration
+            if "u" in cmd_stats:
+                speed = mean_or_none(cmd_stats["u"]["speeds"])
+                duration = mean_or_none(cmd_stats["u"]["durations"])
+                if speed is not None:
+                    profile["lift_speed"] = speed
+                if duration is not None:
+                    profile["lift_time"] = duration
+        elif obj in ("FIND_WALL2", "POSITION_BRICK"):
+            if "f" in cmd_stats:
+                speed = mean_or_none(cmd_stats["f"]["speeds"])
+                duration = mean_or_none(cmd_stats["f"]["durations"])
+                if speed is not None:
+                    profile["speed"] = speed
+                if duration is not None:
+                    profile["duration"] = duration
+        elif obj == "LIFT":
+            if "u" in cmd_stats:
+                speed = mean_or_none(cmd_stats["u"]["speeds"])
+                duration = mean_or_none(cmd_stats["u"]["durations"])
+                if speed is not None:
+                    profile["speed"] = speed
+                if duration is not None:
+                    profile["duration"] = duration
+        elif obj == "PLACE":
+            if "d" in cmd_stats:
+                speed = mean_or_none(cmd_stats["d"]["speeds"])
+                duration = mean_or_none(cmd_stats["d"]["durations"])
+                if speed is not None:
+                    profile["speed"] = speed
+                if duration is not None:
+                    profile["duration"] = duration
+        elif obj == "RETREAT":
+            if "b" in cmd_stats:
+                speed = mean_or_none(cmd_stats["b"]["speeds"])
+                duration = mean_or_none(cmd_stats["b"]["durations"])
+                if speed is not None:
+                    profile["speed"] = speed
+                if duration is not None:
+                    profile["duration"] = duration
+        if profile:
+            profiles[obj] = profile
+
+    return profiles
+
+
+def learn_motion_profiles(success_segments, commit_profile, nominal_segments=None):
     profiles = {}
     duration_acc = {}
 
@@ -988,61 +1382,127 @@ def learn_motion_profiles(success_segments, commit_profile):
         profiles[obj]["duration"] = percentile(durations, 0.9) or durations[-1]
 
     if commit_profile:
-        profiles.setdefault("SCOOP", {})
-        if commit_profile.get("time_s"):
-            profiles["SCOOP"]["drive_time"] = commit_profile["time_s"]
-        if commit_profile.get("speed"):
-            profiles["SCOOP"]["speed"] = commit_profile["speed"]
+        scoop_profile = profiles.setdefault("SCOOP", {})
+        if commit_profile.get("time_s") and "drive_time" not in scoop_profile:
+            scoop_profile["drive_time"] = commit_profile["time_s"]
+        if commit_profile.get("speed") and "speed" not in scoop_profile:
+            scoop_profile["speed"] = commit_profile["speed"]
+
+    nominal_profiles = _learn_nominal_profiles(nominal_segments)
+    for obj, profile in nominal_profiles.items():
+        profiles.setdefault(obj, {}).update(profile)
 
     return profiles
 
 
 def map_phase_to_objective(phase):
-    if phase == Phase.FIND_BRICK:
+    phase_name = phase.value if isinstance(phase, Phase) else str(phase)
+    if phase_name == "FIND_WALL":
+        return ObjectiveState.FIND_WALL
+    if phase_name == "EXIT_WALL":
+        return ObjectiveState.EXIT_WALL
+    if phase_name == "FIND_BRICK":
         return ObjectiveState.FIND_BRICK
-    if phase == Phase.ALIGN_BRICK:
+    if phase_name == "ALIGN_BRICK":
         return ObjectiveState.SCOOP
-    if phase == Phase.SCOOP:
+    if phase_name == "SCOOP":
         return ObjectiveState.SCOOP
-    if phase == Phase.LIFT:
+    if phase_name == "LIFT":
         return ObjectiveState.LIFT
-    if phase == Phase.PLACE:
+    if phase_name == "PLACE":
         return ObjectiveState.PLACE
-    if phase == Phase.FIND_WALL2:
+    if phase_name == "FIND_WALL2":
         return ObjectiveState.LIFT
-    if phase == Phase.POSITION_BRICK:
+    if phase_name == "POSITION_BRICK":
         return ObjectiveState.LIFT
-    if phase == Phase.RETREAT:
+    if phase_name == "RETREAT":
         return ObjectiveState.PLACE
-    return ObjectiveState.FIND_BRICK
+    try:
+        return ObjectiveState(phase_name)
+    except ValueError:
+        return ObjectiveState.FIND_BRICK
+
+
+def _frame_label(count):
+    return "frame" if count == 1 else "frames"
+
+
+def confirm_start_gate(phase_name, world, vision, stream_state, learned_gates, required_frames=GATE_STABILITY_FRAMES):
+    required = max(1, int(required_frames))
+    details = ""
+    for idx in range(required):
+        update_world_model(world, vision, stream_state=stream_state)
+        start_eval = evaluate_start_gates(phase_name, world, learned_gates)
+        if not start_eval["ok"]:
+            reason = _format_start_gate_reasons(start_eval["reasons"])
+            return False, reason
+        details = format_start_gate_details(phase_name, world)
+        if idx < required - 1:
+            time.sleep(CONTROL_DT)
+    return True, details
 
 
 def run_phase_dynamic(phase, world, robot, vision, stream_state, logger, learned_gates):
     phase_name = phase.value
-    update_world_model(world, vision, stream_state=stream_state)
-    start_eval = evaluate_start_gates(phase_name, world, learned_gates)
-    if not start_eval["ok"]:
-        reason = _format_start_gate_reasons(start_eval["reasons"])
-        print(f"[START] {phase_name} blocked: {reason}")
-        return PhaseResult(False, f"start gate: {reason}", 0.0)
-    gates = resolve_phase_gates(phase_name, learned_gates)
+    start_ok, start_info = confirm_start_gate(phase_name, world, vision, stream_state, learned_gates)
+    if not start_ok:
+        reason = start_info
+        details = f": {reason}" if reason else ""
+        print(format_headline(f"[START] {phase_name} start criteria failed", COLOR_RED, details))
+        return PhaseResult(False, f"start gate: {reason}", 0.0, start_gate_failed=True)
+    start_details = start_info
+    frame_label = _frame_label(GATE_STABILITY_FRAMES)
+    detail_suffix = f"; {start_details}" if start_details else ""
+    print(format_headline(
+        f"[START] {phase_name} start criteria stable ({GATE_STABILITY_FRAMES} {frame_label}{detail_suffix})",
+        COLOR_GREEN,
+    ))
+    gates = resolve_runtime_gates(phase_name, learned_gates, world.process_rules)
     start = time.time()
     logger.log_phase(phase_name, "PHASE_START", world)
     last_state_log = 0.0
+    
+    # Track gate events for terminal highlights
+    failure_announced = False
+    success_frames = 0
+    last_action = None
+    last_cmd = None
 
     while True:
         loop_start = time.time()
         update_world_model(world, vision, stream_state=stream_state)
         elapsed = loop_start - start
         gate_eval = check_gates(phase_name, world, gates, elapsed)
+        
+        # Highlight first time we meet failure criteria
+        if gate_eval.fail and not failure_announced:
+            details = f" ({gate_eval.reason})" if gate_eval.reason else ""
+            print(format_headline(f"--- {phase_name}: FAILURE criteria met", COLOR_RED, details))
+            failure_announced = True
+
         if gate_eval.fail:
             logger.log_phase(phase_name, "PHASE_END", world, status="fail", reason=gate_eval.reason)
             return PhaseResult(False, gate_eval.reason or "gate", elapsed)
         if gate_eval.success:
-            logger.log_phase(phase_name, "PHASE_END", world, status="success")
-            return PhaseResult(True, "", elapsed)
+            success_frames += 1
+            if success_frames >= GATE_STABILITY_FRAMES:
+                success_details = format_success_gate_details(phase_name, world, gates)
+                frame_label = _frame_label(GATE_STABILITY_FRAMES)
+                detail_suffix = f"; {success_details}" if success_details else ""
+                print(format_headline(
+                    f"--- {phase_name}: SUCCESS criteria stable ({GATE_STABILITY_FRAMES} {frame_label}{detail_suffix})",
+                    COLOR_GREEN,
+                ))
+                logger.log_phase(phase_name, "PHASE_END", world, status="success")
+                return PhaseResult(True, "", elapsed)
+        else:
+            success_frames = 0
 
-        cmd, speed, _ = compute_alignment_command(world, gates)
+        cmd, speed, action = compute_alignment_command(world, gates, phase_name)
+        if action != last_action or cmd != last_cmd:
+            log_action(phase_name, action, cmd=cmd, speed=speed)
+            last_action = action
+            last_cmd = cmd
         apply_motion(robot, world, cmd, speed, CONTROL_DT)
 
         if time.time() - last_state_log >= STATE_LOG_INTERVAL:
@@ -1056,12 +1516,19 @@ def run_phase_dynamic(phase, world, robot, vision, stream_state, logger, learned
 
 def run_phase_motion(phase, world, robot, vision, stream_state, logger, learned_gates, blind_window_s=None):
     phase_name = phase.value
-    update_world_model(world, vision, stream_state=stream_state)
-    start_eval = evaluate_start_gates(phase_name, world, learned_gates)
-    if not start_eval["ok"]:
-        reason = _format_start_gate_reasons(start_eval["reasons"])
-        print(f"[START] {phase_name} blocked: {reason}")
-        return PhaseResult(False, f"start gate: {reason}", 0.0)
+    start_ok, start_info = confirm_start_gate(phase_name, world, vision, stream_state, learned_gates)
+    if not start_ok:
+        reason = start_info
+        details = f": {reason}" if reason else ""
+        print(format_headline(f"[START] {phase_name} start criteria failed", COLOR_RED, details))
+        return PhaseResult(False, f"start gate: {reason}", 0.0, start_gate_failed=True)
+    start_details = start_info
+    frame_label = _frame_label(GATE_STABILITY_FRAMES)
+    detail_suffix = f"; {start_details}" if start_details else ""
+    print(format_headline(
+        f"[START] {phase_name} start criteria stable ({GATE_STABILITY_FRAMES} {frame_label}{detail_suffix})",
+        COLOR_GREEN,
+    ))
     plan = motion_plan_for_phase(phase_name, learned_gates.get("profiles", {}), world)
     if not plan:
         logger.log_phase(phase_name, "PHASE_START", world)
@@ -1073,6 +1540,7 @@ def run_phase_motion(phase, world, robot, vision, stream_state, logger, learned_
     last_state_log = 0.0
 
     for primitive in plan:
+        log_action(phase_name, primitive.label, cmd=primitive.cmd, speed=primitive.speed, duration=primitive.duration_s)
         step_start = time.time()
         while time.time() - step_start < primitive.duration_s:
             update_world_model(world, vision, stream_state=stream_state)
@@ -1091,15 +1559,215 @@ def run_phase_motion(phase, world, robot, vision, stream_state, logger, learned_
     return PhaseResult(True, "", time.time() - start)
 
 
+def save_gates_to_process_model(learned_gates, success_segments=None, filepath=None, attempt_types_by_objective=None, scan_prefs_by_objective=None):
+    """Save learned gates to world_model_process.json for persistence and reuse."""
+    if filepath is None:
+        filepath = Path(__file__).parent / "world_model_process.json"
+    
+    # Load existing model or create new structure
+    if filepath.exists():
+        try:
+            with open(filepath, 'r') as f:
+                model = json.load(f)
+        except:
+            model = {"objectives": {}}
+    else:
+        model = {"objectives": {}}
+    
+    # Helpers to round values and coerce visibility gates to boolean
+    def round_value(value):
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return round(value, 2)
+        return value
+
+    def visible_bool_from_stats(stats):
+        if not stats:
+            return None
+        for key in ("mu", "min", "max"):
+            if key in stats and stats[key] is not None:
+                return bool(stats[key] >= 0.5)
+        return None
+
+    def normalize_gate_dict(gates, is_failure=False):
+        normalized = {}
+        for metric, stats in (gates or {}).items():
+            if metric == "visible":
+                visible_required = visible_bool_from_stats(stats)
+                if visible_required is None:
+                    continue
+                if is_failure:
+                    if visible_required is False:
+                        normalized[metric] = {"max": False}
+                else:
+                    normalized[metric] = {"min": visible_required}
+                continue
+            normalized[metric] = {}
+            for key, value in (stats or {}).items():
+                normalized[metric][key] = round_value(value)
+        return normalized
+
+    def prune_metrics_when_invisible(gates):
+        if not gates:
+            return gates
+        visible_gate = gates.get("visible")
+        if not isinstance(visible_gate, dict):
+            return gates
+        if visible_gate.get("min") is False or visible_gate.get("max") is False:
+            return {"visible": visible_gate}
+        return gates
+    
+    # Derive start_gates from success segments
+    start_conditions = {}
+    if success_segments:
+        for seg in success_segments:
+            obj = normalize_objective_label(seg.get("objective"))
+            if not obj:
+                continue
+            states = seg.get("states", [])
+            if states:
+                # Get the first state to understand start conditions
+                first_state = states[0]
+                brick = first_state.get("brick", {})
+                if obj not in start_conditions:
+                    start_conditions[obj] = {"visible_count": 0, "total": 0}
+                start_conditions[obj]["total"] += 1
+                if brick.get("visible"):
+                    start_conditions[obj]["visible_count"] += 1
+
+    derived_start_gates = {}
+    for obj_name, cond in start_conditions.items():
+        total = cond.get("total", 0)
+        if total <= 0:
+            continue
+        visible_ratio = cond.get("visible_count", 0) / total
+        if visible_ratio >= 0.5:
+            derived_start_gates[obj_name] = {"visible": {"min": True}}
+    if attempt_types_by_objective is None:
+        attempt_types_by_objective = {}
+    if scan_prefs_by_objective is None:
+        scan_prefs_by_objective = {}
+
+    objective_order = list(model["objectives"].keys()) if model["objectives"] else list(PHASE_SEQUENCE)
+    
+    # Update each objective with learned gates
+    objectives = set(model["objectives"].keys())
+    objectives.update(obj for obj in learned_gates.keys() if obj != "profiles")
+    objectives.update(derived_start_gates.keys())
+    for obj_name in objectives:
+        gates = learned_gates.get(obj_name, {})
+        
+        if obj_name not in model["objectives"]:
+            model["objectives"][obj_name] = {}
+        
+        obj_config = model["objectives"][obj_name]
+        
+        # Convert learned gates to process model format
+        success_metrics = gates.get("success", {}) if gates else {}
+        failure_metrics = gates.get("failure", {}) if gates else {}
+        
+        # Save success gates (using max for upper bounds)
+        if success_metrics:
+            obj_config["success_gates"] = {}
+            for metric, stats in success_metrics.items():
+                if metric == "visible":
+                    visible_required = visible_bool_from_stats(stats)
+                    if visible_required is None:
+                        continue
+                    obj_config["success_gates"][metric] = {"min": visible_required}
+                    continue
+                obj_config["success_gates"][metric] = {}
+                if "max" in stats:
+                    obj_config["success_gates"][metric]["max"] = round_value(stats["max"])
+                if "min" in stats:
+                    obj_config["success_gates"][metric]["min"] = round_value(stats["min"])
+        
+        # Save failure gates
+        if failure_metrics:
+            obj_config["fail_gates"] = {}
+            for metric, stats in failure_metrics.items():
+                if metric == "visible":
+                    visible_failure = visible_bool_from_stats(stats)
+                    if visible_failure is False:
+                        obj_config["fail_gates"][metric] = {"max": False}
+                    continue
+                if "mu" in stats and "sigma" in stats:
+                    # Save mu and sigma for pattern matching
+                    obj_config["fail_gates"][metric] = {
+                        "mu": round_value(stats["mu"]),
+                        "sigma": round_value(stats["sigma"])
+                    }
+                elif "max" in stats:
+                    obj_config["fail_gates"][metric] = {"max": round_value(stats["max"])}
+        
+        # Derive and save start_gates
+        obj_config["start_gates"] = derived_start_gates.get(obj_name, {})
+
+        # Normalize any existing gate values (rounding + visibility booleans)
+        obj_config["success_gates"] = normalize_gate_dict(obj_config.get("success_gates", {}))
+        obj_config["fail_gates"] = normalize_gate_dict(obj_config.get("fail_gates", {}), is_failure=True)
+        obj_config["start_gates"] = normalize_gate_dict(obj_config.get("start_gates", {}))
+
+        obj_config["success_gates"] = prune_metrics_when_invisible(obj_config.get("success_gates", {}))
+        obj_config["fail_gates"] = prune_metrics_when_invisible(obj_config.get("fail_gates", {}))
+        obj_config["start_gates"] = prune_metrics_when_invisible(obj_config.get("start_gates", {}))
+
+        if obj_name in attempt_types_by_objective:
+            attempt_types = attempt_types_by_objective[obj_name]
+            nominal_only = attempt_types == {"NOMINAL"}
+            if nominal_only:
+                obj_config["nominalDemosOnly"] = True
+            else:
+                obj_config.pop("nominalDemosOnly", None)
+        if scan_prefs_by_objective is not None and obj_name in scan_prefs_by_objective:
+            scan_dir = scan_prefs_by_objective.get(obj_name)
+            if scan_dir in ("l", "r"):
+                obj_config["scan_direction"] = scan_dir
+
+        for key in ("start_gates", "success_gates", "fail_gates"):
+            if key in obj_config and not obj_config[key]:
+                obj_config.pop(key)
+
+    ordered_objectives = {}
+    for name in objective_order:
+        if name in model["objectives"]:
+            ordered_objectives[name] = model["objectives"][name]
+    for name in sorted(model["objectives"]):
+        if name not in ordered_objectives:
+            ordered_objectives[name] = model["objectives"][name]
+    model["objectives"] = ordered_objectives
+    
+    # Save to file
+    with open(filepath, 'w') as f:
+        json.dump(model, f, indent=4)
+    
+    print(f"[GATES] Saved learned gates to {filepath}")
+
+
 def run_autostack(session_name=None, stream=True):
     logs = load_demo_logs(DEMO_DIR, session_name)
     summarize_demo_stats(logs)
     learned_gates, success_segments = learn_gates_from_logs(logs)
+    nominal_segments = collect_attempt_segments(logs, "NOMINAL")
+    attempt_types_by_objective = collect_attempt_types_by_objective(logs)
+    scan_prefs_by_objective = learn_scan_preferences(logs)
+    
+    # Save learned gates to world_model_process.json for persistence
+    save_gates_to_process_model(
+        learned_gates,
+        success_segments,
+        attempt_types_by_objective=attempt_types_by_objective,
+        scan_prefs_by_objective=scan_prefs_by_objective,
+    )
+    
     align_gates = resolve_phase_gates("ALIGN_BRICK", learned_gates)
     commit_profile = build_commit_profile(success_segments, align_gates.get("success", {}))
     blind_window = learn_blind_window(success_segments) or BLIND_WINDOW_FALLBACK_S
 
-    motion_profiles = learn_motion_profiles(success_segments, commit_profile)
+    motion_profiles = learn_motion_profiles(success_segments, commit_profile, nominal_segments=nominal_segments)
     learned_gates["profiles"] = motion_profiles
     telemetry_rules = _telemetry_rules_from_gates(learned_gates)
 
@@ -1122,40 +1790,53 @@ def run_autostack(session_name=None, stream=True):
         ).start()
 
     robot = Robot()
-    vision = BrickDetector(debug=False)
+    vision = ArucoBrickVision(debug=False)
     world = WorldModel()
     world.learned_rules = telemetry_rules
 
     try:
-        for phase_name in PHASE_SEQUENCE:
-            phase = Phase(phase_name)
+        process_sequence = load_process_sequence()
+        dynamic_phases = {"FIND_WALL", "EXIT_WALL", "FIND_BRICK", "ALIGN_BRICK"}
+        for idx, phase_name in enumerate(process_sequence):
+            try:
+                phase = Phase(phase_name)
+            except ValueError:
+                phase = phase_name
             world.objective_state = map_phase_to_objective(phase)
             attempts = 0
             while attempts < MAX_PHASE_ATTEMPTS:
-                if phase in (Phase.FIND_BRICK, Phase.ALIGN_BRICK):
-                    gates = resolve_phase_gates(phase_name, learned_gates)
-                    gate_summary = format_gate_summary(phase_name, gates)
-                    print(f"[PHASE] Attempting successful {phase_name} (attempt {attempts + 1}/{MAX_PHASE_ATTEMPTS}; {gate_summary})")
+                success_desc, fail_desc = format_process_gate_lines(phase_name, world.process_rules)
+                if phase_name in dynamic_phases:
+                    print(f"[PHASE] Attempting {phase_name}")
+                    print(f"  attempt: {attempts + 1}/{MAX_PHASE_ATTEMPTS}")
+                    print(f"  success gate: {success_desc}")
+                    print(f"  fail gate: {fail_desc}")
                     result = run_phase_dynamic(phase, world, robot, vision, stream_state, logger, learned_gates)
                 else:
                     plan = motion_plan_for_phase(phase_name, learned_gates.get("profiles", {}), world)
                     plan_summary = format_motion_plan(plan)
-                    print(f"[PHASE] Attempting {phase_name} (attempt {attempts + 1}/{MAX_PHASE_ATTEMPTS}; motion: {plan_summary})")
+                    print(f"[PHASE] Attempting {phase_name} (motion: {plan_summary})")
+                    print(f"  attempt: {attempts + 1}/{MAX_PHASE_ATTEMPTS}")
+                    print(f"  success gate: {success_desc}")
+                    print(f"  fail gate: {fail_desc}")
                     result = run_phase_motion(phase, world, robot, vision, stream_state, logger, learned_gates, blind_window_s=blind_window)
 
+                if result.start_gate_failed:
+                    return
                 if result.success:
                     break
-                if phase in (Phase.FIND_BRICK, Phase.ALIGN_BRICK):
+                if phase_name in ("FIND_BRICK", "ALIGN_BRICK"):
                     recovered = recover_phase(phase_name, world, robot, vision, stream_state, logger, learned_gates)
                     if recovered:
                         attempts += 1
                         continue
                 attempts += 1
                 if attempts >= MAX_PHASE_ATTEMPTS:
-                    print(f"[FAIL] {phase_name} failed after {attempts} attempts")
+                    details = f" after {attempts} attempts"
+                    print(format_headline(f"[FAIL] {phase_name} failed", COLOR_RED, details))
                     return
 
-        print("[JOB] SUCCESS")
+        print(format_headline("[JOB] SUCCESS", COLOR_GREEN))
     finally:
         robot.stop()
         vision.close()

@@ -126,6 +126,7 @@ def update_lift_from_vision(world, cam_h, brick_height, conf):
 
 class ObjectiveState(Enum):
     FIND_WALL = "FIND_WALL"
+    EXIT_WALL = "EXIT_WALL"
     FIND_BRICK = "FIND_BRICK"
     ALIGN_BRICK = "ALIGN_BRICK"
     SCOOP = "SCOOP"
@@ -162,8 +163,33 @@ MOTION_EVENT_TYPES = {
 WORLD_MODEL_PROCESS_FILE = Path(__file__).parent / "world_model_process.json"
 WORLD_MODEL_BRICK_FILE = Path(__file__).parent / "world_model_brick.json"
 
+def _load_process_objective_names():
+    if not WORLD_MODEL_PROCESS_FILE.exists():
+        return []
+    try:
+        with open(WORLD_MODEL_PROCESS_FILE, 'r') as f:
+            model = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    objectives = model.get("objectives", {})
+    if isinstance(objectives, dict):
+        return list(objectives.keys())
+    return []
 
 def objective_sequence():
+    names = _load_process_objective_names()
+    if names:
+        sequence = []
+        seen = set()
+        for name in names:
+            normalized = _objective_name(name)
+            if normalized in ObjectiveState.__members__:
+                obj = ObjectiveState[normalized]
+                if obj not in seen:
+                    sequence.append(obj)
+                    seen.add(obj)
+        if sequence:
+            return sequence
     return list(ObjectiveState)
 
 class WorldModel:
@@ -197,10 +223,7 @@ class WorldModel:
             "angle": 0,
             "offset_x": 0,
             "confidence": 0,
-            "lock_confidence": 0.0,
             "held": False,
-            "seated": False,
-            "height_mm": None,
             "brickAbove": False,
             "brickBelow": False
         }
@@ -208,6 +231,7 @@ class WorldModel:
         # Forklift
         self.lift_height = 0.0 # mm (estimated)
         self.camera_height_anchor = None
+        self.height_mm = None
 
         # Objective
         self._objective_state = None
@@ -223,14 +247,10 @@ class WorldModel:
         self.align_tol_offset = 12.0  # +/- mm
         self.align_tol_dist_min = 30.0 # mm (Too close)
         self.align_tol_dist_max = 500.0 # mm (Too far)
-        self.scoop_commit_offset_factor = 1.2
         self.scoop_success_offset_factor = 1.2
         self.stability_count = 0
         self.stability_threshold = 10  # 10 frames @ 20Hz = 0.5 seconds
         
-        self.last_dist = 999.0 # Track last distance for seated heuristic
-        self.last_align_time = None
-        self.last_align_dist = None
         self.last_visible_time = None
         self.scoop_desired_offset_x = 0.0
         self.scoop_lateral_drift = 0.0
@@ -238,19 +258,11 @@ class WorldModel:
         
         self.last_image_file = None
         
-        # Wiggle Verification
-        self.verification_stage = "IDLE" # IDLE, BACK, LEFT, RIGHT
-        self.verify_dist_mm = 0.0
-        self.verify_turn_deg = 0.0
-        self.verify_vision_hits = 0
-
         # Internal physics constants for dead reckoning (Calibration needed!)
         self.mm_per_sec_full_speed = 200.0 
         self.deg_per_sec_full_speed = 90.0
         self.lift_mm_per_sec = 23.5 # Adjusted for better dead reckoning
         self.lift_height_anchor = None # The Vision height at Mast=0mm
-        self._lock_last = None
-        self._lock_confidence = 0.0
 
     @property
     def objective_state(self):
@@ -262,8 +274,6 @@ class WorldModel:
             return
         self._objective_state = value
         self._objective_start_time = time.time()
-        self.last_align_time = None
-        self.last_align_dist = None
         self.last_visible_time = None
         # print(f"[WORLD] Objective changed to {value}, timer reset.", flush=True)
 
@@ -279,7 +289,6 @@ class WorldModel:
     def update_from_motion(self, event):
         """
         Updates pose based on motion events (Dead Reckoning).
-        Also manages "Wiggle Verification" state machine.
         """
         delta = update_from_motion(self, event)
         telemetry_brick.update_from_motion(self, event, delta)
@@ -315,8 +324,6 @@ class WorldModel:
         if not wall_check.ok:
             return False
         obj_name = self.objective_state.value
-        if obj_name == ObjectiveState.SCOOP.value:
-            return bool(self.brick.get("seated")) and self.verification_stage == "IDLE"
 
         gates = self.learned_rules.get(obj_name, {}).get("gates", {})
         success_metrics = gates.get("success", {}).get("metrics", {})
@@ -366,46 +373,40 @@ class WorldModel:
         return True
 
     def next_objective(self):
-        """Cycles through the mission: FIND_BRICK -> ALIGN_BRICK -> SCOOP -> LIFT -> FIND_WALL2 -> POSITION_BRICK -> PLACE -> RETREAT"""
-        if self.objective_state == ObjectiveState.FIND_BRICK:
-            self.objective_state = ObjectiveState.ALIGN_BRICK
-        elif self.objective_state == ObjectiveState.ALIGN_BRICK:
-            self.objective_state = ObjectiveState.SCOOP
-        elif self.objective_state == ObjectiveState.SCOOP:
-            self.objective_state = ObjectiveState.LIFT
-        elif self.objective_state == ObjectiveState.LIFT:
-            self.objective_state = ObjectiveState.FIND_WALL2
-        elif self.objective_state == ObjectiveState.FIND_WALL2:
-            self.objective_state = ObjectiveState.POSITION_BRICK
-        elif self.objective_state == ObjectiveState.POSITION_BRICK:
-            self.objective_state = ObjectiveState.PLACE
-        elif self.objective_state == ObjectiveState.PLACE:
-            self.objective_state = ObjectiveState.RETREAT
-        else:
-            self.objective_state = ObjectiveState.FIND_BRICK
-            self.brick["seated"] = False # Reset on new cycle
+        """Cycles through objectives in the process order."""
+        sequence = objective_sequence()
+        if not sequence:
+            sequence = list(ObjectiveState)
+        try:
+            curr_idx = sequence.index(self.objective_state)
+        except ValueError:
+            sequence = list(ObjectiveState)
+            curr_idx = sequence.index(self.objective_state)
+        next_idx = (curr_idx + 1) % len(sequence)
+        self.objective_state = sequence[next_idx]
+        if next_idx == 0:
             self.brick["held"] = False
-            self.verification_stage = "IDLE"
-
         return self.objective_state.value
 
     def get_next_objective_label(self):
         """Returns the string label of the next objective in sequence."""
-        objs = [o.value for o in ObjectiveState]
-        curr_idx = objs.index(self.objective_state.value)
-        next_idx = (curr_idx + 1) % len(objs)
-        return objs[next_idx]
+        sequence = objective_sequence()
+        if not sequence:
+            sequence = list(ObjectiveState)
+        labels = [o.value for o in sequence]
+        try:
+            curr_idx = labels.index(self.objective_state.value)
+        except ValueError:
+            labels = [o.value for o in ObjectiveState]
+            curr_idx = labels.index(self.objective_state.value)
+        next_idx = (curr_idx + 1) % len(labels)
+        return labels[next_idx]
 
     def reset_mission(self):
         """Resets the objective state and all mission-specific flags."""
         self.objective_state = ObjectiveState.FIND_BRICK
-        self.brick["seated"] = False
         self.brick["held"] = False
         self.stability_count = 0
-        self.verification_stage = "IDLE"
-        self.verify_dist_mm = 0.0
-        self.verify_turn_deg = 0.0
-        self.verify_vision_hits = 0
         self.last_visible_time = None
         return self.objective_state.value
 
@@ -421,16 +422,11 @@ class WorldModel:
                 brick_fmt['offset_x'] = round(brick_fmt['offset_x'], 2)
             if brick_fmt.get("confidence") is not None:
                 brick_fmt['confidence'] = int(brick_fmt['confidence'])
-            if brick_fmt.get("lock_confidence") is not None:
-                brick_fmt['lock_confidence'] = int(round(brick_fmt['lock_confidence']))
-            if brick_fmt.get("height_mm") is not None:
-                brick_fmt['height_mm'] = round(brick_fmt['height_mm'], 2)
         else:
             brick_fmt['dist'] = None
             brick_fmt['angle'] = None
             brick_fmt['offset_x'] = None
             brick_fmt['confidence'] = None
-            brick_fmt['lock_confidence'] = None
 
         # Format Wall Origin
         wall_fmt = None
@@ -456,7 +452,8 @@ class WorldModel:
             "robot_pose": {
                 "x": round(self.x, 2), 
                 "y": round(self.y, 2), 
-                "theta": round(self.theta, 3)
+                "theta": round(self.theta, 3),
+                "height_mm": None if self.height_mm is None else round(self.height_mm, 2)
             },
             "wall_origin": wall_fmt,
             "wall": wall_state,
@@ -691,10 +688,10 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders
     put_line(f"OFFSET: {wm.brick['offset_x']:.1f} mm", GREEN, 0.38, 1)
     put_line(f"ANGLE:  {wm.brick['angle']:.1f} deg", GREEN, 0.38, 1)
     put_line(f"DIST:   {wm.brick['dist']:.0f} mm", GREEN, 0.38, 1)
-    lock_conf = wm.brick.get("lock_confidence")
-    if lock_conf is None:
-        lock_conf = 0.0
-    put_line(f"CONF:   {lock_conf:.0f}%", GREEN, 0.38, 1)
+    brick_conf = wm.brick.get("confidence")
+    if brick_conf is None:
+        brick_conf = 0.0
+    put_line(f"CONF:   {brick_conf:.0f}%", GREEN, 0.38, 1)
     above_txt = "YES" if wm.brick.get("brickAbove") else "NO"
     below_txt = "YES" if wm.brick.get("brickBelow") else "NO"
     put_line(f"BRICK ABOVE: {above_txt}", GREEN, 0.38, 1)
@@ -712,10 +709,6 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders
     if not wm.brick['visible']:
         put_line("VISION: SEARCHING", (0, 0, 255), 0.38, 1)
     
-    # 7. Verification Progress
-    if wm.verification_stage != "IDLE":
-        put_line(f"VERIFY: {wm.verification_stage}", YELLOW, thickness=1)
-
     y_cur += 8 # Spacer
 
     # 8. Extra Messages (Banners -> Moved to Sidebar)
