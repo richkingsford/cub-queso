@@ -6,6 +6,9 @@ from typing import List
 START_GATE_MIN_CONFIDENCE = 25.0
 ALIGN_CONFIDENCE_MIN = 25.0
 VISIBILITY_LOST_GRACE_S = 0.5
+VISIBLE_FALSE_GRACE_S_BY_OBJECTIVE = {
+    "EXIT_WALL": 1.0,
+}
 
 OBJECTIVE_ALIASES = {
     "FIND": "FIND_BRICK",
@@ -77,13 +80,13 @@ def metric_value(brick, metric):
     return None
 
 
-def _effective_visible(world, visible):
+def _effective_visible(world, visible, grace_s=VISIBILITY_LOST_GRACE_S):
     if visible:
         return True
     last_seen = getattr(world, "last_visible_time", None)
     if last_seen is None:
         return False
-    return (time.time() - last_seen) <= VISIBILITY_LOST_GRACE_S
+    return (time.time() - last_seen) <= grace_s
 
 
 def metric_status(value, success_stats, failure_stats, direction):
@@ -116,6 +119,18 @@ def metric_status(value, success_stats, failure_stats, direction):
         if fail_min is not None and fail_max is not None and (value < fail_min or value > fail_max):
             return "fail"
     return "correct"
+
+
+def _target_tol_ok(value, stats, direction):
+    target = stats.get("target") if isinstance(stats, dict) else None
+    tol = stats.get("tol") if isinstance(stats, dict) else None
+    if target is None or tol is None:
+        return None
+    if direction == "high":
+        return value >= (target - tol)
+    if direction == "low":
+        return value <= (target + tol)
+    return abs(value - target) <= tol
 
 
 def compute_brick_world_xy(world, dist, angle_deg):
@@ -288,19 +303,34 @@ def evaluate_start_gates(world, objective, learned_rules, process_rules=None):
     return GateCheck(ok=not reasons, reasons=reasons)
 
 
-def evaluate_success_gates(world, objective, learned_rules, process_rules=None):
+def evaluate_success_gates(world, objective, learned_rules, process_rules=None, visibility_grace_s=None):
     obj_name = _objective_name(objective)
     if obj_name not in METRICS_BY_OBJECTIVE:
         return GateCheck(ok=True)
 
     envelope = build_envelope(process_rules or {}, learned_rules or {}, obj_name)
     success_metrics = envelope.get("success") or {}
+    if obj_name == "FIND_BRICK":
+        if not success_metrics:
+            success_metrics = {"visible": {"min": True}}
+        else:
+            success_metrics = {"visible": success_metrics.get("visible", {"min": True})}
     if not success_metrics:
         return GateCheck(ok=False, reasons=["no success envelope"])
 
     brick = world.brick or {}
     visible = bool(brick.get("visible"))
-    effective_visible = _effective_visible(world, visible)
+    visible_gate = success_metrics.get("visible") or {}
+    if visibility_grace_s is None:
+        visible_grace_s = VISIBILITY_LOST_GRACE_S
+        if isinstance(visible_gate, dict) and visible_gate.get("min") is False:
+            visible_grace_s = VISIBLE_FALSE_GRACE_S_BY_OBJECTIVE.get(
+                obj_name,
+                VISIBILITY_LOST_GRACE_S,
+            )
+    else:
+        visible_grace_s = visibility_grace_s
+    effective_visible = _effective_visible(world, visible, grace_s=visible_grace_s)
     reasons = []
     
     # FIND_BRICK: Ensure we're finding a loose brick, not one already on the wall
@@ -313,44 +343,34 @@ def evaluate_success_gates(world, objective, learned_rules, process_rules=None):
         if metric in ("angle_abs", "offset_abs", "dist", "confidence") and not visible:
             reasons.append("brick not visible")
             continue
-        
-        # Use learned mu (average) for ALIGN_BRICK to target the sweet spot
-        use_mu_targeting = obj_name == "ALIGN_BRICK" and metric in ("angle_abs", "offset_abs", "dist")
-        
+
         if metric == "angle_abs":
             angle_val = abs(brick.get("angle", 0.0))
-            if use_mu_targeting and "mu" in stats:
-                # Target mu ± sigma for precision alignment
-                mu = stats.get("mu", 0.0)
-                sigma = stats.get("sigma", stats.get("max", 0.0) - mu)
-                if angle_val > mu + sigma:
-                    reasons.append(f"angle {angle_val:.1f}° > target {mu+sigma:.1f}°")
-            elif angle_val > stats.get("max", 0.0):
+            ok = _target_tol_ok(angle_val, stats, METRIC_DIRECTIONS.get(metric))
+            if ok is False:
+                reasons.append("angle_abs gate")
+            elif ok is None and angle_val > stats.get("max", 0.0):
                 reasons.append("angle_abs gate")
         elif metric == "offset_abs":
             offset_val = abs(brick.get("offset_x", 0.0))
-            if obj_name == "ALIGN_BRICK":
-                if offset_val != 0.0:
-                    reasons.append("offset not centered")
-                continue
-            if use_mu_targeting and "mu" in stats:
-                mu = stats.get("mu", 0.0)
-                sigma = stats.get("sigma", stats.get("max", 0.0) - mu)
-                if offset_val > mu + sigma:
-                    reasons.append(f"offset {offset_val:.1f}mm > target {mu+sigma:.1f}mm")
-            elif offset_val > stats.get("max", 0.0):
+            ok = _target_tol_ok(offset_val, stats, METRIC_DIRECTIONS.get(metric))
+            if ok is False:
+                reasons.append("offset_abs gate")
+            elif ok is None and offset_val > stats.get("max", 0.0):
                 reasons.append("offset_abs gate")
         elif metric == "dist":
             dist_val = brick.get("dist", 0.0)
-            if use_mu_targeting and "mu" in stats:
-                mu = stats.get("mu", 0.0)
-                sigma = stats.get("sigma", stats.get("max", 0.0) - mu)
-                if dist_val > mu + sigma:
-                    reasons.append(f"dist {dist_val:.1f}mm > target {mu+sigma:.1f}mm")
-            elif dist_val > stats.get("max", 0.0):
+            ok = _target_tol_ok(dist_val, stats, METRIC_DIRECTIONS.get(metric))
+            if ok is False:
+                reasons.append("dist gate")
+            elif ok is None and dist_val > stats.get("max", 0.0):
                 reasons.append("dist gate")
         elif metric == "confidence":
-            if brick.get("confidence", 0.0) < stats.get("min", 0.0):
+            conf_val = brick.get("confidence", 0.0)
+            ok = _target_tol_ok(conf_val, stats, METRIC_DIRECTIONS.get(metric))
+            if ok is False:
+                reasons.append("confidence gate")
+            elif ok is None and conf_val < stats.get("min", 0.0):
                 reasons.append("confidence gate")
         elif metric == "visible":
             min_val = stats.get("min")
@@ -378,6 +398,7 @@ def evaluate_failure_gates(world, objective, learned_rules, process_rules=None):
     
     brick = world.brick or {}
     visible = bool(brick.get("visible"))
+    effective_visible = _effective_visible(world, visible)
     reasons = []
     
     # Check if current state matches known failure patterns

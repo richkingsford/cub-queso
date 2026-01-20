@@ -5,18 +5,6 @@
             "success_gates": {
                 "visible": {
                     "min": true
-                },
-                "angle_abs": {
-                    "min": -3.03,
-                    "max": 8.49
-                },
-                "offset_abs": {
-                    "min": -42.08,
-                    "max": 63.97
-                },
-                "dist": {
-                    "min": 57.62,
-                    "max": 99.72
                 }
             }
         },
@@ -37,7 +25,7 @@
             "scan_direction": "r",
             "success_gates": {
                 "visible": {
-                    "min": false
+                    "min": true
                 }
             }
         },
@@ -52,16 +40,16 @@
                     "min": true
                 },
                 "angle_abs": {
-                    "min": -3.25,
-                    "max": 8.82
+                    "target": 3.84,
+                    "tol": 0.28
                 },
                 "offset_abs": {
-                    "min": -16.4,
-                    "max": 24.7
+                    "target": 4.7,
+                    "tol": 0.26
                 },
                 "dist": {
-                    "min": 31.7,
-                    "max": 98.05
+                    "target": 61.85,
+                    "tol": 0.02
                 }
             }
         },

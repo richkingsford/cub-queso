@@ -27,6 +27,18 @@ METRIC_DIRECTIONS = {
 }
 
 
+def _target_tol_ok(value, stats, direction):
+    target = stats.get("target") if isinstance(stats, dict) else None
+    tol = stats.get("tol") if isinstance(stats, dict) else None
+    if target is None or tol is None:
+        return None
+    if direction == "high":
+        return value >= (target - tol)
+    if direction == "low":
+        return value <= (target + tol)
+    return abs(value - target) <= tol
+
+
 @dataclass
 class MotionDelta:
     dist_mm: float = 0.0
@@ -50,12 +62,16 @@ def evaluate_success_gates(world, objective, learned_rules, process_rules=None):
         return GateCheck(ok=False, reasons=["no lift success envelope"])
     stats = success_metrics.get("lift_height") or {}
     lift = world.lift_height
-    min_val = stats.get("min")
-    max_val = stats.get("max")
-    if min_val is not None and lift < min_val:
-        return GateCheck(ok=False, reasons=[f"lift<{min_val:.1f}mm"])
-    if max_val is not None and lift > max_val:
-        return GateCheck(ok=False, reasons=[f"lift>{max_val:.1f}mm"])
+    ok = _target_tol_ok(lift, stats, METRIC_DIRECTIONS.get("lift_height"))
+    if ok is False:
+        return GateCheck(ok=False, reasons=["lift gate"])
+    if ok is None:
+        min_val = stats.get("min")
+        max_val = stats.get("max")
+        if min_val is not None and lift < min_val:
+            return GateCheck(ok=False, reasons=[f"lift<{min_val:.1f}mm"])
+        if max_val is not None and lift > max_val:
+            return GateCheck(ok=False, reasons=[f"lift>{max_val:.1f}mm"])
     return GateCheck(ok=True)
 
 
@@ -292,6 +308,7 @@ class WorldModel:
         """
         delta = update_from_motion(self, event)
         telemetry_brick.update_from_motion(self, event, delta)
+        telemetry_wall.update_from_motion(self, delta, self.wall_envelope)
 
     def update_vision(self, found, dist, angle, conf, offset_x=0, cam_h=0, brick_above=False, brick_below=False):
         brick_height = telemetry_brick.update_from_vision(
@@ -413,7 +430,14 @@ class WorldModel:
     def to_dict(self):
         # Format Brick Data
         brick_fmt = self.brick.copy()
-        if brick_fmt.get("visible"):
+        if self.objective_state == ObjectiveState.FIND_BRICK:
+            brick_fmt['dist'] = None
+            brick_fmt['angle'] = None
+            brick_fmt['offset_x'] = None
+            brick_fmt['confidence'] = None
+            brick_fmt['brickAbove'] = None
+            brick_fmt['brickBelow'] = None
+        elif brick_fmt.get("visible"):
             if brick_fmt.get("dist") is not None:
                 brick_fmt['dist'] = round(brick_fmt['dist'], 2)
             if brick_fmt.get("angle") is not None:

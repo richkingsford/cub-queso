@@ -7,7 +7,8 @@ from typing import Optional
 
 from telemetry_brick import GateCheck, OBJECTIVE_ALIASES, _objective_name
 
-WALL_MODEL_FILE = Path(__file__).parent / "world_model_wall.json"
+WALL_MODEL_FILE = Path(__file__).parent / "world_model_walls.json"
+WALL_MODEL_FALLBACK_FILE = Path(__file__).parent / "world_model_wall.json"
 
 
 @dataclass
@@ -22,7 +23,7 @@ class WallEnvelope:
     origin: Optional[dict]
 
 
-def load_wall_model(path=WALL_MODEL_FILE):
+def load_wall_model(path=WALL_MODEL_FILE, fallback_path=WALL_MODEL_FALLBACK_FILE):
     defaults = {
         "wall": {
             "x": None,
@@ -37,18 +38,30 @@ def load_wall_model(path=WALL_MODEL_FILE):
             "place_offset_mm": 25.0,
         }
     }
-    if not path.exists():
+    data = None
+    for candidate in (path, fallback_path):
+        if not candidate or not candidate.exists():
+            continue
+        try:
+            with open(candidate, "r") as f:
+                data = json.load(f)
+            break
+        except Exception:
+            data = None
+    if data is None:
         return defaults
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-    except Exception:
-        return defaults
-    if "wall" not in data:
+    if "wall" not in data or not isinstance(data.get("wall"), dict):
         data["wall"] = {}
     merged = defaults["wall"].copy()
     merged.update(data.get("wall", {}))
-    return {"wall": merged}
+    data["wall"] = merged
+    return data
+
+
+def load_wall_objective_rules(path=WALL_MODEL_FILE, fallback_path=WALL_MODEL_FALLBACK_FILE):
+    model = load_wall_model(path, fallback_path)
+    objectives = model.get("objectives")
+    return objectives if isinstance(objectives, dict) else {}
 
 
 def build_envelope(model):
@@ -82,6 +95,10 @@ def init_wall_state(envelope: WallEnvelope):
         "source": "MODEL" if origin is not None else None,
         "contradiction_reason": None,
         "last_seen": None,
+        "last_update": None,
+        "relative": None,
+        "range_mm": None,
+        "bearing_deg": None,
     }
 
 
@@ -110,6 +127,36 @@ def compute_wall_origin(world, dist, angle_deg, envelope: WallEnvelope):
     }
 
 
+def _normalize_angle_deg(angle):
+    if angle is None:
+        return None
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+def _update_wall_estimate(world, envelope: WallEnvelope):
+    wall = world.wall
+    origin = wall.get("origin")
+    if not origin or not wall.get("valid", False):
+        wall["relative"] = None
+        wall["range_mm"] = None
+        wall["bearing_deg"] = None
+        wall["last_update"] = time.time()
+        return
+
+    dx = origin["x"] - world.x
+    dy = origin["y"] - world.y
+    theta = math.radians(-world.theta)
+    rel_x = dx * math.cos(theta) - dy * math.sin(theta)
+    rel_y = dx * math.sin(theta) + dy * math.cos(theta)
+    wall_angle = wall.get("angle_deg", envelope.angle_deg)
+    rel_angle = _normalize_angle_deg(wall_angle - world.theta)
+
+    wall["relative"] = {"x": rel_x, "y": rel_y, "theta": rel_angle}
+    wall["range_mm"] = math.hypot(rel_x, rel_y)
+    wall["bearing_deg"] = math.degrees(math.atan2(rel_y, rel_x))
+    wall["last_update"] = time.time()
+
+
 def update_from_vision(world, found, dist, angle_deg, conf, envelope: WallEnvelope):
     wall = world.wall
     if not found or conf < envelope.min_confidence:
@@ -126,6 +173,7 @@ def update_from_vision(world, found, dist, angle_deg, conf, envelope: WallEnvelo
             wall["immutable"] = True
             wall["source"] = obj_name
             wall["last_seen"] = time.time()
+            _update_wall_estimate(world, envelope)
         return
 
     wall["last_seen"] = time.time()
@@ -136,6 +184,18 @@ def update_from_vision(world, found, dist, angle_deg, conf, envelope: WallEnvelo
     if drift_mm is not None and drift_mm > envelope.max_origin_drift_mm:
         wall["valid"] = False
         wall["contradiction_reason"] = f"origin drift {drift_mm:.1f}mm"
+        _update_wall_estimate(world, envelope)
+        return
+
+    _update_wall_estimate(world, envelope)
+
+
+def update_from_motion(world, delta, envelope: WallEnvelope):
+    if delta is None:
+        return
+    if not delta.dist_mm and not delta.rot_deg:
+        return
+    _update_wall_estimate(world, envelope)
 
 
 def evaluate_start_gates(world, objective, envelope: WallEnvelope):
