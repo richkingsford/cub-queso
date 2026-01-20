@@ -6,7 +6,6 @@ import tty
 import termios
 from pathlib import Path
 
-import autostack
 from robot_control import Robot
 from helper_demo_log_utils import prune_log_file
 from helper_stream_server import StreamServer, format_stream_url
@@ -238,7 +237,7 @@ def print_command_help(app_state=None):
     log_line(f"[CMD] Objective codes: {codes}")
     log_line("[CMD] Attempt codes: f=fail, s=success, r=recover, n=nominal")
     log_line("[CMD] Example: :4s (scoop success), :4n (scoop nominal)")
-    log_line("[CMD] Auto-run: :auto 4s")
+    log_line("[CMD] Auto-run: disabled")
     log_line("[CMD] End attempt: press ':' to finish and return to the command prompt.")
 
 def command_mode_exit_messages(app_state):
@@ -283,28 +282,19 @@ def handle_command_line(app_state, cmd):
             if err:
                 messages.append(f"[CMD] {err}")
             elif auto_mode:
-                if app_state.autostack_active or app_state.autostack_request:
-                    messages.append("[AUTO] Autostack already running.")
-                elif app_state.objective_open and app_state.open_objective != obj_enum:
-                    messages.append(f"[OBJ] Finish {objective_label(app_state.open_objective)} before switching objectives.")
-                else:
-                    app_state.autostack_request = (obj_enum, attempt_type)
-                    messages.append(f"[AUTO] Queued {objective_label(obj_enum)} {attempt_type}.")
-                    exit_mode = True
+                messages.append("[AUTO] Auto-run is disabled. Use manual commands.")
+                exit_mode = True
             else:
-                if app_state.autostack_active or app_state.autostack_request:
-                    messages.append("[AUTO] Autostack pending; wait to issue manual commands.")
-                else:
-                    ok, msg, ended, should_close_val = handle_attempt_command(app_state, obj_enum, attempt_type)
-                    messages.append(msg)
-                    should_close = should_close_val # Propagate
-                    if ok:
-                        # Return to driving mode immediately on start/stop
-                        exit_mode = True
-                        if app_state.active_attempt:
-                            messages.append("[CMD] Press ':' to finish and return to the command prompt.")
-                    if ended:
-                        ended_info = ended
+                ok, msg, ended, should_close_val = handle_attempt_command(app_state, obj_enum, attempt_type)
+                messages.append(msg)
+                should_close = should_close_val # Propagate
+                if ok:
+                    # Return to driving mode immediately on start/stop
+                    exit_mode = True
+                    if app_state.active_attempt:
+                        messages.append("[CMD] Press ':' to finish and return to the command prompt.")
+                if ended:
+                    ended_info = ended
 
     return exit_mode, do_help, messages, ended_info
 
@@ -404,8 +394,6 @@ class AppState:
         self.objective_open = False
         self.open_objective = None
         self.active_attempt = None
-        self.autostack_request = None
-        self.autostack_active = False
         
         # Session Setup
         self.demos_dir = DEMOS_DIR
@@ -494,83 +482,41 @@ def keyboard_thread(app_state):
         else:
             with app_state.lock:
                 app_state.last_key_time = time.time()
-                if app_state.autostack_active or app_state.autostack_request:
-                    if ch_lower in ('w', 's', 'a', 'd', 'q', 'e', 'z', 'c', 'p', 'l'):
-                        messages.append("[AUTO] Autostack active; manual controls paused.")
-                else:
-                    # MOVEMENT (Heartbeat triggers)
-                    if ch_lower == 'w':
-                        app_state.active_command = 'f'
-                    elif ch_lower == 's':
-                        app_state.active_command = 'b'
-                    elif ch_lower == 'a':
-                        app_state.active_command = 'l'
-                        app_state.turn_speed_multiplier = 1.0
-                    elif ch_lower == 'd':
-                        app_state.active_command = 'r'
-                        app_state.turn_speed_multiplier = 1.0
-                    elif ch_lower == 'q':
-                        app_state.active_command = 'l'
-                        app_state.turn_speed_multiplier = 1.0 / 3.0
-                    elif ch_lower == 'e':
-                        app_state.active_command = 'r'
-                        app_state.turn_speed_multiplier = 1.0 / 3.0
-                    elif ch_lower == 'z':
-                        app_state.active_command = 'l'
-                        app_state.turn_speed_multiplier = 2.0
-                    elif ch_lower == 'c':
-                        app_state.active_command = 'r'
-                        app_state.turn_speed_multiplier = 2.0
-                    elif ch_lower == 'p':
-                        app_state.active_command = 'u'
-                    elif ch_lower == 'l':
-                        app_state.active_command = 'd'
-                    elif ch_lower in ('h', '?'):
-                        print_command_help(app_state)
+                # MOVEMENT (Heartbeat triggers)
+                if ch_lower == 'w':
+                    app_state.active_command = 'f'
+                elif ch_lower == 's':
+                    app_state.active_command = 'b'
+                elif ch_lower == 'a':
+                    app_state.active_command = 'l'
+                    app_state.turn_speed_multiplier = 1.0
+                elif ch_lower == 'd':
+                    app_state.active_command = 'r'
+                    app_state.turn_speed_multiplier = 1.0
+                elif ch_lower == 'q':
+                    app_state.active_command = 'l'
+                    app_state.turn_speed_multiplier = 1.0 / 3.0
+                elif ch_lower == 'e':
+                    app_state.active_command = 'r'
+                    app_state.turn_speed_multiplier = 1.0 / 3.0
+                elif ch_lower == 'z':
+                    app_state.active_command = 'l'
+                    app_state.turn_speed_multiplier = 2.0
+                elif ch_lower == 'c':
+                    app_state.active_command = 'r'
+                    app_state.turn_speed_multiplier = 2.0
+                elif ch_lower == 'p':
+                    app_state.active_command = 'u'
+                elif ch_lower == 'l':
+                    app_state.active_command = 'd'
+                elif ch_lower in ('h', '?'):
+                    print_command_help(app_state)
 
         for msg in messages:
             log_line(msg)
 
         if not app_state.running:
             break
-
-def run_auto_attempt(app_state, obj_enum, attempt_type):
-    with app_state.lock:
-        ok, msg = start_attempt(app_state, obj_enum, attempt_type)
-    log_line(msg)
-    if not ok:
-        return False
-
-    # Log initial state immediately to capture conditions at the start of the attempt
-    with app_state.lock:
-        app_state.logger.log_state(app_state.world)
-
-    def frame_callback(frame):
-        if frame is None:
-            return
-        frame_copy = frame.copy()
-        draw_telemetry_overlay(frame_copy, app_state.world, show_prompt=False)
-        with app_state.lock:
-            app_state.current_frame = frame_copy
-
-    ok, info = autostack.run_demo_attempt(
-        objective_label(obj_enum),
-        attempt_type,
-        robot=app_state.robot,
-        vision=app_state.vision,
-        world=app_state.world,
-        telemetry_logger=app_state.logger,
-        frame_callback=frame_callback,
-        log_rate_hz=LOG_RATE_HZ,
-        stop_flag=lambda: not app_state.running,
-    )
-    log_line(info)
-    complete_obj = True
-    if attempt_type == "SUCCESS":
-        complete_obj = ok
-    with app_state.lock:
-        _, _, ended_obj, ended_attempt, _ = end_attempt(app_state, complete_objective=complete_obj)
-    return ok
 
 def control_loop(app_state):
     app_state.robot = Robot()
@@ -584,24 +530,6 @@ def control_loop(app_state):
     while app_state.running:
         loop_start = time.time()
 
-        request = None
-        with app_state.lock:
-            if app_state.autostack_request and not app_state.autostack_active:
-                request = app_state.autostack_request
-                app_state.autostack_request = None
-                app_state.autostack_active = True
-                app_state.active_command = None
-                app_state.active_speed = 0.0
-
-        if request:
-            obj_enum, attempt_type = request
-            app_state.robot.stop()
-            run_auto_attempt(app_state, obj_enum, attempt_type)
-            with app_state.lock:
-                app_state.autostack_active = False
-            was_moving = False
-            continue
-        
         # 1. Heartbeat Check
         with app_state.lock:
             if time.time() - app_state.last_key_time > HEARTBEAT_TIMEOUT:

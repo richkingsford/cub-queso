@@ -66,6 +66,14 @@ def _objective_name(objective):
     return OBJECTIVE_ALIASES.get(key, key)
 
 
+def metric_direction_for_objective(metric, objective):
+    direction = METRIC_DIRECTIONS.get(metric)
+    obj_name = _objective_name(objective)
+    if obj_name == "FIND_BRICK" and metric == "dist":
+        return None
+    return direction
+
+
 def metric_value(brick, metric):
     if metric == "angle_abs":
         return abs(brick.get("angle", 0.0))
@@ -133,6 +141,20 @@ def _target_tol_ok(value, stats, direction):
     return abs(value - target) <= tol
 
 
+def success_metric_bounds(stats, direction):
+    if not isinstance(stats, dict) or direction is None:
+        return None, None
+    target = stats.get("target")
+    tol = stats.get("tol")
+    if target is not None and tol is not None:
+        if direction == "low":
+            return None, target + tol
+        if direction == "high":
+            return target - tol, None
+        return target - tol, target + tol
+    return stats.get("min"), stats.get("max")
+
+
 def compute_brick_world_xy(world, dist, angle_deg):
     heading = math.radians(world.theta + angle_deg)
     return (
@@ -165,6 +187,17 @@ def build_envelope(process_rules, learned_rules, objective):
     return {"success": success, "failure": failure}
 
 
+def success_gate_bounds(process_rules, learned_rules, objective):
+    envelope = build_envelope(process_rules or {}, learned_rules or {}, objective)
+    success_metrics = envelope.get("success") or {}
+    bounds = {}
+    for metric, stats in success_metrics.items():
+        direction = metric_direction_for_objective(metric, objective)
+        min_val, max_val = success_metric_bounds(stats, direction)
+        bounds[metric] = {"min": min_val, "max": max_val}
+    return bounds
+
+
 def update_from_motion(world, event, delta):
     return
 
@@ -179,6 +212,10 @@ def update_from_vision(world, found, dist, angle, conf, offset_x=0, cam_h=0, bri
     world.brick["brickBelow"] = bool(brick_below)
     if found:
         world.last_visible_time = time.time()
+        world.last_seen_angle = float(angle)
+        world.last_seen_offset_x = float(offset_x)
+        world.last_seen_dist = float(dist)
+        world.last_seen_confidence = float(conf)
 
     if world.objective_state.value == "SCOOP":
         world.scoop_forward_preferred = True
@@ -310,11 +347,6 @@ def evaluate_success_gates(world, objective, learned_rules, process_rules=None, 
 
     envelope = build_envelope(process_rules or {}, learned_rules or {}, obj_name)
     success_metrics = envelope.get("success") or {}
-    if obj_name == "FIND_BRICK":
-        if not success_metrics:
-            success_metrics = {"visible": {"min": True}}
-        else:
-            success_metrics = {"visible": success_metrics.get("visible", {"min": True})}
     if not success_metrics:
         return GateCheck(ok=False, reasons=["no success envelope"])
 
@@ -340,34 +372,35 @@ def evaluate_success_gates(world, objective, learned_rules, process_rules=None, 
             return GateCheck(ok=False, reasons=reasons)
     
     for metric, stats in success_metrics.items():
+        direction = metric_direction_for_objective(metric, obj_name)
         if metric in ("angle_abs", "offset_abs", "dist", "confidence") and not visible:
             reasons.append("brick not visible")
             continue
 
         if metric == "angle_abs":
             angle_val = abs(brick.get("angle", 0.0))
-            ok = _target_tol_ok(angle_val, stats, METRIC_DIRECTIONS.get(metric))
+            ok = _target_tol_ok(angle_val, stats, direction)
             if ok is False:
                 reasons.append("angle_abs gate")
             elif ok is None and angle_val > stats.get("max", 0.0):
                 reasons.append("angle_abs gate")
         elif metric == "offset_abs":
             offset_val = abs(brick.get("offset_x", 0.0))
-            ok = _target_tol_ok(offset_val, stats, METRIC_DIRECTIONS.get(metric))
+            ok = _target_tol_ok(offset_val, stats, direction)
             if ok is False:
                 reasons.append("offset_abs gate")
             elif ok is None and offset_val > stats.get("max", 0.0):
                 reasons.append("offset_abs gate")
         elif metric == "dist":
             dist_val = brick.get("dist", 0.0)
-            ok = _target_tol_ok(dist_val, stats, METRIC_DIRECTIONS.get(metric))
+            ok = _target_tol_ok(dist_val, stats, direction)
             if ok is False:
                 reasons.append("dist gate")
             elif ok is None and dist_val > stats.get("max", 0.0):
                 reasons.append("dist gate")
         elif metric == "confidence":
             conf_val = brick.get("confidence", 0.0)
-            ok = _target_tol_ok(conf_val, stats, METRIC_DIRECTIONS.get(metric))
+            ok = _target_tol_ok(conf_val, stats, direction)
             if ok is False:
                 reasons.append("confidence gate")
             elif ok is None and conf_val < stats.get("min", 0.0):
@@ -414,7 +447,7 @@ def evaluate_failure_gates(world, objective, learned_rules, process_rules=None):
         if value is None:
             continue
         
-        direction = METRIC_DIRECTIONS.get(metric)
+        direction = metric_direction_for_objective(metric, obj_name)
         
         # If we have learned failure mu/sigma, check if we're in the failure zone
         if "mu" in stats and "sigma" in stats:

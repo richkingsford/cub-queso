@@ -27,6 +27,15 @@ METRIC_DIRECTIONS = {
 }
 
 
+def resolve_scan_direction(process_rules, objective, fallback="l"):
+    obj_name = _objective_name(objective)
+    rules = (process_rules or {}).get(obj_name, {})
+    scan_direction = rules.get("scan_direction")
+    if scan_direction in ("l", "r"):
+        return scan_direction
+    return fallback
+
+
 def _target_tol_ok(value, stats, direction):
     target = stats.get("target") if isinstance(stats, dict) else None
     tol = stats.get("tol") if isinstance(stats, dict) else None
@@ -271,6 +280,10 @@ class WorldModel:
         self.scoop_desired_offset_x = 0.0
         self.scoop_lateral_drift = 0.0
         self.scoop_forward_preferred = False
+        self.last_seen_angle = None
+        self.last_seen_offset_x = None
+        self.last_seen_dist = None
+        self.last_seen_confidence = None
         
         self.last_image_file = None
         
