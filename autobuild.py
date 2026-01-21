@@ -420,19 +420,19 @@ def alignment_command(world, objective, gate_bounds, speeds):
             scan_cmd = telemetry_robot_module.resolve_scan_direction(world.process_rules, objective)
         return scan_cmd, speeds["scan"], "scanning for brick visibility"
 
-    angle_max = (gate_bounds.get("angle_abs") or {}).get("max")
-    angle = brick.get("angle") or 0.0
-    if angle_max is not None and abs(angle) > angle_max:
-        angle_dir = "right" if angle > 0 else "left"
-        cmd = "r" if angle > 0 else "l"
-        return cmd, speeds["turn"], f"closing {angle_dir} angle of {abs(angle):.2f}deg"
-
     offset_max = (gate_bounds.get("offset_abs") or {}).get("max")
     offset_x = brick.get("offset_x") or 0.0
     if offset_max is not None and abs(offset_x) > offset_max:
         offset_dir = "right" if offset_x > 0 else "left"
         cmd = "r" if offset_x > 0 else "l"
         return cmd, speeds["turn"], f"closing {offset_dir} offset of {abs(offset_x):.2f}mm"
+
+    angle_max = (gate_bounds.get("angle_abs") or {}).get("max")
+    angle = brick.get("angle") or 0.0
+    if angle_max is not None and abs(angle) > angle_max:
+        angle_dir = "right" if angle > 0 else "left"
+        cmd = "r" if angle > 0 else "l"
+        return cmd, speeds["turn"], f"closing {angle_dir} angle of {abs(angle):.2f}deg"
 
     dist = brick.get("dist")
     dist_bounds = gate_bounds.get("dist") or {}
