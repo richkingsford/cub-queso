@@ -164,9 +164,11 @@ class ObjectiveState(Enum):
 class MotionEvent:
     def __init__(self, action_type, power, duration_ms):
         self.action_type = action_type
-        self.power = power
+        self.power = int(power) if power is not None else 0
         self.duration_ms = duration_ms
         self.timestamp = time.time()
+        if self.action_type in ("left_turn", "right_turn") and 0 < self.power < MIN_TURN_POWER_PWM:
+            self.power = MIN_TURN_POWER_PWM
 
     def to_dict(self):
         return {
@@ -193,6 +195,8 @@ DEFAULT_MM_PER_SEC_FULL_SPEED = 200.0
 DEFAULT_DEG_PER_SEC_FULL_SPEED = 90.0
 DEFAULT_LIFT_MM_PER_SEC = 23.5
 DEFAULT_MOTION_TICK_MS = 100.0
+MIN_TURN_POWER = 0.23
+MIN_TURN_POWER_PWM = int(math.ceil(MIN_TURN_POWER * 255))
 
 
 def _coerce_float(value):
@@ -319,6 +323,7 @@ class WorldModel:
         # Objective
         self._objective_state = None
         self._objective_start_time = 0
+        self._success_start_time = None
         self.objective_state = ObjectiveState.FIND_BRICK
         self.attempt_status = "NORMAL" # NORMAL, FAIL, RECOVERY
         self.run_id = "unset"
@@ -369,6 +374,7 @@ class WorldModel:
             return
         self._objective_state = value
         self._objective_start_time = time.time()
+        self._success_start_time = None
         self.last_visible_time = None
         # print(f"[WORLD] Objective changed to {value}, timer reset.", flush=True)
 

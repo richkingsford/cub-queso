@@ -25,12 +25,23 @@ SUCCESS_CONSECUTIVE_FRAMES = 3
 SUCCESS_MAJORITY_WINDOW = 5
 SUCCESS_MAJORITY_REQUIRED = 3
 SUCCESS_VISIBLE_FALSE_GRACE_S = 0.0
+SUCCESS_CONFIDENCE_MIN = 0.85
+CONFIDENCE_LOG_MIN = 0.5
+SUCCESS_CONFIRMATION_S = 0.35
+SUCCESS_CONFIRMATION_FRAMES = 4
+SUCCESS_CONFIRMATION_START_CONFIDENCE = 0.5
+PURSUIT_SPEED = 0.24
+SUCCESS_CONFIRMATION_SLOW_SPEED = 0.0
+SUSPECT_SPEED = 0.6
+MAX_OBJECTIVE_DURATION_S = 20.0
+FAILURE_TIGHTEN_LOW_PCT = 0.1
+FAILURE_TIGHTEN_HIGH_PCT = 0.9
 START_GATE_TIMEOUT_S = 8.0
 SUCCESS_SETTLE_S = 1.0
 SUCCESS_TAIL_WINDOW_S = 0.5
 MAX_PHASE_ATTEMPTS = 1
 MAX_SPEED = 0.5
-SMOOTH_SPEED = 0.3
+SMOOTH_SPEED = PURSUIT_SPEED
 SMOOTH_STEP_S = 1.0
 DURATION_SCALE = 3.0
 FAIL_PAUSE_S = 3.0
@@ -236,7 +247,6 @@ def format_gate_lines(cfg):
     return (
         format_gate_metrics(cfg.get("start_gates") or {}),
         format_gate_metrics(cfg.get("success_gates") or {}),
-        format_gate_metrics(cfg.get("fail_gates") or {}),
     )
 
 
@@ -322,23 +332,30 @@ def format_brick_state_line(world):
     return "[BRICK] " + " ".join(parts)
 
 
-def format_action_line(step, target_visible):
+def format_action_line(step, target_visible, reason=None):
     action = ACTION_CMD_DESC.get(step.cmd, "moving")
     power = f"{step.speed:.2f}"
     duration = f"{step.duration_s:.2f}"
     if target_visible is None:
         suffix = f"for {duration}s"
     else:
-        vis_txt = "true" if target_visible else "false"
-        suffix = f"for {duration}s or until brickVisible={vis_txt}"
-    return f"[ACT] {action} at {power} power {suffix}"
+        if target_visible:
+            stop_clause = "until brick becomes visible"
+        else:
+            stop_clause = "until brick is no longer visible"
+        suffix = f"for {duration}s or {stop_clause}"
+    reason = str(reason).strip() if reason else ""
+    reason_suffix = f" (because {reason})" if reason else ""
+    return f"[ACT] {action} at {power} power {suffix}{reason_suffix}"
 
 
-def format_control_action_line(cmd, speed, reason):
+def format_control_action_line(cmd, speed, reason=None):
     action = ACTION_CMD_DESC.get(cmd, "moving") if cmd else "holding position"
+    reason = str(reason).strip() if reason else ""
+    reason_suffix = f" (because {reason})" if reason else ""
     if cmd:
-        return f"[ACT] {action} at {speed:.2f} power ({reason})"
-    return f"[ACT] {action} ({reason})"
+        return f"[ACT] {action} at {speed:.2f} power{reason_suffix}"
+    return f"[ACT] {action}{reason_suffix}"
 
 
 def objective_uses_alignment_control(objective, process_rules):
@@ -369,7 +386,7 @@ def derive_action_speeds(steps, fallback=SMOOTH_SPEED):
     def pick(value):
         if value is None:
             value = fallback
-        return min(value, MAX_SPEED)
+        return min(value, MAX_SPEED, PURSUIT_SPEED)
 
     turn = pick(turn)
     forward = pick(forward)
@@ -401,19 +418,21 @@ def alignment_command(world, objective, gate_bounds, speeds):
         scan_cmd = recent_turn_preference(world, telemetry_brick.VISIBILITY_LOST_GRACE_S)
         if scan_cmd is None:
             scan_cmd = telemetry_robot_module.resolve_scan_direction(world.process_rules, objective)
-        return scan_cmd, speeds["scan"], "scan"
+        return scan_cmd, speeds["scan"], "scanning for brick visibility"
 
     angle_max = (gate_bounds.get("angle_abs") or {}).get("max")
     angle = brick.get("angle") or 0.0
     if angle_max is not None and abs(angle) > angle_max:
-        cmd = "l" if angle > 0 else "r"
-        return cmd, speeds["turn"], "angle"
+        angle_dir = "right" if angle > 0 else "left"
+        cmd = "r" if angle > 0 else "l"
+        return cmd, speeds["turn"], f"closing {angle_dir} angle of {abs(angle):.2f}deg"
 
     offset_max = (gate_bounds.get("offset_abs") or {}).get("max")
     offset_x = brick.get("offset_x") or 0.0
     if offset_max is not None and abs(offset_x) > offset_max:
-        cmd = "l" if offset_x > 0 else "r"
-        return cmd, speeds["turn"], "offset"
+        offset_dir = "right" if offset_x > 0 else "left"
+        cmd = "r" if offset_x > 0 else "l"
+        return cmd, speeds["turn"], f"closing {offset_dir} offset of {abs(offset_x):.2f}mm"
 
     dist = brick.get("dist")
     dist_bounds = gate_bounds.get("dist") or {}
@@ -421,11 +440,11 @@ def alignment_command(world, objective, gate_bounds, speeds):
     dist_max = dist_bounds.get("max")
     if dist is not None:
         if dist_max is not None and dist > dist_max:
-            return "f", speeds["forward"], "dist"
+            return "f", speeds["forward"], f"closing distance long by {abs(dist - dist_max):.1f}mm"
         if dist_min is not None and dist < dist_min:
-            return "b", speeds["backward"], "dist"
+            return "b", speeds["backward"], f"closing distance short by {abs(dist_min - dist):.1f}mm"
 
-    return None, 0.0, "hold"
+    return None, 0.0, "within success gates"
 
 
 def adjust_speed_for_find_brick(world, objective, speed):
@@ -449,6 +468,106 @@ def success_visible_target(world, objective):
     if "max" in visible_gate:
         return bool(visible_gate.get("max"))
     return None
+
+
+def objective_duration_stats(process_rules, objective):
+    objective_key = normalize_objective_label(objective)
+    rules = (process_rules or {}).get(objective_key, {})
+    stats = (rules.get("success_gates") or {}).get("duration_s")
+    if isinstance(stats, dict):
+        return stats
+    return None
+
+
+def objective_elapsed_s(world):
+    start_time = getattr(world, "_objective_start_time", None)
+    if start_time is None:
+        return None
+    return max(0.0, time.time() - start_time)
+
+
+def objective_confidence(success_ok, world, objective):
+    if not success_ok:
+        if getattr(world, "_success_start_time", None) is not None:
+            world._success_start_time = None
+        world._success_confirm_frames = 0
+        world._success_confirm_progress = None
+        world._success_confirm_logged = False
+        return 0.0
+    now = time.time()
+    confirm_frames = getattr(world, "_success_confirm_frames", 0) + 1
+    world._success_confirm_frames = confirm_frames
+    if getattr(world, "_success_start_time", None) is None:
+        world._success_start_time = now
+    start_conf = max(0.0, min(SUCCESS_CONFIRMATION_START_CONFIDENCE, SUCCESS_CONFIDENCE_MIN))
+    if SUCCESS_CONFIRMATION_FRAMES <= 1:
+        confirm_progress = 1.0
+    else:
+        confirm_progress = (confirm_frames - 1) / (SUCCESS_CONFIRMATION_FRAMES - 1)
+        confirm_progress = max(0.0, min(1.0, confirm_progress))
+    if confirm_progress < 1.0:
+        confirm_conf = start_conf + (SUCCESS_CONFIDENCE_MIN - start_conf) * confirm_progress
+    else:
+        confirm_conf = SUCCESS_CONFIDENCE_MIN
+    world._success_confirm_progress = confirm_progress
+
+    duration_conf = 1.0
+    stats = objective_duration_stats(world.process_rules or {}, objective)
+    if stats:
+        target = stats.get("target")
+        if target is not None and target > 0:
+            elapsed = objective_elapsed_s(world)
+            if elapsed is not None:
+                duration_conf = max(0.0, min(1.0, elapsed / target))
+
+    combined_conf = max(confirm_conf, duration_conf)
+    if confirm_progress is not None and combined_conf < start_conf:
+        combined_conf = start_conf
+    return combined_conf
+
+
+def confidence_suspect(success_ok, confidence):
+    if not success_ok or confidence is None:
+        return False
+    return confidence < SUCCESS_CONFIDENCE_MIN
+
+
+def apply_confidence_speed(speed, success_ok, confidence, world=None):
+    if speed is None:
+        return speed
+    capped_speed = speed
+    if world is not None:
+        confirm_progress = getattr(world, "_success_confirm_progress", None)
+        if confirm_progress is not None:
+            capped_speed = min(capped_speed, SUCCESS_CONFIRMATION_SLOW_SPEED)
+    if confidence_suspect(success_ok, confidence):
+        capped_speed = min(capped_speed, SUSPECT_SPEED)
+    return capped_speed
+
+
+def apply_pursuit_speed(speed):
+    if speed is None:
+        return speed
+    return min(speed, PURSUIT_SPEED)
+
+
+def log_confidence(world, confidence, objective):
+    if confidence is None:
+        return
+    confirm_progress = getattr(world, "_success_confirm_progress", None)
+    if confirm_progress is not None and confirm_progress < 1.0:
+        pct = int(round(confidence * 100))
+        print(format_headline(f"[CONFIRM] {objective} {pct}% confidence", COLOR_WHITE))
+        return
+    if confirm_progress is not None and not getattr(world, "_success_confirm_logged", False):
+        pct = int(round(confidence * 100))
+        print(format_headline(f"[CONFIRM] {objective} {pct}% confidence", COLOR_WHITE))
+        world._success_confirm_logged = True
+        return
+    if confidence < CONFIDENCE_LOG_MIN or confidence >= SUCCESS_CONFIDENCE_MIN:
+        return
+    pct = int(round(confidence * 100))
+    print(format_headline(f"[CONF] {objective} {pct}% confidence", COLOR_WHITE))
 
 
 def pause_after_fail(robot):
@@ -513,6 +632,24 @@ def metric_value_from_state(state, metric):
     return None
 
 
+def metric_direction(metric, objective):
+    if metric in telemetry_brick.METRIC_DIRECTIONS:
+        return telemetry_brick.metric_direction_for_objective(metric, objective)
+    return telemetry_robot_module.METRIC_DIRECTIONS.get(metric)
+
+
+def collect_metric_values(segments, metrics):
+    metric_values = {metric: [] for metric in metrics}
+    for seg in segments:
+        for state in select_tail_states(seg.get("states") or []):
+            for metric in metrics:
+                value = metric_value_from_state(state, metric)
+                if value is None:
+                    continue
+                metric_values[metric].append(value)
+    return metric_values
+
+
 def collect_segments(logs):
     segments_by_obj = {}
     attempt_types = {}
@@ -561,14 +698,7 @@ def derive_success_gates(success_segments, scale_by_objective=None, objective_ru
         )
         if not metrics:
             continue
-        metric_values = {metric: [] for metric in metrics}
-        for seg in segs:
-            for state in select_tail_states(seg.get("states") or []):
-                for metric in metrics:
-                    value = metric_value_from_state(state, metric)
-                    if value is None:
-                        continue
-                    metric_values[metric].append(value)
+        metric_values = collect_metric_values(segs, metrics)
 
         visible_gate = None
         if metric_values.get("visible"):
@@ -607,61 +737,165 @@ def derive_success_gates(success_segments, scale_by_objective=None, objective_ru
     return success_gates
 
 
-def _mean(values):
-    if not values:
-        return None
-    return sum(values) / len(values)
+def derive_success_durations(success_segments):
+    durations = {}
+    for obj, segs in success_segments.items():
+        values = []
+        for seg in segs:
+            start = seg.get("start")
+            end = seg.get("end")
+            if start is None or end is None:
+                timestamps = [
+                    state.get("timestamp")
+                    for state in (seg.get("states") or [])
+                    if state.get("timestamp") is not None
+                ]
+                if not timestamps:
+                    timestamps = [
+                        evt.get("timestamp")
+                        for evt in (seg.get("events") or [])
+                        if evt.get("timestamp") is not None
+                    ]
+                if timestamps:
+                    start = min(timestamps)
+                    end = max(timestamps)
+            if start is None or end is None:
+                continue
+            duration = end - start
+            if duration is None or duration <= 0:
+                continue
+            values.append(duration)
+        if not values:
+            continue
+        p10 = percentile(values, 0.1)
+        p50 = percentile(values, 0.5)
+        p90 = percentile(values, 0.9)
+        if p50 is None:
+            continue
+        tol = None
+        if p10 is not None and p90 is not None:
+            tol = max(abs(p50 - p10), abs(p90 - p50))
+        stats = {"target": round_value(p50)}
+        if tol is not None:
+            stats["tol"] = round_value(tol)
+        durations[obj] = stats
+    return durations
 
 
-def _stdev(values, mean_val=None):
-    if not values:
-        return None
-    if len(values) < 2:
-        return 0.0
-    if mean_val is None:
-        mean_val = _mean(values)
-    var = sum((val - mean_val) ** 2 for val in values) / len(values)
-    return math.sqrt(var)
-
-
-def derive_failure_gates(fail_segments, objective_rules=None):
+def refine_success_gates_with_failures(success_gates, fail_segments, objective_rules=None):
+    if not success_gates or not fail_segments:
+        return success_gates
     metrics_by_obj = objective_metrics_map()
-    failure_gates = {}
-    for obj, segs in fail_segments.items():
+    for obj, gates in success_gates.items():
+        if not isinstance(gates, dict):
+            continue
+        # Tighten success tolerances when failure samples overlap the current success window.
         metrics = success_gate_metrics_for_objective(
             metrics_by_obj.get(obj, []),
             obj,
             objective_rules,
         )
-        metrics = [metric for metric in metrics if metric != "visible"]
         if not metrics:
             continue
-
-        metric_values = {metric: [] for metric in metrics}
-        for seg in segs:
-            for state in select_tail_states(seg.get("states") or []):
-                for metric in metrics:
-                    value = metric_value_from_state(state, metric)
-                    if value is None:
-                        continue
-                    metric_values[metric].append(value)
-
-        obj_gates = {}
-        for metric, values in metric_values.items():
+        fail_values = collect_metric_values(fail_segments.get(obj, []), metrics)
+        for metric, stats in gates.items():
+            if not isinstance(stats, dict):
+                continue
+            if metric == "visible":
+                continue
+            values = fail_values.get(metric)
             if not values:
                 continue
-            mean_val = _mean(values)
-            sigma = _stdev(values, mean_val)
-            if mean_val is None or sigma is None:
+
+            direction = metric_direction(metric, obj)
+            if direction not in ("low", "high"):
                 continue
-            obj_gates[metric] = {
-                "mu": round_value(mean_val),
-                "sigma": round_value(sigma),
+
+            target = stats.get("target")
+            tol = stats.get("tol")
+            if target is not None and tol is not None:
+                if direction == "low":
+                    failure_floor = percentile(values, FAILURE_TIGHTEN_LOW_PCT)
+                    if failure_floor is None:
+                        continue
+                    success_max = target + tol
+                    if failure_floor <= target or failure_floor >= success_max:
+                        continue
+                    stats["tol"] = round_value(failure_floor - target)
+                else:
+                    failure_ceiling = percentile(values, FAILURE_TIGHTEN_HIGH_PCT)
+                    if failure_ceiling is None:
+                        continue
+                    success_min = target - tol
+                    if failure_ceiling >= target or failure_ceiling <= success_min:
+                        continue
+                    stats["tol"] = round_value(target - failure_ceiling)
+                continue
+
+            if direction == "low":
+                failure_floor = percentile(values, FAILURE_TIGHTEN_LOW_PCT)
+                if failure_floor is None:
+                    continue
+                max_val = stats.get("max")
+                if max_val is None or failure_floor >= max_val:
+                    continue
+                stats["max"] = round_value(failure_floor)
+            else:
+                failure_ceiling = percentile(values, FAILURE_TIGHTEN_HIGH_PCT)
+                if failure_ceiling is None:
+                    continue
+                min_val = stats.get("min")
+                if min_val is None or failure_ceiling <= min_val:
+                    continue
+                stats["min"] = round_value(failure_ceiling)
+    return success_gates
+
+
+def derive_movement_learnings(segments_by_obj):
+    learnings = {}
+    for obj, segs_by_type in segments_by_obj.items():
+        segments = []
+        segments.extend(segs_by_type.get("SUCCESS") or [])
+        segments.extend(segs_by_type.get("NOMINAL") or [])
+        if not segments:
+            continue
+
+        aggregate_by_cmd = {}
+        for seg in segments:
+            steps = merge_motion_steps(build_motion_sequence(seg.get("events") or []))
+            if not steps:
+                continue
+            per_cmd = {}
+            for step in steps:
+                entry = per_cmd.setdefault(step.cmd, {"duration": 0.0, "speed_sum": 0.0})
+                entry["duration"] += step.duration_s
+                entry["speed_sum"] += step.speed * step.duration_s
+            for cmd, entry in per_cmd.items():
+                if entry["duration"] <= 0:
+                    continue
+                avg_speed = entry["speed_sum"] / entry["duration"]
+                rollup = aggregate_by_cmd.setdefault(cmd, {"durations": [], "speeds": []})
+                rollup["durations"].append(entry["duration"])
+                rollup["speeds"].append(avg_speed)
+
+        if not aggregate_by_cmd:
+            continue
+
+        cmd_stats = {}
+        for cmd, values in aggregate_by_cmd.items():
+            duration_avg = sum(values["durations"]) / len(values["durations"])
+            speed_avg = sum(values["speeds"]) / len(values["speeds"])
+            cmd_stats[cmd] = {
+                "duration_s": round_value(duration_avg),
+                "speed": round_value(speed_avg),
             }
 
-        if obj_gates:
-            failure_gates[obj] = obj_gates
-    return failure_gates
+        dominant_cmd, stats = max(
+            cmd_stats.items(),
+            key=lambda item: item[1].get("duration_s") or 0.0,
+        )
+        learnings[obj] = {"cmd": dominant_cmd, **stats}
+    return learnings
 
 
 def update_process_model_from_demos(logs, path=PROCESS_MODEL_FILE):
@@ -696,15 +930,24 @@ def update_process_model_from_demos(logs, path=PROCESS_MODEL_FILE):
         success_gate_scales,
         objective_rules,
     )
-    failure_gates = derive_failure_gates(
+    success_durations = derive_success_durations(success_segments)
+    success_gates = refine_success_gates_with_failures(
+        success_gates,
         fail_segments,
         objective_rules,
     )
+    for obj, stats in success_durations.items():
+        if obj not in success_gates:
+            continue
+        if isinstance(success_gates.get(obj), dict):
+            success_gates[obj]["duration_s"] = stats
+
+    movement_learnings = derive_movement_learnings(segments_by_obj)
 
     all_objectives = set(objectives.keys())
     all_objectives.update(start_gates.keys())
     all_objectives.update(success_gates.keys())
-    all_objectives.update(failure_gates.keys())
+    all_objectives.update(movement_learnings.keys())
     all_objectives.update(attempt_types.keys())
 
     for obj in all_objectives:
@@ -719,14 +962,18 @@ def update_process_model_from_demos(logs, path=PROCESS_MODEL_FILE):
             cfg["success_gates"] = success_gates[obj]
         else:
             cfg.pop("success_gates", None)
-        if obj in failure_gates:
-            cfg["fail_gates"] = failure_gates[obj]
-        else:
-            cfg.pop("fail_gates", None)
+        cfg.pop("fail_gates", None)
         visible_gate = cfg.get("success_gates", {}).get("visible", {})
         if visible_gate.get("min") is False:
+            duration_stats = cfg.get("success_gates", {}).get("duration_s")
             cfg["success_gates"] = {"visible": {"min": False}}
+            if duration_stats:
+                cfg["success_gates"]["duration_s"] = duration_stats
 
+        if obj in movement_learnings:
+            cfg["movement_learnings"] = movement_learnings[obj]
+        else:
+            cfg.pop("movement_learnings", None)
 
         obj_types = attempt_types.get(obj, set())
         if obj_types == {"NOMINAL"}:
@@ -793,7 +1040,7 @@ def smooth_motion_steps(
     steps,
     speed=SMOOTH_SPEED,
     step_s=SMOOTH_STEP_S,
-    max_speed=MAX_SPEED,
+    max_speed=PURSUIT_SPEED,
     duration_scale=DURATION_SCALE,
 ):
     if not steps:
@@ -870,32 +1117,29 @@ def evaluate_gate_status(world, objective):
     wall_success = telemetry_wall.evaluate_success_gates(world, objective, world.wall_envelope)
     robot_success = telemetry_robot_module.evaluate_success_gates(world, objective, telemetry_rules, process_rules)
 
-    brick_fail = telemetry_brick.evaluate_failure_gates(world, objective, telemetry_rules, process_rules)
-    wall_fail = telemetry_wall.evaluate_failure_gates(world, objective, world.wall_envelope)
-    robot_fail = telemetry_robot_module.evaluate_failure_gates(world, objective, telemetry_rules, process_rules)
-
     success_ok = brick_success.ok and wall_success.ok and robot_success.ok
-    reasons = []
-    if not brick_fail.ok:
-        reasons.extend(brick_fail.reasons)
-    if not wall_fail.ok:
-        reasons.extend(wall_fail.reasons)
-    if not robot_fail.ok:
-        reasons.extend(robot_fail.reasons)
-    fail = bool(reasons)
-    return success_ok, fail, "; ".join(reasons)
+    confidence = objective_confidence(success_ok, world, objective)
+    return success_ok, confidence
 
 
 def wait_for_start_gates(world, vision, objective, robot=None, cmd=None, speed=None):
     start_time = time.time()
     stable = 0
     success_tracker = SuccessGateTracker(success_frames_required(objective))
+    success_seen = False
+    if robot:
+        robot.stop()
     while time.time() - start_time < START_GATE_TIMEOUT_S:
         update_world_from_vision(world, vision)
-        success_ok, _, _ = evaluate_gate_status(world, objective)
-        success_met = success_tracker.update(success_ok)
-        if success_ok and success_tracker.consecutive == 1 and robot:
+        success_ok, confidence = evaluate_gate_status(world, objective)
+        log_confidence(world, confidence, objective)
+        confidence_ok = success_ok and confidence >= SUCCESS_CONFIDENCE_MIN
+        success_met = success_tracker.update(confidence_ok)
+        if success_ok and not success_seen and robot:
             robot.stop()
+            success_seen = True
+        if not success_ok:
+            success_seen = False
         if success_met:
             if robot:
                 robot.stop()
@@ -904,21 +1148,13 @@ def wait_for_start_gates(world, vision, objective, robot=None, cmd=None, speed=N
             time.sleep(CONTROL_DT)
             continue
 
-        if robot and cmd and speed:
-            active_speed = adjust_speed_for_find_brick(world, objective, speed)
-            robot.send_command(cmd, active_speed)
-            evt = MotionEvent(
-                cmd_to_motion_type(cmd),
-                int(active_speed * 255),
-                int(CONTROL_DT * 1000),
-            )
-            world.update_from_motion(evt)
         brick_check = telemetry_brick.evaluate_start_gates(world, objective, {}, world.process_rules)
         wall_check = telemetry_wall.evaluate_start_gates(world, objective, world.wall_envelope)
         robot_check = telemetry_robot_module.evaluate_start_gates(world, objective, {}, world.process_rules)
         if brick_check.ok and wall_check.ok and robot_check.ok:
             stable += 1
             if stable >= GATE_STABILITY_FRAMES:
+                print(format_headline(f"[START] {objective} start gates met", COLOR_GREEN))
                 return "start"
         else:
             stable = 0
@@ -956,49 +1192,35 @@ def run_alignment_segment(segment, objective, robot, vision, world, steps, raw_s
         pause_after_fail(robot)
         return False, "start gates not met"
 
-    duration_s = sum(step.duration_s for step in steps)
-    if duration_s <= 0:
-        duration_s = START_GATE_TIMEOUT_S
-
+    objective_deadline = time.time() + MAX_OBJECTIVE_DURATION_S
     success_tracker = SuccessGateTracker(success_frames_required(objective))
-    fail_frames = 0
     last_cmd = None
     last_reason = None
-    start_time = time.time()
+    last_speed = None
 
-    while time.time() - start_time < duration_s:
+    while time.time() < objective_deadline:
         update_world_from_vision(world, vision)
-        success_ok, fail, reason = evaluate_gate_status(world, objective)
+        success_ok, confidence = evaluate_gate_status(world, objective)
+        log_confidence(world, confidence, objective)
+        confidence_ok = success_ok and confidence >= SUCCESS_CONFIDENCE_MIN
 
-        if fail:
-            fail_frames += 1
-            if fail_frames >= GATE_STABILITY_FRAMES:
-                if robot:
-                    robot.stop()
-                pause_after_fail(robot)
-                return False, reason or "fail gate"
-        else:
-            fail_frames = 0
-
-        success_met = success_tracker.update(success_ok)
-        if success_ok:
-            if success_tracker.consecutive == 1 and robot:
+        success_met = success_tracker.update(confidence_ok)
+        if success_met:
+            if robot:
                 robot.stop()
-            if success_met:
-                if robot:
-                    robot.stop()
-                print(format_headline(f"[SUCCESS] {objective} criteria met", COLOR_GREEN))
-                print(format_headline(format_success_details(world, objective), COLOR_WHITE))
-                time.sleep(3.0)
-                return True, "success gate"
-            time.sleep(CONTROL_DT)
-            continue
+            print(format_headline(f"[SUCCESS] {objective} criteria met", COLOR_GREEN))
+            print(format_headline(format_success_details(world, objective), COLOR_WHITE))
+            time.sleep(3.0)
+            return True, "success gate"
 
         cmd, speed, cmd_reason = alignment_command(world, objective, gate_bounds, action_speeds)
-        if cmd != last_cmd or cmd_reason != last_reason:
+        speed = apply_pursuit_speed(speed)
+        speed = apply_confidence_speed(speed, success_ok, confidence, world)
+        if cmd != last_cmd or cmd_reason != last_reason or speed != last_speed:
             print(format_headline(format_control_action_line(cmd, speed, cmd_reason), COLOR_WHITE))
             last_cmd = cmd
             last_reason = cmd_reason
+            last_speed = speed
 
         if cmd:
             robot.send_command(cmd, speed)
@@ -1015,15 +1237,14 @@ def run_alignment_segment(segment, objective, robot, vision, world, steps, raw_s
 
     if robot:
         robot.stop()
-    settle_start = time.time()
+    settle_deadline = min(objective_deadline, time.time() + SUCCESS_SETTLE_S)
     settle_tracker = SuccessGateTracker(success_frames_required(objective))
-    while time.time() - settle_start < SUCCESS_SETTLE_S:
+    while time.time() < settle_deadline:
         update_world_from_vision(world, vision)
-        success_ok, fail, reason = evaluate_gate_status(world, objective)
-        if fail:
-            pause_after_fail(robot)
-            return False, reason or "fail gate"
-        success_met = settle_tracker.update(success_ok)
+        success_ok, confidence = evaluate_gate_status(world, objective)
+        log_confidence(world, confidence, objective)
+        confidence_ok = success_ok and confidence >= SUCCESS_CONFIDENCE_MIN
+        success_met = settle_tracker.update(confidence_ok)
         if success_met:
             print(format_headline(f"[SUCCESS] {objective} criteria met", COLOR_GREEN))
             print(format_headline(format_success_details(world, objective), COLOR_WHITE))
@@ -1031,10 +1252,13 @@ def run_alignment_segment(segment, objective, robot, vision, world, steps, raw_s
             return True, "success gate"
 
         cmd, speed, cmd_reason = alignment_command(world, objective, gate_bounds, action_speeds)
-        if cmd != last_cmd or cmd_reason != last_reason:
+        speed = apply_pursuit_speed(speed)
+        speed = apply_confidence_speed(speed, success_ok, confidence, world)
+        if cmd != last_cmd or cmd_reason != last_reason or speed != last_speed:
             print(format_headline(format_control_action_line(cmd, speed, cmd_reason), COLOR_WHITE))
             last_cmd = cmd
             last_reason = cmd_reason
+            last_speed = speed
 
         if cmd:
             robot.send_command(cmd, speed)
@@ -1082,8 +1306,8 @@ def replay_segment(segment, objective, robot, vision, world):
 
     allow_early_exit = True
 
+    objective_deadline = time.time() + MAX_OBJECTIVE_DURATION_S
     success_tracker = SuccessGateTracker(success_frames_required(objective))
-    fail_frames = 0
     last_action = None
     last_cmd = default_step.cmd
     last_speed_base = default_step.speed
@@ -1091,39 +1315,36 @@ def replay_segment(segment, objective, robot, vision, world):
     for step in steps:
         if step.label != last_action:
             update_world_from_vision(world, vision)
-            print(format_headline(format_action_line(step, target_visible), COLOR_WHITE))
+            print(
+                format_headline(
+                    format_action_line(step, target_visible, reason="replaying demo action"),
+                    COLOR_WHITE,
+                )
+            )
             last_action = step.label
         last_cmd = step.cmd
         last_speed_base = step.speed
         step_start = time.time()
         while time.time() - step_start < step.duration_s:
+            if time.time() >= objective_deadline:
+                break
             update_world_from_vision(world, vision)
-            success_ok, fail, reason = evaluate_gate_status(world, objective)
+            success_ok, confidence = evaluate_gate_status(world, objective)
+            confidence_ok = success_ok and confidence >= SUCCESS_CONFIDENCE_MIN
+            log_confidence(world, confidence, objective)
 
             if allow_early_exit:
-                if fail:
-                    fail_frames += 1
-                    if fail_frames >= GATE_STABILITY_FRAMES:
-                        robot.stop()
-                        pause_after_fail(robot)
-                        return False, reason or "fail gate"
-                else:
-                    fail_frames = 0
-
-                success_met = success_tracker.update(success_ok)
-                if success_ok and success_tracker.consecutive == 1:
-                    robot.stop()
+                success_met = success_tracker.update(confidence_ok)
                 if success_met:
                     robot.stop()
                     print(format_headline(f"[SUCCESS] {objective} criteria met 🎉", COLOR_GREEN))
                     print(format_headline(format_success_details(world, objective), COLOR_WHITE))
                     time.sleep(3.0)
                     return True, "success gate"
-                if success_ok:
-                    time.sleep(CONTROL_DT)
-                    continue
 
             active_speed = adjust_speed_for_find_brick(world, objective, step.speed)
+            active_speed = apply_pursuit_speed(active_speed)
+            active_speed = apply_confidence_speed(active_speed, success_ok, confidence, world)
             robot.send_command(step.cmd, active_speed)
             evt = MotionEvent(
                 cmd_to_motion_type(step.cmd),
@@ -1132,17 +1353,18 @@ def replay_segment(segment, objective, robot, vision, world):
             )
             world.update_from_motion(evt)
             time.sleep(CONTROL_DT)
+        if time.time() >= objective_deadline:
+            break
 
     robot.stop()
-    settle_start = time.time()
+    settle_deadline = min(objective_deadline, time.time() + SUCCESS_SETTLE_S)
     settle_tracker = SuccessGateTracker(success_frames_required(objective))
-    while time.time() - settle_start < SUCCESS_SETTLE_S:
+    while time.time() < settle_deadline:
         update_world_from_vision(world, vision)
-        success_ok, fail, reason = evaluate_gate_status(world, objective)
-        if fail and allow_early_exit:
-            pause_after_fail(robot)
-            return False, reason or "fail gate"
-        success_met = settle_tracker.update(success_ok)
+        success_ok, confidence = evaluate_gate_status(world, objective)
+        confidence_ok = success_ok and confidence >= SUCCESS_CONFIDENCE_MIN
+        log_confidence(world, confidence, objective)
+        success_met = settle_tracker.update(confidence_ok)
         if success_met:
             print(format_headline(f"[SUCCESS] {objective} criteria met 🎉", COLOR_GREEN))
             print(format_headline(format_success_details(world, objective), COLOR_WHITE))
@@ -1150,6 +1372,8 @@ def replay_segment(segment, objective, robot, vision, world):
             return True, "success gate"
         if last_cmd:
             active_speed = adjust_speed_for_find_brick(world, objective, last_speed_base)
+            active_speed = apply_pursuit_speed(active_speed)
+            active_speed = apply_confidence_speed(active_speed, success_ok, confidence, world)
             robot.send_command(last_cmd, active_speed)
             evt = MotionEvent(
                 cmd_to_motion_type(last_cmd),
@@ -1158,6 +1382,34 @@ def replay_segment(segment, objective, robot, vision, world):
             )
             world.update_from_motion(evt)
         time.sleep(CONTROL_DT)
+
+    if time.time() < objective_deadline:
+        tail_tracker = SuccessGateTracker(success_frames_required(objective))
+        while time.time() < objective_deadline:
+            update_world_from_vision(world, vision)
+            success_ok, confidence = evaluate_gate_status(world, objective)
+            confidence_ok = success_ok and confidence >= SUCCESS_CONFIDENCE_MIN
+            log_confidence(world, confidence, objective)
+            success_met = tail_tracker.update(confidence_ok)
+            if success_met:
+                if robot:
+                    robot.stop()
+                print(format_headline(f"[SUCCESS] {objective} criteria met 🎉", COLOR_GREEN))
+                print(format_headline(format_success_details(world, objective), COLOR_WHITE))
+                time.sleep(3.0)
+                return True, "success gate"
+            if last_cmd:
+                active_speed = adjust_speed_for_find_brick(world, objective, last_speed_base)
+                active_speed = apply_pursuit_speed(active_speed)
+                active_speed = apply_confidence_speed(active_speed, success_ok, confidence, world)
+                robot.send_command(last_cmd, active_speed)
+                evt = MotionEvent(
+                    cmd_to_motion_type(last_cmd),
+                    int(active_speed * 255),
+                    int(CONTROL_DT * 1000),
+                )
+                world.update_from_motion(evt)
+            time.sleep(CONTROL_DT)
 
     pause_after_fail(robot)
     return False, "success gate not reached"
@@ -1204,10 +1456,9 @@ def run_autobuild(session_name=None):
                     f"(attempt {attempts + 1}/{MAX_PHASE_ATTEMPTS}; demo {seg_type})"
                 )
                 print(format_headline(header, COLOR_GREEN))
-                start_desc, success_desc, fail_desc = format_gate_lines(cfg)
+                start_desc, success_desc = format_gate_lines(cfg)
                 print(f"  start gates: {start_desc}")
                 print(f"  success gates: {success_desc}")
-                print(f"  fail gates: {fail_desc}")
                 ok, reason = replay_segment(segment, normalized, robot, vision, world)
                 if ok:
                     break

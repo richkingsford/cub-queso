@@ -18,6 +18,7 @@ class Robot:
         # --- PHYSICAL CONSTANTS (Copied from your Xbox Config) ---
         self.MIN_PWM = 60   # Motors won't turn below this
         self.MAX_PWM = 255
+        self.MIN_TURN_POWER = 0.23
         self.CMD_DURATION = 100 # ms (Keep it running slightly longer for smooth auto-drive)
         
         self.connect()
@@ -48,14 +49,18 @@ class Robot:
         cmd_char: f, b, l, r, u, d
         speed: 0.0 to 1.0
         """
+        speed = abs(speed)
+
         # 1. Deadzone check (implied stop)
-        if abs(speed) < 0.05:
+        if speed < 0.05:
             # For safety, sending 0 speed usually stops that action
             self._send(f"{cmd_char} 0 {self.CMD_DURATION}\n")
             return
+        if cmd_char in ('l', 'r') and speed < self.MIN_TURN_POWER:
+            speed = self.MIN_TURN_POWER
 
         # 2. Scale to PWM
-        pwm = int(self.MIN_PWM + (self.MAX_PWM - self.MIN_PWM) * abs(speed))
+        pwm = int(self.MIN_PWM + (self.MAX_PWM - self.MIN_PWM) * speed)
         pwm = min(pwm, 255)
 
         # 3. Hardware Inversion Correction

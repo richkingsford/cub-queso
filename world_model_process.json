@@ -5,7 +5,16 @@
             "success_gates": {
                 "visible": {
                     "min": true
+                },
+                "duration_s": {
+                    "target": 5.23,
+                    "tol": 0.0
                 }
+            },
+            "movement_learnings": {
+                "cmd": "r",
+                "duration_s": 1.7,
+                "speed": 0.32
             }
         },
         "EXIT_WALL": {
@@ -18,7 +27,16 @@
             "success_gates": {
                 "visible": {
                     "min": false
+                },
+                "duration_s": {
+                    "target": 5.33,
+                    "tol": 0.0
                 }
+            },
+            "movement_learnings": {
+                "cmd": "r",
+                "duration_s": 0.6,
+                "speed": 0.32
             }
         },
         "FIND_BRICK": {
@@ -26,7 +44,16 @@
             "success_gates": {
                 "visible": {
                     "min": true
+                },
+                "duration_s": {
+                    "target": 3.26,
+                    "tol": 0.0
                 }
+            },
+            "movement_learnings": {
+                "cmd": "r",
+                "duration_s": 0.9,
+                "speed": 0.32
             }
         },
         "ALIGN_BRICK": {
@@ -40,22 +67,29 @@
                     "min": true
                 },
                 "angle_abs": {
-                    "target": 3.84,
-                    "tol": 0.28
+                    "target": 3.73,
+                    "tol": 1.15
                 },
                 "offset_abs": {
-                    "target": 4.7,
-                    "tol": 0.26
+                    "target": 4.9,
+                    "tol": 1.93
                 },
                 "dist": {
-                    "target": 61.85,
-                    "tol": 0.02
+                    "target": 60.97,
+                    "tol": 2.64
+                },
+                "duration_s": {
+                    "target": 9.13,
+                    "tol": 5.5
                 }
+            },
+            "movement_learnings": {
+                "cmd": "l",
+                "duration_s": 0.9,
+                "speed": 0.23
             }
         },
-        "SCOOP": {
-            "nominalDemosOnly": true
-        },
+        "SCOOP": {},
         "FIND_WALL2": {},
         "POSITION_BRICK": {},
         "PLACE": {},
