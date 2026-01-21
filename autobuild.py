@@ -45,7 +45,11 @@ SMOOTH_SPEED = PURSUIT_SPEED
 SMOOTH_STEP_S = 1.0
 DURATION_SCALE = 3.0
 FAIL_PAUSE_S = 3.0
+FAIL_PAUSE_S = 3.0
 FIND_BRICK_SLOW_FACTOR = 4.0
+MIN_ALIGN_SPEED = 0.2
+MAX_ALIGN_SPEED = 0.35
+VISIBILITY_LOST_HOLD_S = 0.5
 
 SUCCESS_FRAMES_BY_OBJECTIVE = {
     "FIND_BRICK": 3,
@@ -345,14 +349,14 @@ def format_action_line(step, target_visible, reason=None):
             stop_clause = "until brick is no longer visible"
         suffix = f"for {duration}s or {stop_clause}"
     reason = str(reason).strip() if reason else ""
-    reason_suffix = f" (because {reason})" if reason else ""
+    reason_suffix = f" ({reason})" if reason else ""
     return f"[ACT] {action} at {power} power {suffix}{reason_suffix}"
 
 
 def format_control_action_line(cmd, speed, reason=None):
     action = ACTION_CMD_DESC.get(cmd, "moving") if cmd else "holding position"
     reason = str(reason).strip() if reason else ""
-    reason_suffix = f" (because {reason})" if reason else ""
+    reason_suffix = f" ({reason})" if reason else ""
     if cmd:
         return f"[ACT] {action} at {speed:.2f} power{reason_suffix}"
     return f"[ACT] {action}{reason_suffix}"
@@ -415,36 +419,63 @@ def recent_turn_preference(world, max_age_s):
 def alignment_command(world, objective, gate_bounds, speeds):
     brick = world.brick or {}
     if not brick.get("visible"):
+        # Hold still for a moment if we just lost it
+        last_seen = getattr(world, "last_visible_time", None)
+        if last_seen is not None and (time.time() - last_seen) < VISIBILITY_LOST_HOLD_S:
+            return None, 0.0, "waiting for brick visibility"
+
         scan_cmd = recent_turn_preference(world, telemetry_brick.VISIBILITY_LOST_GRACE_S)
         if scan_cmd is None:
             scan_cmd = telemetry_robot_module.resolve_scan_direction(world.process_rules, objective)
         return scan_cmd, speeds["scan"], "scanning for brick visibility"
 
+    # Calculate ratios to find the most egregious error
     offset_max = (gate_bounds.get("offset_abs") or {}).get("max")
     offset_x = brick.get("offset_x") or 0.0
-    if offset_max is not None and abs(offset_x) > offset_max:
-        offset_dir = "right" if offset_x > 0 else "left"
-        cmd = "r" if offset_x > 0 else "l"
-        return cmd, speeds["turn"], f"closing {offset_dir} offset of {abs(offset_x):.2f}mm"
+    offset_ratio = 0.0
+    if offset_max is not None:
+        if offset_max > 0:
+            offset_ratio = abs(offset_x) / offset_max
+        elif abs(offset_x) > 0:
+            offset_ratio = float('inf')
 
     angle_max = (gate_bounds.get("angle_abs") or {}).get("max")
     angle = brick.get("angle") or 0.0
-    if angle_max is not None and abs(angle) > angle_max:
+    angle_ratio = 0.0
+    if angle_max is not None:
+        if angle_max > 0:
+            angle_ratio = abs(angle) / angle_max
+        elif abs(angle) > 0:
+            angle_ratio = float('inf')
+
+    # If both are valid (ratio <= 1.0), check distance
+    if offset_ratio <= 1.0 and angle_ratio <= 1.0:
+        dist = brick.get("dist")
+        dist_bounds = gate_bounds.get("dist") or {}
+        dist_min = dist_bounds.get("min")
+        dist_max = dist_bounds.get("max")
+        if dist is not None:
+            if dist_max is not None and dist > dist_max:
+                return "f", speeds["forward"], f"closing distance long by {abs(dist - dist_max):.1f}mm"
+            if dist_min is not None and dist < dist_min:
+                return "b", speeds["backward"], f"closing distance short by {abs(dist_min - dist):.1f}mm"
+        return None, 0.0, "within success gates"
+
+    # Determine Dynamic Speed
+    max_ratio = max(offset_ratio, angle_ratio)
+    # Map ratio 1.0 -> MIN_SPEED, ratio 3.0 -> MAX_SPEED
+    speed_factor = max(0.0, min(1.0, (max_ratio - 1.0) / 2.0))
+    dynamic_speed = MIN_ALIGN_SPEED + (MAX_ALIGN_SPEED - MIN_ALIGN_SPEED) * speed_factor
+
+    # Prioritize the most egregious error
+    if offset_ratio >= angle_ratio:
+        offset_dir = "right" if offset_x > 0 else "left"
+        cmd = "r" if offset_x > 0 else "l"
+        return cmd, dynamic_speed, f"closing {offset_dir} offset of {abs(offset_x):.2f}mm (ratio {offset_ratio:.2f})"
+    else:
         angle_dir = "right" if angle > 0 else "left"
         cmd = "r" if angle > 0 else "l"
-        return cmd, speeds["turn"], f"closing {angle_dir} angle of {abs(angle):.2f}deg"
-
-    dist = brick.get("dist")
-    dist_bounds = gate_bounds.get("dist") or {}
-    dist_min = dist_bounds.get("min")
-    dist_max = dist_bounds.get("max")
-    if dist is not None:
-        if dist_max is not None and dist > dist_max:
-            return "f", speeds["forward"], f"closing distance long by {abs(dist - dist_max):.1f}mm"
-        if dist_min is not None and dist < dist_min:
-            return "b", speeds["backward"], f"closing distance short by {abs(dist_min - dist):.1f}mm"
-
-    return None, 0.0, "within success gates"
+        return cmd, dynamic_speed, f"closing {angle_dir} angle of {abs(angle):.2f}deg (ratio {angle_ratio:.2f})"
 
 
 def adjust_speed_for_find_brick(world, objective, speed):
