@@ -11,7 +11,7 @@ from pathlib import Path
 # Fix relative imports
 sys.path.append(str(Path(__file__).parent))
 
-from train_brick_vision import BrickDetector
+from helper_brick_vision import BrickDetector
 from helper_stream_server import StreamServer, format_stream_url
 
 WORLD_MODEL_BRICK_FILE = Path(__file__).parent / "world_model_brick.json"

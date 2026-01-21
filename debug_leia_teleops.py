@@ -16,8 +16,8 @@ import enum
 from flask import Flask, Response
 
 # Import our capabilities
-from robot_control import Robot
-from train_brick_vision import BrickDetector
+from helper_robot_control import Robot
+from helper_brick_vision import BrickDetector
 from telemetry_robot import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
 
 # --- CONFIG ---

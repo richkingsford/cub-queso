@@ -8,7 +8,7 @@ from pathlib import Path
 
 from helper_demo_log_utils import extract_attempt_segments, load_demo_logs, normalize_objective_label
 from helper_vision_aruco import ArucoBrickVision
-from robot_control import Robot
+from helper_robot_control import Robot
 from telemetry_robot import MotionEvent, ObjectiveState, WorldModel
 import telemetry_brick
 import telemetry_robot as telemetry_robot_module
@@ -607,6 +607,63 @@ def derive_success_gates(success_segments, scale_by_objective=None, objective_ru
     return success_gates
 
 
+def _mean(values):
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _stdev(values, mean_val=None):
+    if not values:
+        return None
+    if len(values) < 2:
+        return 0.0
+    if mean_val is None:
+        mean_val = _mean(values)
+    var = sum((val - mean_val) ** 2 for val in values) / len(values)
+    return math.sqrt(var)
+
+
+def derive_failure_gates(fail_segments, objective_rules=None):
+    metrics_by_obj = objective_metrics_map()
+    failure_gates = {}
+    for obj, segs in fail_segments.items():
+        metrics = success_gate_metrics_for_objective(
+            metrics_by_obj.get(obj, []),
+            obj,
+            objective_rules,
+        )
+        metrics = [metric for metric in metrics if metric != "visible"]
+        if not metrics:
+            continue
+
+        metric_values = {metric: [] for metric in metrics}
+        for seg in segs:
+            for state in select_tail_states(seg.get("states") or []):
+                for metric in metrics:
+                    value = metric_value_from_state(state, metric)
+                    if value is None:
+                        continue
+                    metric_values[metric].append(value)
+
+        obj_gates = {}
+        for metric, values in metric_values.items():
+            if not values:
+                continue
+            mean_val = _mean(values)
+            sigma = _stdev(values, mean_val)
+            if mean_val is None or sigma is None:
+                continue
+            obj_gates[metric] = {
+                "mu": round_value(mean_val),
+                "sigma": round_value(sigma),
+            }
+
+        if obj_gates:
+            failure_gates[obj] = obj_gates
+    return failure_gates
+
+
 def update_process_model_from_demos(logs, path=PROCESS_MODEL_FILE):
     model = load_process_model(path)
     objectives = model.get("objectives")
@@ -619,6 +676,11 @@ def update_process_model_from_demos(logs, path=PROCESS_MODEL_FILE):
         obj: segs.get("SUCCESS", [])
         for obj, segs in segments_by_obj.items()
         if segs.get("SUCCESS")
+    }
+    fail_segments = {
+        obj: segs.get("FAIL", [])
+        for obj, segs in segments_by_obj.items()
+        if segs.get("FAIL")
     }
 
     start_gates = derive_start_gates(success_segments)
@@ -634,10 +696,15 @@ def update_process_model_from_demos(logs, path=PROCESS_MODEL_FILE):
         success_gate_scales,
         objective_rules,
     )
+    failure_gates = derive_failure_gates(
+        fail_segments,
+        objective_rules,
+    )
 
     all_objectives = set(objectives.keys())
     all_objectives.update(start_gates.keys())
     all_objectives.update(success_gates.keys())
+    all_objectives.update(failure_gates.keys())
     all_objectives.update(attempt_types.keys())
 
     for obj in all_objectives:
@@ -652,6 +719,10 @@ def update_process_model_from_demos(logs, path=PROCESS_MODEL_FILE):
             cfg["success_gates"] = success_gates[obj]
         else:
             cfg.pop("success_gates", None)
+        if obj in failure_gates:
+            cfg["fail_gates"] = failure_gates[obj]
+        else:
+            cfg.pop("fail_gates", None)
         visible_gate = cfg.get("success_gates", {}).get("visible", {})
         if visible_gate.get("min") is False:
             cfg["success_gates"] = {"visible": {"min": False}}

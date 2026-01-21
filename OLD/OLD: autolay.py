@@ -11,8 +11,8 @@ import numpy as np
 from flask import Flask, Response
 from pathlib import Path
 
-from robot_control import Robot
-from train_brick_vision import BrickDetector
+from helper_robot_control import Robot
+from helper_brick_vision import BrickDetector
 from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
 
 # --- CONFIG ---

@@ -3,9 +3,9 @@
 -------------
 The "Manager". It sets up the hardware and assigns the current task.
 """
-from train_brick_vision import BrickDetector
+from helper_brick_vision import BrickDetector
 # Assuming your hardware driver is saved here:
-from robot_control import Robot 
+from helper_robot_control import Robot 
 import debug_maneuvers as maneuvers
 import time
 import shutil

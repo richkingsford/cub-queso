@@ -10,7 +10,7 @@ from enum import Enum
 from pathlib import Path
 
 from helper_demo_log_utils import extract_attempt_segments, load_demo_logs, normalize_objective_label
-from robot_control import Robot
+from helper_robot_control import Robot
 import telemetry_brick
 import telemetry_robot as telemetry_robot_module
 import telemetry_wall

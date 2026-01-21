@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from robot_control import Robot
+from helper_robot_control import Robot
 
 ACTION_SEQUENCE = [
     {"label": "FORWARD", "cmd": "f", "measure": "mm"},

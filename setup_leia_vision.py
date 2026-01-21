@@ -10,7 +10,7 @@ from pathlib import Path
 # Setup path
 sys.path.append(str(Path(__file__).parent))
 
-from vision_leia import LeiaVision
+from helper_vision_leia import LeiaVision
 from helper_stream_server import StreamServer, format_stream_url
 
 class LeiaApp:

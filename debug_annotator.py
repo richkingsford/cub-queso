@@ -12,13 +12,16 @@ from pathlib import Path
 # --- CONFIG ---
 # Make sure you create this folder and put your selected photos in it!
 DATASET_DIR = Path(__file__).parent / "photos" / "angled_bricks_subset"
-OUTPUT_FILE = Path(__file__).parent / "brick_database.json"
+WORLD_MODEL_BRICK_FILE = Path(__file__).parent / "world_model_brick.json"
+LEGACY_DB_FILE = Path(__file__).parent / "brick_database.json"
+DB_KEY = "brick_database"
 
 # Global state
 current_points = []
 current_img = None
 display_img = None
 database = {}
+world_model = {}
 
 def click_event(event, x, y, flags, params):
     global current_points, display_img, current_img
@@ -46,28 +49,57 @@ def redraw():
 
     cv2.imshow("Annotator V3", display_img)
 
-def load_database():
-    if OUTPUT_FILE.exists():
+def load_world_model():
+    if WORLD_MODEL_BRICK_FILE.exists():
         try:
-            with open(OUTPUT_FILE, 'r') as f:
+            with open(WORLD_MODEL_BRICK_FILE, 'r') as f:
                 return json.load(f)
-        except: return {}
+        except Exception:
+            return {}
     return {}
 
+
+def save_world_model(model):
+    with open(WORLD_MODEL_BRICK_FILE, 'w') as f:
+        json.dump(model, f, indent=4)
+
+
+def load_database():
+    model = load_world_model()
+    db = model.get(DB_KEY)
+    if isinstance(db, dict):
+        return model, db
+
+    legacy = {}
+    if LEGACY_DB_FILE.exists():
+        try:
+            with open(LEGACY_DB_FILE, 'r') as f:
+                legacy = json.load(f)
+        except Exception:
+            legacy = {}
+
+    if legacy:
+        model[DB_KEY] = legacy
+        save_world_model(model)
+        return model, legacy
+
+    model[DB_KEY] = {}
+    return model, model[DB_KEY]
+
 def save_database():
-    with open(OUTPUT_FILE, 'w') as f:
-        json.dump(database, f, indent=4)
+    world_model[DB_KEY] = database
+    save_world_model(world_model)
     print("Database saved.")
 
 def main():
-    global display_img, current_img, current_points, database
+    global display_img, current_img, current_points, database, world_model
 
     if not DATASET_DIR.exists():
         print(f"Error: Folder not found: {DATASET_DIR}")
         print("Please create the folder 'angled_bricks_subset' inside 'photos' and copy your selected images there.")
         return
 
-    database = load_database()
+    world_model, database = load_database()
     
     all_files = sorted(list(DATASET_DIR.glob("*.jpg")) + list(DATASET_DIR.glob("*.png")))
     # Filter 0deg

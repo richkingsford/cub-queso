@@ -187,6 +187,64 @@ MOTION_EVENT_TYPES = {
 
 WORLD_MODEL_PROCESS_FILE = Path(__file__).parent / "world_model_process.json"
 WORLD_MODEL_BRICK_FILE = Path(__file__).parent / "world_model_brick.json"
+WORLD_MODEL_MOTION_FILE = Path(__file__).parent / "world_model_motion.json"
+
+DEFAULT_MM_PER_SEC_FULL_SPEED = 200.0
+DEFAULT_DEG_PER_SEC_FULL_SPEED = 90.0
+DEFAULT_LIFT_MM_PER_SEC = 23.5
+DEFAULT_MOTION_TICK_MS = 100.0
+
+
+def _coerce_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_motion_calibration(path=WORLD_MODEL_MOTION_FILE):
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    motion = (data.get("calibration") or {}).get("motion") or {}
+    return motion if isinstance(motion, dict) else {}
+
+
+def motion_speeds_from_calibration(motion):
+    if not isinstance(motion, dict):
+        motion = {}
+
+    mm_per_sec = _coerce_float(motion.get("mm_per_sec_full_speed"))
+    deg_per_sec = _coerce_float(motion.get("deg_per_sec_full_speed"))
+    lift_per_sec = _coerce_float(motion.get("mm_per_sec_mast"))
+
+    tick_ms = _coerce_float(
+        motion.get("tick_ms")
+        or motion.get("command_duration_ms")
+        or motion.get("cmd_duration_ms")
+    )
+    if tick_ms is None or tick_ms <= 0:
+        tick_ms = DEFAULT_MOTION_TICK_MS
+    tick_s = tick_ms / 1000.0
+
+    if mm_per_sec is None:
+        mm_per_tick = _coerce_float(motion.get("mm_per_tick"))
+        if mm_per_tick is not None:
+            mm_per_sec = mm_per_tick / tick_s
+    if deg_per_sec is None:
+        deg_per_tick = _coerce_float(motion.get("deg_per_tick"))
+        if deg_per_tick is not None:
+            deg_per_sec = deg_per_tick / tick_s
+    if lift_per_sec is None:
+        mm_per_tick_mast = _coerce_float(motion.get("mm_per_tick_mast"))
+        if mm_per_tick_mast is not None:
+            lift_per_sec = mm_per_tick_mast / tick_s
+
+    return mm_per_sec, deg_per_sec, lift_per_sec
 
 def _load_process_objective_names():
     if not WORLD_MODEL_PROCESS_FILE.exists():
@@ -288,9 +346,17 @@ class WorldModel:
         self.last_image_file = None
         
         # Internal physics constants for dead reckoning (Calibration needed!)
-        self.mm_per_sec_full_speed = 200.0 
-        self.deg_per_sec_full_speed = 90.0
-        self.lift_mm_per_sec = 23.5 # Adjusted for better dead reckoning
+        self.mm_per_sec_full_speed = DEFAULT_MM_PER_SEC_FULL_SPEED
+        self.deg_per_sec_full_speed = DEFAULT_DEG_PER_SEC_FULL_SPEED
+        self.lift_mm_per_sec = DEFAULT_LIFT_MM_PER_SEC
+        motion = load_motion_calibration()
+        mm_per_sec, deg_per_sec, lift_per_sec = motion_speeds_from_calibration(motion)
+        if mm_per_sec is not None:
+            self.mm_per_sec_full_speed = mm_per_sec
+        if deg_per_sec is not None:
+            self.deg_per_sec_full_speed = deg_per_sec
+        if lift_per_sec is not None:
+            self.lift_mm_per_sec = lift_per_sec
         self.lift_height_anchor = None # The Vision height at Mast=0mm
 
     @property

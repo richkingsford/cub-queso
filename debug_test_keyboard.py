@@ -18,8 +18,8 @@ import termios
 import cv2
 import numpy as np
 from flask import Flask, Response
-from robot_control import Robot
-from train_brick_vision import BrickDetector
+from helper_robot_control import Robot
+from helper_brick_vision import BrickDetector
 from telemetry_robot import WorldModel, MotionEvent, draw_telemetry_overlay
 
 # --- CONFIG ---

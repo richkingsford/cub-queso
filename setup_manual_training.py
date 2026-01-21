@@ -6,7 +6,7 @@ import tty
 import termios
 from pathlib import Path
 
-from robot_control import Robot
+from helper_robot_control import Robot
 from helper_demo_log_utils import prune_log_file
 from helper_stream_server import StreamServer, format_stream_url
 from helper_vision_aruco import ArucoBrickVision
