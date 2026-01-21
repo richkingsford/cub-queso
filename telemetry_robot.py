@@ -8,6 +8,7 @@ import math
 import os
 import threading
 import time
+import collections
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -363,6 +364,8 @@ class WorldModel:
         if lift_per_sec is not None:
             self.lift_mm_per_sec = lift_per_sec
         self.lift_height_anchor = None # The Vision height at Mast=0mm
+        
+        self.action_history = collections.deque(maxlen=100)
 
     @property
     def objective_state(self):
@@ -394,6 +397,32 @@ class WorldModel:
         delta = update_from_motion(self, event)
         telemetry_brick.update_from_motion(self, event, delta)
         telemetry_wall.update_from_motion(self, delta, self.wall_envelope)
+        self.action_history.append(event)
+
+    def get_recent_net_forward_mm(self, window_s=5.0):
+        """
+        Calculates net forward distance (Forward - Backward) in the last window_s seconds.
+        """
+        now = time.time()
+        cutoff = now - window_s
+        net_dist = 0.0
+        
+        for event in reversed(self.action_history):
+            if event.timestamp < cutoff:
+                break
+                
+            dist = 0.0
+            dt = event.duration_ms / 1000.0
+            power_ratio = event.power / 255.0
+            
+            if event.action_type == "forward":
+                dist = self.mm_per_sec_full_speed * power_ratio * dt
+                net_dist += dist
+            elif event.action_type == "backward":
+                dist = self.mm_per_sec_full_speed * power_ratio * dt
+                net_dist -= dist
+                
+        return net_dist
 
     def update_vision(self, found, dist, angle, conf, offset_x=0, cam_h=0, brick_above=False, brick_below=False):
         brick_height = telemetry_brick.update_from_vision(

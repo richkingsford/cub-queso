@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import collections
 import math
 import time
 from dataclasses import dataclass, field
@@ -13,6 +14,10 @@ from telemetry_robot import MotionEvent, ObjectiveState, WorldModel
 import telemetry_brick
 import telemetry_robot as telemetry_robot_module
 import telemetry_wall
+import helper_learning
+
+USE_LEARNED_POLICY = False
+GLOBAL_POLICY = None
 
 
 DEMO_DIR = Path(__file__).resolve().parent / "demos"
@@ -30,7 +35,7 @@ CONFIDENCE_LOG_MIN = 0.5
 SUCCESS_CONFIRMATION_S = 0.35
 SUCCESS_CONFIRMATION_FRAMES = 4
 SUCCESS_CONFIRMATION_START_CONFIDENCE = 0.5
-PURSUIT_SPEED = 0.24
+PURSUIT_SPEED = 0.32
 SUCCESS_CONFIRMATION_SLOW_SPEED = 0.0
 SUSPECT_SPEED = 0.6
 MAX_OBJECTIVE_DURATION_S = 20.0
@@ -45,11 +50,14 @@ SMOOTH_SPEED = PURSUIT_SPEED
 SMOOTH_STEP_S = 1.0
 DURATION_SCALE = 3.0
 FAIL_PAUSE_S = 3.0
-FAIL_PAUSE_S = 3.0
 FIND_BRICK_SLOW_FACTOR = 4.0
 MIN_ALIGN_SPEED = 0.2
-MAX_ALIGN_SPEED = 0.35
+MAX_ALIGN_SPEED = 0.28
+MICRO_ALIGN_SPEED = 0.21
+MICRO_ALIGN_OFFSET_MM = 10.0
+MICRO_ALIGN_ANGLE_DEG = 5.0
 VISIBILITY_LOST_HOLD_S = 0.5
+LEARNED_POLICY_CONFIDENCE_THRESHOLD = 0.4
 
 SUCCESS_FRAMES_BY_OBJECTIVE = {
     "FIND_BRICK": 3,
@@ -61,7 +69,10 @@ ALIGNMENT_METRICS = {"angle_abs", "offset_abs", "dist"}
 COLOR_RESET = "\033[0m"
 COLOR_GREEN = "\033[32m"
 COLOR_RED = "\033[31m"
+COLOR_GREEN = "\033[32m"
+COLOR_RED = "\033[31m"
 COLOR_WHITE = "\033[37m"
+COLOR_GRAY = "\033[90m"
 
 
 ACTION_CMD_MAP = {
@@ -349,14 +360,15 @@ def format_action_line(step, target_visible, reason=None):
             stop_clause = "until brick is no longer visible"
         suffix = f"for {duration}s or {stop_clause}"
     reason = str(reason).strip() if reason else ""
-    reason_suffix = f" ({reason})" if reason else ""
+    # Make reason gray
+    reason_suffix = f" {COLOR_GRAY}({reason}){COLOR_RESET}" if reason else ""
     return f"[ACT] {action} at {power} power {suffix}{reason_suffix}"
 
 
 def format_control_action_line(cmd, speed, reason=None):
     action = ACTION_CMD_DESC.get(cmd, "moving") if cmd else "holding position"
     reason = str(reason).strip() if reason else ""
-    reason_suffix = f" ({reason})" if reason else ""
+    reason_suffix = f" {COLOR_GRAY}({reason}){COLOR_RESET}" if reason else ""
     if cmd:
         return f"[ACT] {action} at {speed:.2f} power{reason_suffix}"
     return f"[ACT] {action}{reason_suffix}"
@@ -417,17 +429,67 @@ def recent_turn_preference(world, max_age_s):
 
 
 def alignment_command(world, objective, gate_bounds, speeds):
+    # Backtrack Queue Management
+    backtrack_queue = getattr(world, "backtrack_queue", None)
+    if backtrack_queue is None:
+        backtrack_queue = collections.deque()
+        setattr(world, "backtrack_queue", backtrack_queue)
+
     brick = world.brick or {}
     if not brick.get("visible"):
-        # Hold still for a moment if we just lost it
+        # Hold still for a moment to confirm loss
         last_seen = getattr(world, "last_visible_time", None)
         if last_seen is not None and (time.time() - last_seen) < VISIBILITY_LOST_HOLD_S:
             return None, 0.0, "waiting for brick visibility"
+
+        # 1. If we have a queue, execute it
+        if backtrack_queue:
+            cmd, speed = backtrack_queue.popleft()
+            return cmd, speed, f"backtracking: replaying history ({len(backtrack_queue)} steps remaining)"
+
+        # 2. If no queue, generate one from history (Last 5 seconds)
+        # Only do this ONCE when we first realized we're lost and strictly need to recover
+        # To avoid constant re-generation, check if we just finished a queue? 
+        # Actually, if the queue is empty, we check history. If history is empty, we default to scan.
+        # But we need to be careful not to infinite loop. 
+        # Let's say we only generate if we haven't backtracked recently?
+        # Or simpler: if we are lost, we generate the queue once.
+        # We need a flag "actions_inverted".
+        
+        # Heuristic: If we moved > 20mm forward recently, trigger the rewind.
+        if world.get_recent_net_forward_mm(window_s=5.0) > 10.0:  # Lower threshold for sensitivity
+             now = time.time()
+             # Get events from last 5s
+             # History is oldest->newest. We want newest->oldest (reversed)
+             for evt in reversed(world.action_history):
+                 if (now - evt.timestamp) > 5.0:
+                     break
+                 
+                 # Invert Logic
+                 inv_cmd = None
+                 if evt.action_type == "forward": inv_cmd = "b"
+                 elif evt.action_type == "backward": inv_cmd = "f"
+                 elif evt.action_type == "left_turn": inv_cmd = "r"
+                 elif evt.action_type == "right_turn": inv_cmd = "l"
+                 
+                 if inv_cmd:
+                     # Speed estimation: power / 255.0
+                     speed = evt.power / 255.0
+                     # Add to queue
+                     backtrack_queue.append((inv_cmd, speed))
+             
+             if backtrack_queue:
+                 cmd, speed = backtrack_queue.popleft()
+                 return cmd, speed, f"backtracking: starting replay of {len(backtrack_queue)+1} steps"
 
         scan_cmd = recent_turn_preference(world, telemetry_brick.VISIBILITY_LOST_GRACE_S)
         if scan_cmd is None:
             scan_cmd = telemetry_robot_module.resolve_scan_direction(world.process_rules, objective)
         return scan_cmd, speeds["scan"], "scanning for brick visibility"
+    
+    # If visible, clear any stale backtrack queue
+    if backtrack_queue:
+        backtrack_queue.clear()
 
     # Calculate ratios to find the most egregious error
     offset_max = (gate_bounds.get("offset_abs") or {}).get("max")
@@ -454,15 +516,68 @@ def alignment_command(world, objective, gate_bounds, speeds):
         dist_bounds = gate_bounds.get("dist") or {}
         dist_min = dist_bounds.get("min")
         dist_max = dist_bounds.get("max")
+        
+        # Emoji Logic for Distance
+        last_dist = getattr(world, "last_align_dist", None)
+        dist_emoji = ""
+        if last_dist is not None and dist is not None:
+             # For distance, "progress" depends on context, but generally closer to target is better?
+             # Actually, simpler: did the absolute error decrease?
+             # Error could be (dist - dist_max) or (dist_min - dist). 
+             # Let's just track raw distance change relative to action.
+             # If we moved 'f' (closer), dist should decrease.
+             pass
+
         if dist is not None:
             if dist_max is not None and dist > dist_max:
-                return "f", speeds["forward"], f"closing distance long by {abs(dist - dist_max):.1f}mm"
+                # We need to move forward (closer) -> Distance should decrease
+                if last_dist is not None:
+                     if dist < last_dist - 0.5: dist_emoji = " 🟢"
+                     elif dist > last_dist + 0.5: dist_emoji = " 🔴"
+                setattr(world, "last_align_dist", dist)
+                return "f", speeds["forward"], f"closing distance long by {abs(dist - dist_max):.1f}mm{dist_emoji}"
+            
             if dist_min is not None and dist < dist_min:
-                return "b", speeds["backward"], f"closing distance short by {abs(dist_min - dist):.1f}mm"
+                # We need to move backward (further) -> Distance should increase
+                if last_dist is not None:
+                     if dist > last_dist + 0.5: dist_emoji = " 🟢"
+                     elif dist < last_dist - 0.5: dist_emoji = " 🔴"
+                setattr(world, "last_align_dist", dist)
+                return "b", speeds["backward"], f"closing distance short by {abs(dist_min - dist):.1f}mm{dist_emoji}"
+        
+        setattr(world, "last_align_dist", dist)
         return None, 0.0, "within success gates"
+
+    # Policy-Based Learning Check
+    policy_reason = None
+    if USE_LEARNED_POLICY and GLOBAL_POLICY:
+        l_cmd, l_speed, l_conf = GLOBAL_POLICY.query(objective, world)
+        if l_cmd:
+            if l_conf >= LEARNED_POLICY_CONFIDENCE_THRESHOLD:
+                 l_dir = ACTION_CMD_DESC.get(l_cmd, "moving")
+                 return l_cmd, l_speed, f"learned behavior | {l_conf*100:.0f}% conf"
+            else:
+                 policy_reason = f"hardcoded rule | policy conf {l_conf*100:.0f}% < {LEARNED_POLICY_CONFIDENCE_THRESHOLD*100:.0f}%"
+        else:
+            policy_reason = "hardcoded rule | no demo match"
+    
+    # Default policy reason if not using learning
+    if not policy_reason:
+        policy_reason = "hardcoded rule"
 
     # Determine Dynamic Speed
     max_ratio = max(offset_ratio, angle_ratio)
+    
+    # Progress Emoji Logic
+    last_ratio = getattr(world, "last_align_ratio", None)
+    ratio_emoji = ""
+    if last_ratio is not None:
+        if max_ratio < last_ratio - 0.01:
+            ratio_emoji = " 🟢" # Improved
+        elif max_ratio > last_ratio + 0.01:
+            ratio_emoji = " 🔴" # Regressed
+    setattr(world, "last_align_ratio", max_ratio)
+
     # Map ratio 1.0 -> MIN_SPEED, ratio 3.0 -> MAX_SPEED
     speed_factor = max(0.0, min(1.0, (max_ratio - 1.0) / 2.0))
     dynamic_speed = MIN_ALIGN_SPEED + (MAX_ALIGN_SPEED - MIN_ALIGN_SPEED) * speed_factor
@@ -471,11 +586,21 @@ def alignment_command(world, objective, gate_bounds, speeds):
     if offset_ratio >= angle_ratio:
         offset_dir = "right" if offset_x > 0 else "left"
         cmd = "r" if offset_x > 0 else "l"
-        return cmd, dynamic_speed, f"closing {offset_dir} offset of {abs(offset_x):.2f}mm (ratio {offset_ratio:.2f})"
+        
+        # Micro-Correction: If within 10mm, slow down
+        if abs(offset_x) < MICRO_ALIGN_OFFSET_MM:
+             dynamic_speed = min(dynamic_speed, MICRO_ALIGN_SPEED)
+
+        return cmd, dynamic_speed, f"{policy_reason}: closing {offset_dir} offset of {abs(offset_x):.2f}mm (ratio {offset_ratio:.2f}){ratio_emoji}"
     else:
         angle_dir = "right" if angle > 0 else "left"
         cmd = "r" if angle > 0 else "l"
-        return cmd, dynamic_speed, f"closing {angle_dir} angle of {abs(angle):.2f}deg (ratio {angle_ratio:.2f})"
+
+        # Micro-Correction: If within 5deg, slow down
+        if abs(angle) < MICRO_ALIGN_ANGLE_DEG:
+            dynamic_speed = min(dynamic_speed, MICRO_ALIGN_SPEED)
+
+        return cmd, dynamic_speed, f"{policy_reason}: closing {angle_dir} angle of {abs(angle):.2f}deg (ratio {angle_ratio:.2f}){ratio_emoji}"
 
 
 def adjust_speed_for_find_brick(world, objective, speed):
@@ -956,6 +1081,14 @@ def update_process_model_from_demos(logs, path=PROCESS_MODEL_FILE):
     if isinstance(objectives, dict):
         objective_rules.update(objectives)
     success_gate_scales = derive_success_gate_scales(segments_by_obj, objective_rules)
+
+    # Train Policy if requested
+    if USE_LEARNED_POLICY:
+        global GLOBAL_POLICY
+        print(format_headline("[LEARNING REPLAY] Training Policy from Demos...", COLOR_GREEN))
+        GLOBAL_POLICY = helper_learning.BehavioralCloningPolicy()
+        GLOBAL_POLICY.train(segments_by_obj)
+
     success_gates = derive_success_gates(
         success_segments,
         success_gate_scales,
@@ -1217,7 +1350,6 @@ def run_alignment_segment(segment, objective, robot, vision, world, steps, raw_s
             robot.stop()
         print(format_headline(f"[SUCCESS] {objective} criteria met", COLOR_GREEN))
         print(format_headline(format_success_details(world, objective), COLOR_WHITE))
-        time.sleep(3.0)
         return True, "success gate"
     if start_status != "start":
         pause_after_fail(robot)
@@ -1241,7 +1373,6 @@ def run_alignment_segment(segment, objective, robot, vision, world, steps, raw_s
                 robot.stop()
             print(format_headline(f"[SUCCESS] {objective} criteria met", COLOR_GREEN))
             print(format_headline(format_success_details(world, objective), COLOR_WHITE))
-            time.sleep(3.0)
             return True, "success gate"
 
         cmd, speed, cmd_reason = alignment_command(world, objective, gate_bounds, action_speeds)
@@ -1279,7 +1410,6 @@ def run_alignment_segment(segment, objective, robot, vision, world, steps, raw_s
         if success_met:
             print(format_headline(f"[SUCCESS] {objective} criteria met", COLOR_GREEN))
             print(format_headline(format_success_details(world, objective), COLOR_WHITE))
-            time.sleep(3.0)
             return True, "success gate"
 
         cmd, speed, cmd_reason = alignment_command(world, objective, gate_bounds, action_speeds)
@@ -1370,7 +1500,6 @@ def replay_segment(segment, objective, robot, vision, world):
                     robot.stop()
                     print(format_headline(f"[SUCCESS] {objective} criteria met 🎉", COLOR_GREEN))
                     print(format_headline(format_success_details(world, objective), COLOR_WHITE))
-                    time.sleep(3.0)
                     return True, "success gate"
 
             active_speed = adjust_speed_for_find_brick(world, objective, step.speed)
@@ -1399,7 +1528,6 @@ def replay_segment(segment, objective, robot, vision, world):
         if success_met:
             print(format_headline(f"[SUCCESS] {objective} criteria met 🎉", COLOR_GREEN))
             print(format_headline(format_success_details(world, objective), COLOR_WHITE))
-            time.sleep(3.0)
             return True, "success gate"
         if last_cmd:
             active_speed = adjust_speed_for_find_brick(world, objective, last_speed_base)
@@ -1427,7 +1555,6 @@ def replay_segment(segment, objective, robot, vision, world):
                     robot.stop()
                 print(format_headline(f"[SUCCESS] {objective} criteria met 🎉", COLOR_GREEN))
                 print(format_headline(format_success_details(world, objective), COLOR_WHITE))
-                time.sleep(3.0)
                 return True, "success gate"
             if last_cmd:
                 active_speed = adjust_speed_for_find_brick(world, objective, last_speed_base)
@@ -1515,7 +1642,12 @@ def run_autobuild(session_name=None):
 def main():
     parser = argparse.ArgumentParser(description="Robot Leia Autobuild")
     parser.add_argument("--session", help="demo session file or folder", default=None)
+    parser.add_argument("--learn", help="enable learning from demonstration policy", action="store_true")
     args = parser.parse_args()
+
+    global USE_LEARNED_POLICY
+    if args.learn:
+        USE_LEARNED_POLICY = True
 
     run_autobuild(session_name=args.session)
     print("\n" * 5, end="")
