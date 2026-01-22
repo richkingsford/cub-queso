@@ -167,7 +167,7 @@ class ArucoBrickVision:
                     dy = pose.position[1] - best_marker.position[1]
                     dx = abs(pose.position[0] - best_marker.position[0])
                     
-                    if dx < 15 and dz < 25: # Strict alignment
+                    if dx < 30 and dz < 40: # Loosened for reliability
                         if -55 < dy < -40: best_marker.brickAbove = True
                         if  40 < dy < 55:  best_marker.brickBelow = True
 
@@ -206,7 +206,7 @@ class ArucoBrickVision:
                         # expected_shift_bottom = focal * (38 / dist_mm)
                         # But simpler: use center if size is okay, or just check alignment
                         
-                        if idx < expected_shift_px * 0.3:
+                        if idx < expected_shift_px * 0.5: # Loosened alignment
                             # Check "Above" (Positive idy)
                             # center-center shift is 48mm. 
                             # If clipped at top, max_y (bottom edge) is the most reliable anchor.

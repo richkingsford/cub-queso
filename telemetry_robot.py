@@ -782,34 +782,8 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders
         cv2.putText(frame, txt, (x_base, y_cur), font, s, c, th)
         y_cur += line_h
 
-    # 3. MERGED STATE & PROMPT
-    state_label = wm.objective_state.value
-    status_label = f" ({wm.attempt_status})" if wm.attempt_status != "NORMAL" else ""
-    put_line(f"OBJ: {state_label}{status_label}", GREEN, 0.45, 1) # Objective Header
-    
-    if show_prompt:
-        # Prompts based on attempt status and recording state
-        if wm.attempt_status == "NORMAL":
-            if not wm.recording_active:
-                prompt = f"Press 'f' to BEGIN {state_label} (FAIL version)"
-            else:
-                prompt = f"Show clean {state_label} (+ Press 'f' when done)"
-        elif wm.attempt_status == "FAIL":
-            prompt = f"Press 'f' to BEGIN RECOVERY for {state_label}"
-        elif wm.attempt_status == "RECOVERY":
-            prompt = f"Press 'f' to finish recovery & start SUCCESS demo"
-        else:
-            prompt = f"Current focus: {state_label}"
-        
-        # Override with specific override if provided (e.g. from Keyboard Demo)
-        if extra_messages:
-            if isinstance(extra_messages, list): prompt = extra_messages[-1]
-            else: prompt = extra_messages
-
-        put_line(prompt, (0, 255, 255), 0.38, 1)
-        y_cur += 10
-    else:
-        y_cur += 5
+    # 3. MERGED STATE & PROMPT - REMOVED per user request
+    y_cur += 5
 
     # 4. Reminders
     if reminders:

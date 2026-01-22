@@ -366,12 +366,47 @@ def format_action_line(step, target_visible, reason=None):
 
 
 def format_control_action_line(cmd, speed, reason=None):
-    action = ACTION_CMD_DESC.get(cmd, "moving") if cmd else "holding position"
-    reason = str(reason).strip() if reason else ""
-    reason_suffix = f" {COLOR_GRAY}({reason}){COLOR_RESET}" if reason else ""
-    if cmd:
-        return f"[ACT] {action} at {speed:.2f} power{reason_suffix}"
-    return f"[ACT] {action}{reason_suffix}"
+    if not cmd:
+        return f"[ACT] holding position"
+
+    # Action Description
+    action_map = {
+        "f": "move forward",
+        "b": "move backward",
+        "l": "turn left",
+        "r": "turn right",
+        "u": "lift mast",
+        "d": "lower mast",
+    }
+    action = action_map.get(cmd, "move")
+    
+    # Power Level
+    level = "Major" if speed >= 0.24 else "Minor"
+    
+    # Parse Reason
+    reason_str = str(reason) if reason else ""
+    parts = reason_str.split("|")
+    gap_info = parts[0] if parts else ""
+    delta_info = parts[1] if len(parts) > 1 else ""
+    
+    # Format Line 1
+    if ":" in gap_info:
+        # e.g. "angle:19.18deg" -> "close the 19.18deg gap"
+        _, gap_val = gap_info.split(":", 1)
+        line1 = f"[ACT] {level} {action} to close the {gap_val} gap."
+    else:
+        line1 = f"[ACT] {level} {action} ({reason_str})"
+        
+    # Format Line 2 (Progress)
+    line2 = ""
+    if delta_info and ":" in delta_info:
+        # e.g. "closer:2.13deg" -> "🟢 The last act got us 2.13deg closer to perfect alignment."
+        direction, delta_val = delta_info.split(":", 1)
+        emoji = "🟢" if direction == "closer" else "🔴"
+        word = "closer to" if direction == "closer" else "further from"
+        line2 = f"\n{emoji} The last act got us {delta_val} {word} perfect alignment."
+        
+    return f"{line1}{line2}"
 
 
 def objective_uses_alignment_control(objective, process_rules):
@@ -517,90 +552,80 @@ def alignment_command(world, objective, gate_bounds, speeds):
         dist_min = dist_bounds.get("min")
         dist_max = dist_bounds.get("max")
         
-        # Emoji Logic for Distance
+        # Delta logic for Distance
         last_dist = getattr(world, "last_align_dist", None)
-        dist_emoji = ""
+        delta_msg = ""
         if last_dist is not None and dist is not None:
-             # For distance, "progress" depends on context, but generally closer to target is better?
-             # Actually, simpler: did the absolute error decrease?
-             # Error could be (dist - dist_max) or (dist_min - dist). 
-             # Let's just track raw distance change relative to action.
-             # If we moved 'f' (closer), dist should decrease.
-             pass
-
+             delta = dist - last_dist
+             if dist > dist_max: # Too far, need to move forward
+                 if delta < -0.2: delta_msg = f"|closer:{abs(delta):.2f}mm"
+                 elif delta > 0.2: delta_msg = f"|further:{abs(delta):.2f}mm"
+             elif dist < dist_min: # Too close, need to move backward
+                 if delta > 0.2: delta_msg = f"|closer:{abs(delta):.2f}mm"
+                 elif delta < -0.2: delta_msg = f"|further:{abs(delta):.2f}mm"
+        
         if dist is not None:
             if dist_max is not None and dist > dist_max:
-                # We need to move forward (closer) -> Distance should decrease
-                if last_dist is not None:
-                     if dist < last_dist - 0.5: dist_emoji = " 🟢"
-                     elif dist > last_dist + 0.5: dist_emoji = " 🔴"
                 setattr(world, "last_align_dist", dist)
-                return "f", speeds["forward"], f"closing distance long by {abs(dist - dist_max):.1f}mm{dist_emoji}"
+                return "f", speeds["forward"], f"dist:{abs(dist - dist_max):.2f}mm{delta_msg}"
             
             if dist_min is not None and dist < dist_min:
-                # We need to move backward (further) -> Distance should increase
-                if last_dist is not None:
-                     if dist > last_dist + 0.5: dist_emoji = " 🟢"
-                     elif dist < last_dist - 0.5: dist_emoji = " 🔴"
                 setattr(world, "last_align_dist", dist)
-                return "b", speeds["backward"], f"closing distance short by {abs(dist_min - dist):.1f}mm{dist_emoji}"
+                return "b", speeds["backward"], f"dist:{abs(dist_min - dist):.2f}mm{delta_msg}"
         
         setattr(world, "last_align_dist", dist)
         return None, 0.0, "within success gates"
 
-    # Policy-Based Learning Check
-    policy_reason = None
-    if USE_LEARNED_POLICY and GLOBAL_POLICY:
-        l_cmd, l_speed, l_conf = GLOBAL_POLICY.query(objective, world)
-        if l_cmd:
-            if l_conf >= LEARNED_POLICY_CONFIDENCE_THRESHOLD:
-                 l_dir = ACTION_CMD_DESC.get(l_cmd, "moving")
-                 return l_cmd, l_speed, f"learned behavior | {l_conf*100:.0f}% conf"
-            else:
-                 policy_reason = f"hardcoded rule | policy conf {l_conf*100:.0f}% < {LEARNED_POLICY_CONFIDENCE_THRESHOLD*100:.0f}%"
-        else:
-            policy_reason = "hardcoded rule | no demo match"
-    
-    # Default policy reason if not using learning
-    if not policy_reason:
-        policy_reason = "hardcoded rule"
-
     # Determine Dynamic Speed
     max_ratio = max(offset_ratio, angle_ratio)
     
-    # Progress Emoji Logic
-    last_ratio = getattr(world, "last_align_ratio", None)
-    ratio_emoji = ""
-    if last_ratio is not None:
-        if max_ratio < last_ratio - 0.01:
-            ratio_emoji = " 🟢" # Improved
-        elif max_ratio > last_ratio + 0.01:
-            ratio_emoji = " 🔴" # Regressed
-    setattr(world, "last_align_ratio", max_ratio)
-
     # Map ratio 1.0 -> MIN_SPEED, ratio 3.0 -> MAX_SPEED
     speed_factor = max(0.0, min(1.0, (max_ratio - 1.0) / 2.0))
     dynamic_speed = MIN_ALIGN_SPEED + (MAX_ALIGN_SPEED - MIN_ALIGN_SPEED) * speed_factor
 
-    # Prioritize the most egregious error
+    # Delta logic for Offset/Angle
+    last_val = getattr(world, "last_align_val", None)
+    last_type = getattr(world, "last_align_type", None)
+    delta_msg = ""
+    
     if offset_ratio >= angle_ratio:
-        offset_dir = "right" if offset_x > 0 else "left"
+        val = abs(offset_x)
+        type_str = "offset"
+        unit = "mm"
         cmd = "r" if offset_x > 0 else "l"
+        
+        if last_type == "offset" and last_val is not None:
+            delta = val - last_val
+            if delta < -0.1: delta_msg = f"|closer:{abs(delta):.2f}{unit}"
+            elif delta > 0.1: delta_msg = f"|further:{abs(delta):.2f}{unit}"
+            
+        setattr(world, "last_align_val", val)
+        setattr(world, "last_align_type", "offset")
         
         # Micro-Correction: If within 10mm, slow down
         if abs(offset_x) < MICRO_ALIGN_OFFSET_MM:
              dynamic_speed = min(dynamic_speed, MICRO_ALIGN_SPEED)
 
-        return cmd, dynamic_speed, f"{policy_reason}: closing {offset_dir} offset of {abs(offset_x):.2f}mm (ratio {offset_ratio:.2f}){ratio_emoji}"
+        return cmd, dynamic_speed, f"offset:{val:.2f}mm{delta_msg}"
     else:
-        angle_dir = "right" if angle > 0 else "left"
+        val = abs(angle)
+        type_str = "angle"
+        unit = "deg"
         cmd = "r" if angle > 0 else "l"
+
+        if last_type == "angle" and last_val is not None:
+            delta = val - last_val
+            if delta < -0.1: delta_msg = f"|closer:{abs(delta):.2f}{unit}"
+            elif delta > 0.1: delta_msg = f"|further:{abs(delta):.2f}{unit}"
+
+        setattr(world, "last_align_val", val)
+        setattr(world, "last_align_type", "angle")
 
         # Micro-Correction: If within 5deg, slow down
         if abs(angle) < MICRO_ALIGN_ANGLE_DEG:
-            dynamic_speed = min(dynamic_speed, MICRO_ALIGN_SPEED)
+             dynamic_speed = min(dynamic_speed, MICRO_ALIGN_SPEED)
 
-        return cmd, dynamic_speed, f"{policy_reason}: closing {angle_dir} angle of {abs(angle):.2f}deg (ratio {angle_ratio:.2f}){ratio_emoji}"
+        return cmd, dynamic_speed, f"angle:{val:.2f}deg{delta_msg}"
 
 
 def adjust_speed_for_find_brick(world, objective, speed):
