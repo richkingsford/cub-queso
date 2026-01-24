@@ -8,6 +8,7 @@ from pathlib import Path
 
 from helper_robot_control import Robot
 from helper_demo_log_utils import prune_log_file
+from helper_gate_utils import load_process_objectives, objective_progress, satisfied_objectives
 from helper_stream_server import StreamServer, format_stream_url
 from helper_vision_aruco import ArucoBrickVision
 from telemetry_robot import (
@@ -570,7 +571,21 @@ def control_loop(app_state):
             frame = app_state.vision.current_frame.copy()
             
             with app_state.lock:
-                draw_telemetry_overlay(frame, app_state.world, show_prompt=False)
+                objectives = load_process_objectives()
+                gate_status = satisfied_objectives(app_state.world.brick, objectives)
+                gate_progress = []
+                for name, data in objectives.items():
+                    success_gates = (data or {}).get("success_gates") or {}
+                    progress = objective_progress(app_state.world.brick, success_gates)
+                    if progress is not None:
+                        gate_progress.append((name, progress * 100))
+                draw_telemetry_overlay(
+                    frame,
+                    app_state.world,
+                    show_prompt=False,
+                    gate_status=gate_status,
+                    gate_progress=gate_progress,
+                )
                 app_state.current_frame = frame
         
         # Track Motion

@@ -67,26 +67,46 @@
                     "min": true
                 },
                 "angle_abs": {
-                    "target": 3.73,
-                    "tol": 1.15
+                    "target": 5.34,
+                    "tol": 18.7
                 },
                 "offset_abs": {
-                    "target": 4.9,
-                    "tol": 1.93
+                    "target": 11.27,
+                    "tol": 3.162
                 },
                 "dist": {
-                    "target": 60.97,
-                    "tol": 2.64
+                    "target": 79.65,
+                    "tol": 9.911
                 },
                 "duration_s": {
-                    "target": 9.13,
-                    "tol": 5.5
+                    "target": 4.5,
+                    "tol": 11.441
                 }
             },
             "movement_learnings": {
-                "cmd": "l",
-                "duration_s": 0.9,
-                "speed": 0.23
+                "cmd": "r",
+                "duration_s": 1.2,
+                "speed": 0.27
+            },
+            "gate_validation": {
+                "timestamp": 1769218132.666,
+                "fail_runs": 0,
+                "fail_states": 0,
+                "overlap_fail_runs": 0,
+                "metrics": {
+                    "angle_abs": {
+                        "target": 5.34,
+                        "tol": 18.7
+                    },
+                    "offset_abs": {
+                        "target": 11.27,
+                        "tol": 3.162
+                    },
+                    "dist": {
+                        "target": 79.65,
+                        "tol": 9.911
+                    }
+                }
             }
         },
         "SCOOP": {},
