@@ -310,6 +310,7 @@ class WorldModel:
             "dist": 0,
             "angle": 0,
             "offset_x": 0,
+            "x_axis": 0,
             "confidence": 0,
             "held": False,
             "brickAbove": False,
@@ -462,12 +463,12 @@ class WorldModel:
             brick = self.brick or {}
             brick_visible = bool(brick.get("visible"))
             for metric, stats in success_metrics.items():
-                if metric in ("angle_abs", "offset_abs", "dist", "confidence") and not brick_visible:
+                if metric in ("angle_abs", "xAxis_offset_abs", "dist", "confidence") and not brick_visible:
                     return False
                 if metric == "angle_abs":
                     if abs(brick.get("angle", 0.0)) > stats.get("max", 0.0):
                         return False
-                elif metric == "offset_abs":
+                elif metric == "xAxis_offset_abs":
                     if abs(brick.get("offset_x", 0.0)) > stats.get("max", 0.0):
                         return False
                 elif metric == "dist":
@@ -548,6 +549,7 @@ class WorldModel:
             brick_fmt['dist'] = None
             brick_fmt['angle'] = None
             brick_fmt['offset_x'] = None
+            brick_fmt['x_axis'] = None
             brick_fmt['confidence'] = None
             brick_fmt['brickAbove'] = None
             brick_fmt['brickBelow'] = None
@@ -558,12 +560,15 @@ class WorldModel:
                 brick_fmt['angle'] = round(brick_fmt['angle'], 3)
             if brick_fmt.get("offset_x") is not None:
                 brick_fmt['offset_x'] = round(brick_fmt['offset_x'], 2)
+            if brick_fmt.get("x_axis") is not None:
+                brick_fmt['x_axis'] = round(brick_fmt['x_axis'], 2)
             if brick_fmt.get("confidence") is not None:
                 brick_fmt['confidence'] = int(brick_fmt['confidence'])
         else:
             brick_fmt['dist'] = None
             brick_fmt['angle'] = None
             brick_fmt['offset_x'] = None
+            brick_fmt['x_axis'] = None
             brick_fmt['confidence'] = None
 
         # Format Wall Origin
@@ -738,7 +743,18 @@ class TelemetryLogger:
 # --- SHARED VISUALIZATION ---
 import cv2
 
-def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders=None, gear=None, show_prompt=True):
+def draw_telemetry_overlay(
+    frame,
+    wm: WorldModel,
+    extra_messages=None,
+    reminders=None,
+    gear=None,
+    show_prompt=True,
+    gate_status=None,
+    gate_progress=None,
+    objective_suggestions=None,
+    highlight_metric=None,
+):
     """
     Simplified HUD renderer.
     - Merged objective/checklist/status into single-line prompt.
@@ -795,11 +811,79 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders
             put_line(str(reminders), WHITE, 0.35, 1)
         y_cur += 5
 
+    # 4b. Success Gates
+    if gate_progress is not None:
+        put_line("--- SUCCESS GATES ---", WHITE, 0.35, 1)
+        if gate_progress:
+            for name, pct in gate_progress:
+                pct_display = int(max(0.0, min(100.0, pct)))
+                put_line(f"{name}: {pct_display}%", GREEN, 0.35, 1)
+                if objective_suggestions:
+                    for obj_name, suggestion in objective_suggestions:
+                        if obj_name == name:
+                            put_line(f"  {suggestion}", ORANGE, 0.35, 1)
+        else:
+            put_line("(none)", WHITE, 0.35, 1)
+        y_cur += 5
+    elif gate_status is not None:
+        put_line("--- SUCCESS GATES ---", WHITE, 0.35, 1)
+        if gate_status:
+            for name in gate_status:
+                put_line(str(name), GREEN, 0.35, 1)
+        else:
+            put_line("(none)", WHITE, 0.35, 1)
+        y_cur += 5
+
     # 5. Position Info
     put_line("--- BRICK[0] TELEMETRY ---", WHITE, 0.35, 1)
-    put_line(f"OFFSET: {wm.brick['offset_x']:.1f} mm", GREEN, 0.38, 1)
-    put_line(f"ANGLE:  {wm.brick['angle']:.1f} deg", GREEN, 0.38, 1)
-    put_line(f"DIST:   {wm.brick['dist']:.0f} mm", GREEN, 0.38, 1)
+    x_axis = wm.brick.get("x_axis", wm.brick.get("offset_x", 0.0))
+    obj_rules = (wm.process_rules or {}).get("ALIGN_BRICK", {}) if wm.process_rules else {}
+    success_gates = (obj_rules or {}).get("success_gates") or {}
+    x_gate = success_gates.get("xAxis_offset_abs") or {}
+    angle_gate = success_gates.get("angle_abs") or {}
+    dist_gate = success_gates.get("dist") or {}
+    def _target_tol_str(stats, fmt):
+        target = stats.get("target")
+        tol = stats.get("tol")
+        if isinstance(target, (int, float)) and isinstance(tol, (int, float)):
+            return f" ({fmt(target)}+/-{fmt(tol)})"
+        min_val = stats.get("min")
+        max_val = stats.get("max")
+        if isinstance(min_val, (int, float)) and isinstance(max_val, (int, float)):
+            return f" ({fmt(min_val)}-{fmt(max_val)})"
+        return ""
+    def _gate_line(stats, fmt, label, current_val):
+        target = stats.get("target")
+        tol = stats.get("tol")
+        if isinstance(target, (int, float)) and isinstance(tol, (int, float)):
+            off_val = abs(current_val - target)
+            return f"  {label} {fmt(target)} +/- {fmt(tol)} | {fmt(off_val)} off"
+        min_val = stats.get("min")
+        max_val = stats.get("max")
+        if isinstance(min_val, (int, float)) and isinstance(max_val, (int, float)):
+            if current_val < min_val:
+                off_val = min_val - current_val
+            elif current_val > max_val:
+                off_val = current_val - max_val
+            else:
+                off_val = 0.0
+            return f"  {label} {fmt(min_val)}-{fmt(max_val)} | {fmt(off_val)} off"
+        return None
+    x_prefix = "* " if highlight_metric == "xAxis_offset_abs" else ""
+    angle_prefix = "* " if highlight_metric == "angle_abs" else ""
+    dist_prefix = "* " if highlight_metric == "dist" else ""
+    put_line(f"{x_prefix}X-AXIS: {x_axis:.1f} mm", GREEN, 0.38, 1)
+    x_gate_line = _gate_line(x_gate, lambda v: f"{v:.1f}", "TARGET", x_axis)
+    if x_gate_line:
+        put_line(x_gate_line, YELLOW, 0.35, 1)
+    put_line(f"{angle_prefix}ANGLE:  {wm.brick['angle']:.1f} deg", GREEN, 0.38, 1)
+    angle_gate_line = _gate_line(angle_gate, lambda v: f"{v:.1f}", "TARGET", wm.brick["angle"])
+    if angle_gate_line:
+        put_line(angle_gate_line, YELLOW, 0.35, 1)
+    put_line(f"{dist_prefix}DIST:   {wm.brick['dist']:.0f} mm", GREEN, 0.38, 1)
+    dist_gate_line = _gate_line(dist_gate, lambda v: f"{v:.1f}", "TARGET", wm.brick["dist"])
+    if dist_gate_line:
+        put_line(dist_gate_line, YELLOW, 0.35, 1)
     brick_conf = wm.brick.get("confidence")
     if brick_conf is None:
         brick_conf = 0.0
@@ -827,8 +911,8 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders
     if extra_messages:
         y_cur = h - 20
         for msg in extra_messages:
-             put_line(f"! {msg}", (0, 0, 255), 0.4, 2)
+             put_line(f"! {msg}", YELLOW, 0.4, 2)
 
     # 9. GEAR Display
     if gear:
-        cv2.putText(frame, f"GEAR: {gear}", (x_base, h - 35), font, 0.4, YELLOW, 2)
+        cv2.putText(frame, f"GEAR: {gear}", (x_base, h - 35), font, 0.4, WHITE, 2)

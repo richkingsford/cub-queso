@@ -1,4 +1,58 @@
 {
+    "autobuild": {
+        "control_hz": 20.0,
+        "gate_stability_frames": 5,
+        "success_consecutive_frames": 3,
+        "success_majority_window": 5,
+        "success_majority_required": 3,
+        "success_visible_false_grace_s": 0.0,
+        "success_confidence_min": 0.85,
+        "confidence_log_min": 0.5,
+        "success_confirmation_s": 0.35,
+        "success_confirmation_frames": 4,
+        "success_confirmation_start_confidence": 0.5,
+        "pursuit_speed": 0.32,
+        "success_confirmation_slow_speed": 0.0,
+        "suspect_speed": 0.6,
+        "max_objective_duration_s": 20.0,
+        "failure_tighten_low_pct": 0.1,
+        "failure_tighten_high_pct": 0.9,
+        "start_gate_timeout_s": 8.0,
+        "success_settle_s": 1.0,
+        "success_tail_window_s": 0.5,
+        "max_phase_attempts": 1,
+        "max_speed": 0.5,
+        "smooth_speed": 0.32,
+        "smooth_step_s": 1.0,
+        "duration_scale": 3.0,
+        "fail_pause_s": 3.0,
+        "find_brick_slow_factor": 4.0,
+        "min_align_speed": 0.2,
+        "max_align_speed": 0.28,
+        "micro_align_speed": 0.21,
+        "micro_align_offset_mm": 10.0,
+        "micro_align_angle_deg": 5.0,
+        "visibility_lost_hold_s": 0.5,
+        "learned_policy_confidence_threshold": 0.4,
+        "success_frames_by_objective": {
+            "FIND_BRICK": 3
+        },
+        "alignment_metrics": [
+            "angle_abs",
+            "xAxis_offset_abs",
+            "dist"
+        ]
+    },
+    "manual_training": {
+        "log_rate_hz": 10,
+        "gear_1_speed": 0.32,
+        "gear_9_speed": 1.0,
+        "heartbeat_timeout": 0.3,
+        "stream_host": "127.0.0.1",
+        "stream_port": 5000,
+        "stream_fps": 10,
+        "stream_jpeg_quality": 85
+    },
     "objectives": {
         "FIND_WALL": {
             "scan_direction": "r",
@@ -66,27 +120,18 @@
                 "visible": {
                     "min": true
                 },
-                "angle_abs": {
-                    "target": 5.34,
-                    "tol": 18.7
-                },
-                "offset_abs": {
-                    "target": 11.27,
-                    "tol": 3.162
+                "xAxis_offset_abs": {
+                    "target": -8.4,
+                    "tol": 1.5
                 },
                 "dist": {
-                    "target": 79.65,
-                    "tol": 9.911
+                    "target": 60.35,
+                    "tol": 1.5
                 },
                 "duration_s": {
-                    "target": 4.5,
-                    "tol": 11.441
+                    "target": 2.35,
+                    "tol": 0.0
                 }
-            },
-            "movement_learnings": {
-                "cmd": "r",
-                "duration_s": 1.2,
-                "speed": 0.27
             },
             "gate_validation": {
                 "timestamp": 1769218132.666,
@@ -98,7 +143,7 @@
                         "target": 5.34,
                         "tol": 18.7
                     },
-                    "offset_abs": {
+                    "xAxis_offset_abs": {
                         "target": 11.27,
                         "tol": 3.162
                     },
@@ -109,7 +154,14 @@
                 }
             }
         },
-        "SCOOP": {},
+        "SCOOP": {
+            "movement_learnings": {
+                "cmd": "b",
+                "duration_s": 5.2,
+                "speed": 0.32
+            },
+            "nominalDemosOnly": true
+        },
         "FIND_WALL2": {},
         "POSITION_BRICK": {},
         "PLACE": {},
