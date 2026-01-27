@@ -71,7 +71,7 @@ MM_METRICS = {
 }
 MIN_MM_TOL = 1.5
 
-BRICK_SMOOTH_FRAMES = 4
+BRICK_SMOOTH_FRAMES = 3
 BRICK_SMOOTH_SPLIT_MM = 20.0
 BRICK_SMOOTH_SPLIT_DEG = 8.0
 BRICK_SMOOTH_OUTLIER_MM = 12.0
@@ -1308,16 +1308,6 @@ def _average_brick_frames(frames):
 def _filtered_brick_frame_average(frames):
     if len(frames) < BRICK_SMOOTH_FRAMES:
         return None, False, None
-    first_two = frames[:2]
-    last_two = frames[2:]
-    avg_first = _average_brick_frames(first_two)
-    avg_last = _average_brick_frames(last_two)
-    if (
-        abs(avg_first["dist"] - avg_last["dist"]) > BRICK_SMOOTH_SPLIT_MM
-        or abs(avg_first["offset_x"] - avg_last["offset_x"]) > BRICK_SMOOTH_SPLIT_MM
-        or abs(avg_first["angle"] - avg_last["angle"]) > BRICK_SMOOTH_SPLIT_DEG
-    ):
-        return None, True, f"0/{BRICK_SMOOTH_FRAMES} frames (split mismatch)"
 
     dist_vals = [f["dist"] for f in frames]
     offset_vals = [f["offset_x"] for f in frames]
@@ -1338,9 +1328,9 @@ def _filtered_brick_frame_average(frames):
             continue
         keep.append(frame)
 
-    if len(keep) < 3:
-        return None, True, f"{len(keep)}/{BRICK_SMOOTH_FRAMES} tight variance frames (outliers)"
-    return _average_brick_frames(keep), True, f"{len(keep)}/{BRICK_SMOOTH_FRAMES} tight variance frames"
+    if len(keep) < BRICK_SMOOTH_FRAMES:
+        return None, True, f"{len(keep)}/{BRICK_SMOOTH_FRAMES} tight variance frames (inconsistent)"
+    return _average_brick_frames(keep), True, None
 
 
 def merge_motion_steps(steps, speed_tol=0.02):
@@ -1450,22 +1440,29 @@ def update_world_from_vision(world, vision, log=True):
             avg["brick_above"],
             avg["brick_below"],
         )
+        world._frame_id = getattr(world, "_frame_id", 0) + 1
         if log:
             print(format_headline(format_brick_state_line(world), COLOR_WHITE))
 
 
-def refresh_world_after_action(world, vision, log=True, attempts=4):
-    last_avg = None
+def refresh_world_after_action(world, vision, log=True, attempts=8):
+    start_frame_id = getattr(world, "_frame_id", 0)
+    last_frame = None
     for _ in range(attempts):
         update_world_from_vision(world, vision, log=log)
+        frame_id = getattr(world, "_frame_id", 0)
         if world.brick:
-            last_avg = {
+            last_frame = {
                 "dist": world.brick.get("dist"),
                 "angle": world.brick.get("angle"),
                 "x_axis": world.brick.get("x_axis"),
+                "frame_id": frame_id,
             }
+        # Prefer a new observed frame over fixed sleeps.
+        if frame_id > start_frame_id:
+            return last_frame
         time.sleep(CONTROL_DT * 0.5)
-    return last_avg
+    return last_frame
 
 
 def evaluate_gate_status(world, objective):
@@ -1670,8 +1667,7 @@ def run_alignment_segment(
             last_speed = speed
 
         if cmd:
-            print("[DEBUG] pause2 (align_loop_pre_command)")
-            time.sleep(CONTROL_DT * 3)
+            pre_frame_id = getattr(world, "_frame_id", 0)
             if confirm_callback:
                 if not confirm_callback(world, vision):
                     return False, "confirm cancelled"
@@ -1685,6 +1681,9 @@ def run_alignment_segment(
             if confirm_callback and robot:
                 robot.stop()
             last_action_frame = refresh_world_after_action(world, vision, log=not align_silent)
+            post_frame_id = getattr(world, "_frame_id", 0)
+            if post_frame_id <= pre_frame_id:
+                print(format_headline("[WARN] No new frame observed after action", COLOR_RED))
         else:
             if robot:
                 robot.stop()
@@ -1703,7 +1702,13 @@ def run_alignment_segment(
     if robot:
         robot.stop()
     if not align_silent:
-        print(format_headline(f"[FAIL] {objective} giving up after {MAX_OBJECTIVE_DURATION_S:.1f}s", COLOR_RED))
+        loops = getattr(world, "loop_id", 0)
+        print(
+            format_headline(
+                f"[FAIL] Gave up after {loops} loops ({MAX_OBJECTIVE_DURATION_S:.0f}s).",
+                COLOR_RED,
+            )
+        )
     settle_deadline = min(objective_deadline, time.time() + SUCCESS_SETTLE_S)
     settle_tracker = SuccessGateTracker(success_frames_required(objective))
     loop_id = 0
