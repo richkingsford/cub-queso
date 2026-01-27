@@ -1307,7 +1307,7 @@ def _average_brick_frames(frames):
 
 def _filtered_brick_frame_average(frames):
     if len(frames) < BRICK_SMOOTH_FRAMES:
-        return None, False
+        return None, False, None
     first_two = frames[:2]
     last_two = frames[2:]
     avg_first = _average_brick_frames(first_two)
@@ -1317,7 +1317,7 @@ def _filtered_brick_frame_average(frames):
         or abs(avg_first["offset_x"] - avg_last["offset_x"]) > BRICK_SMOOTH_SPLIT_MM
         or abs(avg_first["angle"] - avg_last["angle"]) > BRICK_SMOOTH_SPLIT_DEG
     ):
-        return None, True
+        return None, True, f"0/{BRICK_SMOOTH_FRAMES} frames (split mismatch)"
 
     dist_vals = [f["dist"] for f in frames]
     offset_vals = [f["offset_x"] for f in frames]
@@ -1339,8 +1339,8 @@ def _filtered_brick_frame_average(frames):
         keep.append(frame)
 
     if len(keep) < 3:
-        return None, True
-    return _average_brick_frames(keep), True
+        return None, True, f"{len(keep)}/{BRICK_SMOOTH_FRAMES} frames (outliers)"
+    return _average_brick_frames(keep), True, f"{len(keep)}/{BRICK_SMOOTH_FRAMES} frames"
 
 
 def merge_motion_steps(steps, speed_tol=0.02):
@@ -1434,9 +1434,11 @@ def update_world_from_vision(world, vision, log=True):
     buffer.append(frame)
     if len(buffer) > BRICK_SMOOTH_FRAMES:
         buffer.pop(0)
-    avg, should_reset = _filtered_brick_frame_average(buffer)
+    avg, should_reset, obs_note = _filtered_brick_frame_average(buffer)
     if should_reset:
         buffer.clear()
+    if obs_note:
+        world._last_obs_note = obs_note
     if avg is not None:
         world.update_vision(
             avg["found"],
@@ -1450,6 +1452,20 @@ def update_world_from_vision(world, vision, log=True):
         )
         if log:
             print(format_headline(format_brick_state_line(world), COLOR_WHITE))
+
+
+def refresh_world_after_action(world, vision, log=True, attempts=4):
+    last_avg = None
+    for _ in range(attempts):
+        update_world_from_vision(world, vision, log=log)
+        if world.brick:
+            last_avg = {
+                "dist": world.brick.get("dist"),
+                "angle": world.brick.get("angle"),
+                "x_axis": world.brick.get("x_axis"),
+            }
+        time.sleep(CONTROL_DT * 0.5)
+    return last_avg
 
 
 def evaluate_gate_status(world, objective):
@@ -1580,9 +1596,21 @@ def run_alignment_segment(
     last_cmd = None
     last_reason = None
     last_speed = None
+    last_action_frame = None
+    loop_id = 0
 
     while time.time() < objective_deadline:
+        loop_id += 1
+        world.loop_id = loop_id
         update_world_from_vision(world, vision, log=not align_silent)
+        obs_note = getattr(world, "_last_obs_note", None)
+        if obs_note:
+            print(format_headline(f"[OBS] {obs_note}", COLOR_WHITE))
+            world._last_obs_note = None
+            print("[DEBUG] pause3 (post_obs_note)")
+            time.sleep(CONTROL_DT * 3)
+        print("[DEBUG] pause1 (align_loop_pre_observer)")
+        time.sleep(CONTROL_DT * 3)
         if observer:
             observer("frame", world, vision, None, None, None)
         success_ok, confidence = evaluate_gate_status(world, objective)
@@ -1615,8 +1643,6 @@ def run_alignment_segment(
         cmd_reason = analytics.get("worst_metric") or "align"
         speed = apply_pursuit_speed(speed)
         speed = apply_confidence_speed(speed, success_ok, confidence, world)
-        if objective == "ALIGN_BRICK":
-            speed = telemetry_brick.ALIGN_FIXED_SPEED
         if cmd != last_cmd or cmd_reason != last_reason or speed != last_speed:
             if not align_silent:
                 brick_success = telemetry_brick.evaluate_success_gates(
@@ -1647,6 +1673,8 @@ def run_alignment_segment(
             last_speed = speed
 
         if cmd:
+            print("[DEBUG] pause2 (align_loop_pre_command)")
+            time.sleep(CONTROL_DT * 3)
             if confirm_callback:
                 if not confirm_callback(world, vision):
                     return False, "confirm cancelled"
@@ -1659,19 +1687,39 @@ def run_alignment_segment(
             world.update_from_motion(evt)
             if confirm_callback and robot:
                 robot.stop()
+            last_action_frame = refresh_world_after_action(world, vision, log=not align_silent)
         else:
             if robot:
                 robot.stop()
         if observer:
             observer("action", world, vision, cmd, speed, cmd_reason)
         time.sleep(CONTROL_DT)
+        if last_action_frame:
+            current_frame = {
+                "dist": world.brick.get("dist"),
+                "angle": world.brick.get("angle"),
+                "x_axis": world.brick.get("x_axis"),
+            }
+            if current_frame == last_action_frame:
+                print(format_headline("[ERROR] Frame unchanged before/after action", COLOR_RED))
 
     if robot:
         robot.stop()
+    if not align_silent:
+        print(format_headline(f"[FAIL] {objective} giving up after {MAX_OBJECTIVE_DURATION_S:.1f}s", COLOR_RED))
     settle_deadline = min(objective_deadline, time.time() + SUCCESS_SETTLE_S)
     settle_tracker = SuccessGateTracker(success_frames_required(objective))
+    loop_id = 0
     while time.time() < settle_deadline:
+        loop_id += 1
+        world.loop_id = loop_id
         update_world_from_vision(world, vision, log=not align_silent)
+        obs_note = getattr(world, "_last_obs_note", None)
+        if obs_note:
+            print(format_headline(f"[OBS] {obs_note}", COLOR_WHITE))
+            world._last_obs_note = None
+            print("[DEBUG] pause3 (post_obs_note)")
+            time.sleep(CONTROL_DT * 3)
         if observer:
             observer("frame", world, vision, None, None, None)
         success_ok, confidence = evaluate_gate_status(world, objective)
@@ -1700,8 +1748,6 @@ def run_alignment_segment(
         cmd_reason = analytics.get("worst_metric") or "align"
         speed = apply_pursuit_speed(speed)
         speed = apply_confidence_speed(speed, success_ok, confidence, world)
-        if objective == "ALIGN_BRICK":
-            speed = telemetry_brick.ALIGN_FIXED_SPEED
         if cmd != last_cmd or cmd_reason != last_reason or speed != last_speed:
             if not align_silent:
                 brick_success = telemetry_brick.evaluate_success_gates(

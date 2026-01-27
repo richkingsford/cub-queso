@@ -10,11 +10,12 @@ ALIGN_MIN_SPEED = 0.2
 ALIGN_MAX_SPEED = 0.28
 ALIGN_MICRO_SPEED = 0.21
 ALIGN_FIXED_SPEED = 0.19
-ALIGN_SPEED_NORMAL = ALIGN_FIXED_SPEED / 3.0 * 0.1512
-ALIGN_SPEED_FAST = min(ALIGN_MAX_SPEED / 3.0, ALIGN_FIXED_SPEED * 1.4 / 3.0) * 0.1512
-ALIGN_SPEED_SLOW = max(0.05, ALIGN_FIXED_SPEED * 0.7 / 3.0) * 0.1512
-ALIGN_SPEED_SLOW_MM = 11.2
-ALIGN_SPEED_FAST_MM = 28.0
+ALIGN_SPEED_MIN_POWER = 0.288
+ALIGN_SPEED_SLOW = ALIGN_SPEED_MIN_POWER
+ALIGN_SPEED_NORMAL = 0.28
+ALIGN_SPEED_FAST = 0.392
+ALIGN_SPEED_SLOW_MM = 16.0
+ALIGN_SPEED_FAST_MM = 36.0
 ALIGN_MICRO_OFFSET_MM = 10.0
 ALIGN_MICRO_ANGLE_DEG = 5.0
 VISIBLE_FALSE_GRACE_S_BY_OBJECTIVE = {
@@ -429,10 +430,10 @@ def compute_alignment_analytics(world, process_rules, learned_rules, objective, 
         target = stats.get("target")
         tol = stats.get("tol")
         signed_error = signed - target if target is not None and tol is not None else signed
-        if signed == 0:
+        if signed_error == 0:
             cmd = None
         else:
-            cmd = "l" if signed < 0 else "r"
+            cmd = "r" if signed_error > 0 else "l"
         if abs(signed_error) < micro_offset_mm:
             speed = min(speed, micro_speed)
     elif worst_metric == "angle_abs":
@@ -451,7 +452,7 @@ def compute_alignment_analytics(world, process_rules, learned_rules, objective, 
 
     speed_label = None
     if obj_name == "ALIGN_BRICK":
-        mm_off = max(mm_errors.values(), default=None)
+        mm_off = mm_errors.get("xAxis_offset_abs")
         if (mm_off is None or mm_off <= 0.0) and worst_metric == "angle_abs":
             mm_off = None
         speed_label = "n"
@@ -463,6 +464,8 @@ def compute_alignment_analytics(world, process_rules, learned_rules, objective, 
             elif mm_off >= ALIGN_SPEED_FAST_MM:
                 speed_label = "f"
                 speed = ALIGN_SPEED_FAST
+        if cmd in ("f", "b"):
+            speed = min(1.0, speed * 2.0)
 
     return {
         "progress": progress,

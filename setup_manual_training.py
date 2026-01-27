@@ -258,7 +258,7 @@ def run_auto_objective(app_state, obj_enum):
 
 
 def update_brick_analytics(app_state):
-    objectives = load_process_objectives()
+    objectives = app_state.world.process_rules or load_process_objectives()
     analytics = telemetry_brick.compute_brick_analytics(
         app_state.world,
         objectives,
@@ -417,6 +417,7 @@ def update_stream_frame(app_state):
             gate_progress=app_state.gate_progress,
             objective_suggestions=objective_suggestions,
             highlight_metric=app_state.brick_highlight_metric,
+            loop_id=getattr(app_state.world, "loop_id", None),
         )
         app_state.current_frame = frame
 

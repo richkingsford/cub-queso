@@ -196,7 +196,7 @@ DEFAULT_MM_PER_SEC_FULL_SPEED = 200.0
 DEFAULT_DEG_PER_SEC_FULL_SPEED = 90.0
 DEFAULT_LIFT_MM_PER_SEC = 23.5
 DEFAULT_MOTION_TICK_MS = 100.0
-MIN_TURN_POWER = 0.23
+MIN_TURN_POWER = 0.064
 MIN_TURN_POWER_PWM = int(math.ceil(MIN_TURN_POWER * 255))
 
 
@@ -754,6 +754,7 @@ def draw_telemetry_overlay(
     gate_progress=None,
     objective_suggestions=None,
     highlight_metric=None,
+    loop_id=None,
 ):
     """
     Simplified HUD renderer.
@@ -813,6 +814,9 @@ def draw_telemetry_overlay(
 
     # 4b. Success Gates
     if gate_progress is not None:
+        if loop_id is not None:
+            put_line(f"LOOP ID: {loop_id}", WHITE, 0.35, 1)
+            y_cur += 3
         put_line("--- SUCCESS GATES ---", WHITE, 0.35, 1)
         if gate_progress:
             for name, pct in gate_progress:
@@ -852,11 +856,11 @@ def draw_telemetry_overlay(
         if isinstance(min_val, (int, float)) and isinstance(max_val, (int, float)):
             return f" ({fmt(min_val)}-{fmt(max_val)})"
         return ""
-    def _gate_line(stats, fmt, label, current_val):
+    def _gate_line(stats, fmt, label, current_val, signed=False):
         target = stats.get("target")
         tol = stats.get("tol")
         if isinstance(target, (int, float)) and isinstance(tol, (int, float)):
-            off_val = abs(current_val - target)
+            off_val = current_val - target if signed else abs(current_val - target)
             return f"  {label} {fmt(target)} +/- {fmt(tol)} | {fmt(off_val)} off"
         min_val = stats.get("min")
         max_val = stats.get("max")
@@ -873,7 +877,7 @@ def draw_telemetry_overlay(
     angle_prefix = "* " if highlight_metric == "angle_abs" else ""
     dist_prefix = "* " if highlight_metric == "dist" else ""
     put_line(f"{x_prefix}X-AXIS: {x_axis:.1f} mm", GREEN, 0.38, 1)
-    x_gate_line = _gate_line(x_gate, lambda v: f"{v:.1f}", "TARGET", x_axis)
+    x_gate_line = _gate_line(x_gate, lambda v: f"{v:.1f}", "TARGET", x_axis, signed=True)
     if x_gate_line:
         put_line(x_gate_line, YELLOW, 0.35, 1)
     put_line(f"{angle_prefix}ANGLE:  {wm.brick['angle']:.1f} deg", GREEN, 0.38, 1)

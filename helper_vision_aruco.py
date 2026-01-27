@@ -61,6 +61,7 @@ class ArucoBrickVision:
     def init_camera(self, width: int = 640, height: int = 480):
         if self.cap is None:
             self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
@@ -77,7 +78,10 @@ class ArucoBrickVision:
     def read(self):
         if self.cap is None:
             self.init_camera()
-        
+
+        # Flush a few frames to avoid stale buffer data
+        for _ in range(2):
+            self.cap.grab()
         ret, frame = self.cap.read()
         if not ret:
             return False, 0, -1, 0, 0, 0, False, False

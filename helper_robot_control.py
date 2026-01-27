@@ -16,9 +16,9 @@ class Robot:
         self.ser = None
         
         # --- PHYSICAL CONSTANTS (Copied from your Xbox Config) ---
-        self.MIN_PWM = 60   # Motors won't turn below this
+        self.MIN_PWM = 36   # Motors won't turn below this
         self.MAX_PWM = 255
-        self.MIN_TURN_POWER = 0.23
+        self.MIN_TURN_POWER = 0.064
         self.CMD_DURATION = 100 # ms (Keep it running slightly longer for smooth auto-drive)
         
         self.connect()

@@ -14,7 +14,7 @@
         "pursuit_speed": 0.32,
         "success_confirmation_slow_speed": 0.0,
         "suspect_speed": 0.6,
-        "max_objective_duration_s": 20.0,
+        "max_objective_duration_s": 120.0,
         "failure_tighten_low_pct": 0.1,
         "failure_tighten_high_pct": 0.9,
         "start_gate_timeout_s": 8.0,
