@@ -1339,8 +1339,8 @@ def _filtered_brick_frame_average(frames):
         keep.append(frame)
 
     if len(keep) < 3:
-        return None, True, f"{len(keep)}/{BRICK_SMOOTH_FRAMES} frames (outliers)"
-    return _average_brick_frames(keep), True, f"{len(keep)}/{BRICK_SMOOTH_FRAMES} frames"
+        return None, True, f"{len(keep)}/{BRICK_SMOOTH_FRAMES} tight variance frames (outliers)"
+    return _average_brick_frames(keep), True, f"{len(keep)}/{BRICK_SMOOTH_FRAMES} tight variance frames"
 
 
 def merge_motion_steps(steps, speed_tol=0.02):
@@ -1607,10 +1607,7 @@ def run_alignment_segment(
         if obs_note:
             print(format_headline(f"[OBS] {obs_note}", COLOR_WHITE))
             world._last_obs_note = None
-            print("[DEBUG] pause3 (post_obs_note)")
-            time.sleep(CONTROL_DT * 3)
-        print("[DEBUG] pause1 (align_loop_pre_observer)")
-        time.sleep(CONTROL_DT * 3)
+        # pause1 removed per request
         if observer:
             observer("frame", world, vision, None, None, None)
         success_ok, confidence = evaluate_gate_status(world, objective)
@@ -1718,8 +1715,6 @@ def run_alignment_segment(
         if obs_note:
             print(format_headline(f"[OBS] {obs_note}", COLOR_WHITE))
             world._last_obs_note = None
-            print("[DEBUG] pause3 (post_obs_note)")
-            time.sleep(CONTROL_DT * 3)
         if observer:
             observer("frame", world, vision, None, None, None)
         success_ok, confidence = evaluate_gate_status(world, objective)

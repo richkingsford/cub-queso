@@ -766,6 +766,7 @@ def draw_telemetry_overlay(
     
     # --- COLORS (BGR) ---
     GREEN = (0, 255, 0)
+    RED = (0, 0, 255)
     WHITE = (255, 255, 255)
     ORANGE = (0, 165, 255)
     YELLOW = (0, 255, 255)
@@ -821,11 +822,23 @@ def draw_telemetry_overlay(
         if gate_progress:
             for name, pct in gate_progress:
                 pct_display = int(max(0.0, min(100.0, pct)))
-                put_line(f"{name}: {pct_display}%", GREEN, 0.35, 1)
+                put_line(f"{name}: {pct_display}%", WHITE, 0.35, 1)
                 if objective_suggestions:
                     for obj_name, suggestion in objective_suggestions:
                         if obj_name == name:
-                            put_line(f"  {suggestion}", ORANGE, 0.35, 1)
+                            sug_color = WHITE
+                            trend_map = getattr(wm, "_align_metrics_trend", {})
+                            if suggestion.startswith(("L ", "R ")):
+                                trend_val = trend_map.get("x_axis")
+                            elif suggestion.startswith(("F ", "B ")):
+                                trend_val = trend_map.get("dist")
+                            else:
+                                trend_val = 0
+                            if trend_val == 1:
+                                sug_color = GREEN
+                            elif trend_val == -1:
+                                sug_color = RED
+                            put_line(f"  {suggestion}", sug_color, 0.35, 1)
         else:
             put_line("(none)", WHITE, 0.35, 1)
         y_cur += 5
@@ -833,7 +846,7 @@ def draw_telemetry_overlay(
         put_line("--- SUCCESS GATES ---", WHITE, 0.35, 1)
         if gate_status:
             for name in gate_status:
-                put_line(str(name), GREEN, 0.35, 1)
+                put_line(str(name), WHITE, 0.35, 1)
         else:
             put_line("(none)", WHITE, 0.35, 1)
         y_cur += 5
@@ -876,26 +889,30 @@ def draw_telemetry_overlay(
     x_prefix = "* " if highlight_metric == "xAxis_offset_abs" else ""
     angle_prefix = "* " if highlight_metric == "angle_abs" else ""
     dist_prefix = "* " if highlight_metric == "dist" else ""
-    put_line(f"{x_prefix}X-AXIS: {x_axis:.1f} mm", GREEN, 0.38, 1)
+    put_line(f"{x_prefix}X-AXIS: {x_axis:.1f} mm", WHITE, 0.38, 1)
     x_gate_line = _gate_line(x_gate, lambda v: f"{v:.1f}", "TARGET", x_axis, signed=True)
     if x_gate_line:
-        put_line(x_gate_line, YELLOW, 0.35, 1)
-    put_line(f"{angle_prefix}ANGLE:  {wm.brick['angle']:.1f} deg", GREEN, 0.38, 1)
+        x_trend = getattr(wm, "_align_metrics_trend", {}).get("x_axis")
+        x_gate_color = GREEN if x_trend == 1 else RED if x_trend == -1 else WHITE
+        put_line(x_gate_line, x_gate_color, 0.35, 1)
+    put_line(f"{angle_prefix}ANGLE:  {wm.brick['angle']:.1f} deg", WHITE, 0.38, 1)
     angle_gate_line = _gate_line(angle_gate, lambda v: f"{v:.1f}", "TARGET", wm.brick["angle"])
     if angle_gate_line:
-        put_line(angle_gate_line, YELLOW, 0.35, 1)
-    put_line(f"{dist_prefix}DIST:   {wm.brick['dist']:.0f} mm", GREEN, 0.38, 1)
+        put_line(angle_gate_line, WHITE, 0.35, 1)
+    put_line(f"{dist_prefix}DIST:   {wm.brick['dist']:.0f} mm", WHITE, 0.38, 1)
     dist_gate_line = _gate_line(dist_gate, lambda v: f"{v:.1f}", "TARGET", wm.brick["dist"])
     if dist_gate_line:
-        put_line(dist_gate_line, YELLOW, 0.35, 1)
+        dist_trend = getattr(wm, "_align_metrics_trend", {}).get("dist")
+        dist_gate_color = GREEN if dist_trend == 1 else RED if dist_trend == -1 else WHITE
+        put_line(dist_gate_line, dist_gate_color, 0.35, 1)
     brick_conf = wm.brick.get("confidence")
     if brick_conf is None:
         brick_conf = 0.0
-    put_line(f"CONF:   {brick_conf:.0f}%", GREEN, 0.38, 1)
+    put_line(f"CONF:   {brick_conf:.0f}%", WHITE, 0.38, 1)
     above_txt = "YES" if wm.brick.get("brickAbove") else "NO"
     below_txt = "YES" if wm.brick.get("brickBelow") else "NO"
-    put_line(f"BRICK ABOVE: {above_txt}", GREEN, 0.38, 1)
-    put_line(f"BRICK_BELOW: {below_txt}", GREEN, 0.38, 1)
+    put_line(f"BRICK ABOVE: {above_txt}", WHITE, 0.38, 1)
+    put_line(f"BRICK_BELOW: {below_txt}", WHITE, 0.38, 1)
     
     y_cur += 5
     put_line("--- LEIA TELEMETRY ---", WHITE, 0.35, 1)

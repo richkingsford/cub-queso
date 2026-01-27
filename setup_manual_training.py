@@ -269,6 +269,38 @@ def update_brick_analytics(app_state):
     app_state.gate_status = analytics.get("gate_status") or []
     app_state.gate_progress = analytics.get("gate_progress") or []
     app_state.brick_highlight_metric = analytics.get("highlight_metric")
+    last_progress = getattr(app_state.world, "_last_gate_progress", {})
+    trend = {}
+    current_progress = {}
+    for name, pct in app_state.gate_progress:
+        current_progress[name] = pct
+        prev = last_progress.get(name)
+        if prev is None:
+            continue
+        if pct > prev + 0.1:
+            trend[name] = 1
+        elif pct < prev - 0.1:
+            trend[name] = -1
+        else:
+            trend[name] = 0
+    app_state.world._last_gate_progress = current_progress
+    app_state.world._gate_trend = trend
+    align = analytics.get("align") or {}
+    last_metrics = getattr(app_state.world, "_last_align_metrics", {})
+    metrics_trend = {}
+    for key in ("x_axis", "angle", "dist"):
+        value = align.get(key)
+        prev_val = last_metrics.get(key)
+        if value is None or prev_val is None:
+            continue
+        if value < prev_val:
+            metrics_trend[key] = 1
+        elif value > prev_val:
+            metrics_trend[key] = -1
+        else:
+            metrics_trend[key] = 0
+    app_state.world._last_align_metrics = {k: align.get(k) for k in ("x_axis", "angle", "dist")}
+    app_state.world._align_metrics_trend = metrics_trend
     suggestion = analytics.get("suggestion")
     if suggestion:
         app_state.objective_suggestions = [("ALIGN_BRICK", suggestion)]
