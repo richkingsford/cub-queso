@@ -92,6 +92,13 @@ STREAM_JPEG_QUALITY = int(_MANUAL_CONFIG.get("stream_jpeg_quality", 85))
 DEMOS_DIR = Path(__file__).resolve().parent / "demos"
 PROCESS_MODEL_FILE = Path(__file__).resolve().parent / "world_model_process.json"
 DEMO_OBJECTIVES = objective_sequence()
+TURN_SPEED_NORMAL = 1.0
+TURN_SPEED_SLOW = 1.0 / 3.0
+TURN_SPEED_FAST = 2.0
+DRIVE_SPEED_NORMAL = TURN_SPEED_NORMAL * 0.25
+DRIVE_SPEED_SLOW = TURN_SPEED_SLOW * 0.25
+DRIVE_SPEED_FAST = TURN_SPEED_FAST * 0.25
+DRIVE_POWER_MULTIPLIER = 2.0
 
 MM_METRICS = {
     "xAxis_offset_abs",
@@ -582,6 +589,7 @@ def print_command_help(app_state=None):
     log_line("[CMD] Trash current session log: press '1' during recording.")
     log_line("[CMD] Auto-run: use 'p' + objective code.")
     log_line("[CMD] End attempt: press ':' to finish and return to the command prompt.")
+    log_line("[KEYS] Drive: W/S normal, R/F slow, T/G fast. Turn: A/D normal, Q/E slow, Z/C fast. Lift: U/L.")
 
 def command_mode_exit_messages(app_state):
     if app_state.active_attempt:
@@ -720,7 +728,8 @@ class AppState:
         self.active_command = None
         self.active_speed = 0.0
         self.last_key_time = 0
-        self.turn_speed_multiplier = 1.0
+        self.turn_speed_multiplier = TURN_SPEED_NORMAL
+        self.drive_speed_multiplier = DRIVE_SPEED_NORMAL
         
         # Job Status
         self.job_success = False
@@ -887,26 +896,40 @@ def keyboard_thread(app_state):
                 # MOVEMENT (Heartbeat triggers)
                 if ch_lower == 'w':
                     app_state.active_command = 'f'
+                    app_state.drive_speed_multiplier = DRIVE_SPEED_NORMAL
                 elif ch_lower == 's':
                     app_state.active_command = 'b'
+                    app_state.drive_speed_multiplier = DRIVE_SPEED_NORMAL
+                elif ch_lower == 'r':
+                    app_state.active_command = 'f'
+                    app_state.drive_speed_multiplier = DRIVE_SPEED_SLOW
+                elif ch_lower == 'f':
+                    app_state.active_command = 'b'
+                    app_state.drive_speed_multiplier = DRIVE_SPEED_SLOW
+                elif ch_lower == 't':
+                    app_state.active_command = 'f'
+                    app_state.drive_speed_multiplier = DRIVE_SPEED_FAST
+                elif ch_lower == 'g':
+                    app_state.active_command = 'b'
+                    app_state.drive_speed_multiplier = DRIVE_SPEED_FAST
                 elif ch_lower == 'a':
                     app_state.active_command = 'l'
-                    app_state.turn_speed_multiplier = 1.0
+                    app_state.turn_speed_multiplier = TURN_SPEED_NORMAL
                 elif ch_lower == 'd':
                     app_state.active_command = 'r'
-                    app_state.turn_speed_multiplier = 1.0
+                    app_state.turn_speed_multiplier = TURN_SPEED_NORMAL
                 elif ch_lower == 'q':
                     app_state.active_command = 'l'
-                    app_state.turn_speed_multiplier = 1.0 / 3.0
+                    app_state.turn_speed_multiplier = TURN_SPEED_SLOW
                 elif ch_lower == 'e':
                     app_state.active_command = 'r'
-                    app_state.turn_speed_multiplier = 1.0 / 3.0
+                    app_state.turn_speed_multiplier = TURN_SPEED_SLOW
                 elif ch_lower == 'z':
                     app_state.active_command = 'l'
-                    app_state.turn_speed_multiplier = 2.0
+                    app_state.turn_speed_multiplier = TURN_SPEED_FAST
                 elif ch_lower == 'c':
                     app_state.active_command = 'r'
-                    app_state.turn_speed_multiplier = 2.0
+                    app_state.turn_speed_multiplier = TURN_SPEED_FAST
                 elif ch_lower == 'u':
                     app_state.active_command = 'u'
                 elif ch_lower == 'l':
@@ -963,15 +986,20 @@ def control_loop(app_state):
                 speed = gear_speed
                 if cmd in ('l', 'r'):
                     speed = min(1.0, speed * app_state.turn_speed_multiplier)
-                if cmd in ('u', 'd'):
+                elif cmd in ('f', 'b'):
+                    speed = min(1.0, speed * app_state.drive_speed_multiplier)
+                elif cmd in ('u', 'd'):
                     speed = min(1.0, speed * 4.0)
-                app_state.active_speed = speed 
+                app_state.active_speed = speed
             else:
                 speed = 0.0
                 app_state.active_speed = 0.0
             
-        if cmd and speed > 0:
-            app_state.robot.send_command(cmd, speed)
+        send_speed = speed
+        if cmd in ('f', 'b'):
+            send_speed = min(1.0, speed * DRIVE_POWER_MULTIPLIER)
+        if cmd and send_speed > 0:
+            app_state.robot.send_command(cmd, send_speed)
             was_moving = True
         elif was_moving:
             app_state.robot.stop()
@@ -1014,7 +1042,7 @@ def control_loop(app_state):
         refresh_brick_telemetry(app_state)
         
         # Track Motion
-        if cmd and speed > 0:
+        if cmd and send_speed > 0:
             atype = "unknown"
             if cmd == 'f': atype = "forward"
             elif cmd == 'b': atype = "backward"
@@ -1023,7 +1051,7 @@ def control_loop(app_state):
             elif cmd == 'u': atype = "mast_up"
             elif cmd == 'd': atype = "mast_down"
             
-            pwr = int(speed * 255)
+            pwr = int(send_speed * 255)
             evt = MotionEvent(atype, pwr, int(dt*1000))
             app_state.world.update_from_motion(evt)
             if app_state.active_attempt:
