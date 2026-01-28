@@ -13,7 +13,7 @@ from pathlib import Path
 
 from helper_robot_control import Robot
 from helper_brick_vision import BrickDetector
-from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
+from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, StepState, draw_telemetry_overlay
 
 # --- CONFIG ---
 GEAR_1_SPEED = 1.0  # Full speed instead of 0.32
@@ -24,9 +24,9 @@ SMART_REPLAY = True
 STREAM_ENABLED = True # Default, will be updated by args
 DEBUG_MODE = False
 DEMOS_DIR = Path(__file__).resolve().parent / "demos"
-OBJECTIVE_TIMEOUT = 10.0  # Seconds before declaring objective failure
+STEP_TIMEOUT = 10.0  # Seconds before declaring step failure
 RECOVER_TIMEOUT = 60.0  # Seconds to attempt recovery
-MAX_OBJECTIVE_ATTEMPTS = 5
+MAX_STEP_ATTEMPTS = 5
 BRICK_LOST_FAIL_TIME = 10.0
 TURN_SIGN = -1  # Invert turn direction for angle/offset alignment
 
@@ -58,7 +58,7 @@ METRIC_DIRECTIONS = {
     "lift_height": "band",
 }
 
-OBJECTIVE_METRICS = {
+STEP_METRICS = {
     "FIND": ("angle_abs", "offset_abs", "dist", "visible"),
     "SCOOP": ("angle_abs", "offset_abs", "dist", "visible"),
     "LIFT": ("lift_height",),
@@ -75,7 +75,7 @@ class AutoplayState:
         self.world = WorldModel()
         self.robot = None
         self.vision = None
-        self.active_objective = "UNKNOWN"
+        self.active_step = "UNKNOWN"
         self.status_msg = "Initializing..."
         
         # Logging
@@ -158,7 +158,7 @@ def vision_thread():
 
             if STREAM_ENABLED and app_state.vision.current_frame is not None:
                 frame = app_state.vision.current_frame.copy()
-                messages = [f"AUTO: {app_state.active_objective}", app_state.status_msg]
+                messages = [f"AUTO: {app_state.active_step}", app_state.status_msg]
                 draw_telemetry_overlay(frame, app_state.world, messages)
                 app_state.current_frame = frame
         
@@ -211,7 +211,7 @@ def load_demo(session_name, include_attempts=False):
     for entry in log_data:
         etype = entry.get('type')
         if etype == 'keyframe':
-            obj_field = entry.get('objective')
+            obj_field = entry.get('step')
             if obj_field: current_obj = obj_field
             marker = entry.get('marker')
             if marker == 'OBJ_SUCCESS' and current_obj and last_state_entry:
@@ -240,7 +240,7 @@ def load_demo(session_name, include_attempts=False):
                 power = event.get('power', 0)
                 duration_ms = event.get('duration_ms')
 
-            event_obj = entry.get('objective')
+            event_obj = entry.get('step')
             if event_obj:
                 current_obj = event_obj
             cmd = event_type_to_cmd(cmd_name)
@@ -310,7 +310,7 @@ def extract_demo_attempts(log_data):
             continue
         etype = entry.get('type')
         if etype == 'keyframe':
-            obj_field = entry.get('objective')
+            obj_field = entry.get('step')
             if obj_field:
                 current_obj = obj_field
             marker = entry.get('marker')
@@ -337,7 +337,7 @@ def extract_demo_attempts(log_data):
             power = event.get('power', 0)
             duration_ms = event.get('duration_ms')
 
-        event_obj = entry.get('objective')
+        event_obj = entry.get('step')
         if event_obj:
             current_obj = event_obj
         cmd = event_type_to_cmd(cmd_name)
@@ -376,14 +376,14 @@ def extract_attempt_segments(log_data):
             continue
         etype = entry.get("type")
         if etype == "keyframe":
-            obj_field = entry.get("objective")
+            obj_field = entry.get("step")
             if obj_field:
                 current_obj = obj_field
             marker = entry.get("marker")
             if marker in ATTEMPT_START_MARKERS:
                 close_segment()
                 current = {
-                    "objective": current_obj,
+                    "step": current_obj,
                     "type": ATTEMPT_START_MARKERS[marker],
                     "start": entry.get("timestamp"),
                     "end": None,
@@ -448,8 +448,8 @@ def build_stat_band(values, non_negative=False, clamp_min=None, clamp_max=None):
         "samples": len(values),
     }
 
-def extract_metrics_from_states(states, objective):
-    metrics = {m: [] for m in OBJECTIVE_METRICS.get(objective, ())}
+def extract_metrics_from_states(states, step):
+    metrics = {m: [] for m in STEP_METRICS.get(step, ())}
     if not metrics:
         return metrics
 
@@ -513,7 +513,7 @@ def pick_best_attempt(attempts, attempt_type):
         return None
     return max(sequences, key=lambda seq: sum(evt.get('duration', 0) for evt in seq))
 
-def pick_best_attempt_for_objective(attempts, attempt_type, objective):
+def pick_best_attempt_for_step(attempts, attempt_type, step):
     if not attempts:
         return None
     sequences = attempts.get(attempt_type, [])
@@ -523,7 +523,7 @@ def pick_best_attempt_for_objective(attempts, attempt_type, objective):
     best_seq = None
     best_duration = 0.0
     for seq in sequences:
-        obj_events = [evt for evt in seq if evt.get('obj') == objective]
+        obj_events = [evt for evt in seq if evt.get('obj') == step]
         duration = sum(evt.get('duration', 0) for evt in obj_events)
         if obj_events and duration > best_duration:
             best_duration = duration
@@ -553,7 +553,7 @@ def validate_log_integrity(log_path):
     for entry in log_data:
         if entry.get('type') != 'keyframe': continue
         marker = entry.get('marker', '')
-        obj = entry.get('objective', 'GLOBAL')
+        obj = entry.get('step', 'GLOBAL')
         if obj not in stats:
             stats[obj] = {"FAIL": 0, "RECOVER": 0, "COMPLETE": 0}
         
@@ -782,7 +782,7 @@ def aggregate_heuristics():
 
         segments = extract_attempt_segments(log_data)
         for seg in segments:
-            obj = seg.get("objective")
+            obj = seg.get("step")
             seg_type = seg.get("type")
             if not obj or not seg_type:
                 continue
@@ -825,7 +825,7 @@ def aggregate_heuristics():
                     if values:
                         gate_acc["failure"].setdefault(obj, {}).setdefault(metric, []).extend(values)
 
-    for obj, metric_list in OBJECTIVE_METRICS.items():
+    for obj, metric_list in STEP_METRICS.items():
         success_metrics = {}
         failure_metrics = {}
         for metric in metric_list:
@@ -904,14 +904,14 @@ def cmd_to_motion_type(cmd):
     m = {'f': 'forward', 'b': 'backward', 'l': 'left_turn', 'r': 'right_turn', 'u': 'mast_up', 'd': 'mast_down'}
     return m.get(cmd, 'wait')
 
-def objective_complete(world):
-    if world.objective_state == ObjectiveState.SCOOP:
+def step_complete(world):
+    if world.step_state == StepState.SCOOP:
         if world.verification_stage == "IDLE" and world.brick.get("seated"):
             return True
-    return world.check_objective_complete()
+    return world.check_step_complete()
 
 def get_scoop_verification_command(world):
-    if world.objective_state != ObjectiveState.SCOOP:
+    if world.step_state != StepState.SCOOP:
         return None
     stage = world.verification_stage
     if stage == "BACK":
@@ -933,7 +933,7 @@ def execute_and_track_smooth(cmd, duration, base_speed):
     
     evt = MotionEvent(m_type, pwm, int(duration * 1000))
     app_state.world.update_from_motion(evt)
-    app_state.logger.log_event(evt, app_state.world.objective_state.value)
+    app_state.logger.log_event(evt, app_state.world.step_state.value)
     
     # 2. Execute with dynamic speed adjustment - NO PAUSES
     start_time = time.time()
@@ -953,11 +953,11 @@ def execute_and_track_smooth(cmd, duration, base_speed):
         app_state.robot.send_command(cmd, current_speed)
         last_send = current_time 
 
-def replay_demo_attempt(events, objective, attempt_status, start_marker, end_marker, tick_hz=20):
+def replay_demo_attempt(events, step, attempt_status, start_marker, end_marker, tick_hz=20):
     if not events:
         return False
 
-    app_state.logger.log_keyframe(start_marker, objective)
+    app_state.logger.log_keyframe(start_marker, step)
     with app_state.lock:
         app_state.world.attempt_status = attempt_status
         app_state.world.recording_active = True
@@ -978,12 +978,12 @@ def replay_demo_attempt(events, objective, attempt_status, start_marker, end_mar
             motion_evt = MotionEvent(cmd_to_motion_type(cmd), int(speed * 255), int(step * 1000))
             with app_state.lock:
                 app_state.world.update_from_motion(motion_evt)
-            app_state.logger.log_event(motion_evt, objective)
+            app_state.logger.log_event(motion_evt, step)
             time.sleep(step)
             elapsed += step
 
     app_state.robot.stop()
-    app_state.logger.log_keyframe(end_marker, objective)
+    app_state.logger.log_keyframe(end_marker, step)
     with app_state.lock:
         app_state.world.attempt_status = "NORMAL"
         app_state.world.recording_active = False
@@ -1005,7 +1005,7 @@ def decide_next_action(world, attempt_speed):
         
         # Check if already aligned
         if abs(angle) <= 5.0 and abs(offset_x) <= 12.0:
-            return None, 0, "ALIGNED - OBJECTIVE COMPLETE"
+            return None, 0, "ALIGNED - STEP COMPLETE"
         
         # Prioritize angle correction
         if abs(angle) > 5.0:
@@ -1038,8 +1038,8 @@ def smooth_velocity(current_vel, target_vel, alpha=0.3):
 def turn_cmd_from_error(error):
     return 'l' if error * TURN_SIGN > 0 else 'r'
 
-def objective_display_label(obj_enum):
-    return "CARRY" if obj_enum == ObjectiveState.LIFT else obj_enum.value
+def step_display_label(obj_enum):
+    return "CARRY" if obj_enum == StepState.LIFT else obj_enum.value
 
 def _format_percent(delta, baseline):
     if baseline is None or baseline == 0:
@@ -1063,8 +1063,8 @@ def humanize_failure_reason(reason):
     rendered = [mapping.get(part, part) for part in parts if part]
     return "; ".join(rendered) if rendered else "failure gate triggered"
 
-def format_failure_details(world, objective, gate_eval, learned_rules, elapsed_s):
-    obj_name = objective.value if isinstance(objective, ObjectiveState) else objective
+def format_failure_details(world, step, gate_eval, learned_rules, elapsed_s):
+    obj_name = step.value if isinstance(step, StepState) else step
     gates = learned_rules.get(obj_name, {}).get("gates", {})
     success_metrics = gates.get("success", {}).get("metrics", {})
     temporal = gates.get("temporal", {})
@@ -1208,8 +1208,8 @@ def _resolve_start_gate_metrics(learned_rules, obj_name, fallback_obj=None):
 def _format_start_gate_reasons(reasons):
     return "; ".join(reasons) if reasons else ""
 
-def evaluate_start_gates(world, objective, learned_rules):
-    obj_name = objective.value if isinstance(objective, ObjectiveState) else objective
+def evaluate_start_gates(world, step, learned_rules):
+    obj_name = step.value if isinstance(step, StepState) else step
     reasons = []
     brick = world.brick or {}
     visible = bool(brick.get("visible"))
@@ -1287,13 +1287,13 @@ def scoop_commit_speed(world):
         return max(0.0, min(1.0, blind_speed))
     return SCOOP_APPROACH_SPEED
 
-def evaluate_phase_gates(world, objective, elapsed_s, learned_rules):
-    obj_name = objective.value if isinstance(objective, ObjectiveState) else objective
+def evaluate_phase_gates(world, step, elapsed_s, learned_rules):
+    obj_name = step.value if isinstance(step, StepState) else step
     gates = learned_rules.get(obj_name, {}).get("gates", {})
     success_metrics = gates.get("success", {}).get("metrics", {})
     failure_metrics = gates.get("failure", {}).get("metrics", {})
     temporal = gates.get("temporal", {})
-    metric_list = OBJECTIVE_METRICS.get(obj_name, ())
+    metric_list = STEP_METRICS.get(obj_name, ())
     now = time.time()
     fail_time = temporal.get("fail_time_s")
     fail_time_gate = None
@@ -1406,7 +1406,7 @@ def should_commit_scoop(world):
         return False
     return True
 
-def compute_target_velocity(brick_visible, angle, offset_x, dist, objective_state, world=None, correction=False):
+def compute_target_velocity(brick_visible, angle, offset_x, dist, step_state, world=None, correction=False):
     """
     Compute target velocity vector based on current perception.
     Returns: {'linear': forward_speed, 'angular': turn_speed}
@@ -1415,13 +1415,13 @@ def compute_target_velocity(brick_visible, angle, offset_x, dist, objective_stat
     if brick_visible:
         tol_ang = 5.0
         tol_off = 12.0
-        if objective_state == ObjectiveState.SCOOP and world:
+        if step_state == StepState.SCOOP and world:
             corridor = world.get_scoop_corridor_limits(dist)
             if corridor:
                 tol_off = corridor.get("max_offset_x", tol_off)
                 tol_ang = corridor.get("max_angle", tol_ang)
         aligned = abs(angle) <= tol_ang and abs(offset_x) <= tol_off
-        if objective_state == ObjectiveState.SCOOP:
+        if step_state == StepState.SCOOP:
             linear = SCOOP_APPROACH_SPEED if aligned else SCOOP_ALIGN_SPEED
         else:
             linear = 0.15  # Slow forward motion
@@ -1443,10 +1443,10 @@ def compute_target_velocity(brick_visible, angle, offset_x, dist, objective_stat
         return {'linear': linear, 'angular': angular * TURN_SIGN}
     else:
         # No brick - slow scanning turn unless we are committing the scoop
-        if objective_state == ObjectiveState.SCOOP and (should_commit_scoop(world) or scoop_blind_window_active(world)):
+        if step_state == StepState.SCOOP and (should_commit_scoop(world) or scoop_blind_window_active(world)):
             commit_speed = scoop_commit_speed(world)
             return {'linear': commit_speed, 'angular': 0.0}
-        if objective_state == ObjectiveState.SCOOP:
+        if step_state == StepState.SCOOP:
             return {'linear': 0.0, 'angular': 0.25 * TURN_SIGN}  # Slower scan during scoop
         return {'linear': 0.0, 'angular': 0.3 * TURN_SIGN}  # Turn to scan
 
@@ -1499,15 +1499,15 @@ def continuous_autoplay(learned_rules):
     print(f"CONTINUOUS VELOCITY CONTROL - Smooth flow toward target")
     print(f"{'='*60}")
     
-    objectives = [ObjectiveState.FIND, ObjectiveState.SCOOP, ObjectiveState.LIFT, ObjectiveState.PLACE]
-    objective_index = 0
+    steps = [StepState.FIND, StepState.SCOOP, StepState.LIFT, StepState.PLACE]
+    step_index = 0
     with app_state.lock:
-        app_state.active_objective = objectives[objective_index].value
-        app_state.status_msg = f"Objective: {objectives[objective_index].value}"
-        app_state.world.objective_state = objectives[objective_index]
+        app_state.active_step = steps[step_index].value
+        app_state.status_msg = f"Step: {steps[step_index].value}"
+        app_state.world.step_state = steps[step_index]
     
     app_state.logger.log_keyframe("JOB_START")
-    app_state.logger.log_keyframe("OBJ_START", app_state.world.objective_state.value)
+    app_state.logger.log_keyframe("OBJ_START", app_state.world.step_state.value)
     
     # Control parameters
     CONTROL_HZ = 20  # 20 Hz control loop
@@ -1516,7 +1516,7 @@ def continuous_autoplay(learned_rules):
     # State variables
     current_velocity = {'linear': 0.0, 'angular': 0.1 * TURN_SIGN}  # Start with slow turn
     run_start = time.time()
-    objective_start = run_start
+    step_start = run_start
     cycle_count = 0
     last_log_time = run_start
     
@@ -1527,7 +1527,7 @@ def continuous_autoplay(learned_rules):
     print("  └─ Failure detection: Learned gates + temporal envelopes")
     
     # MAIN CONTROL LOOP - Fixed frequency
-    failure_objective = app_state.world.objective_state.value
+    failure_step = app_state.world.step_state.value
     while app_state.running:
         cycle_start = time.time()
         
@@ -1536,47 +1536,47 @@ def continuous_autoplay(learned_rules):
         
         # 1. GET TELEMETRY (non-blocking read from shared state)
         with app_state.lock:
-            current_objective = app_state.world.objective_state
-            current_objective_label = current_objective.value
-            elapsed = time.time() - objective_start
-            gate_eval = evaluate_phase_gates(app_state.world, current_objective, elapsed, app_state.world.learned_rules)
+            current_step = app_state.world.step_state
+            current_step_label = current_step.value
+            elapsed = time.time() - step_start
+            gate_eval = evaluate_phase_gates(app_state.world, current_step, elapsed, app_state.world.learned_rules)
 
             # Check completion
-            objective_done = False
-            if current_objective in (ObjectiveState.LIFT, ObjectiveState.PLACE):
-                action_duration = LIFT_ACTION_DURATION if current_objective == ObjectiveState.LIFT else PLACE_ACTION_DURATION
+            step_done = False
+            if current_step in (StepState.LIFT, StepState.PLACE):
+                action_duration = LIFT_ACTION_DURATION if current_step == StepState.LIFT else PLACE_ACTION_DURATION
                 if elapsed >= action_duration:
-                    objective_done = True
-            elif objective_complete(app_state.world):
-                objective_done = True
+                    step_done = True
+            elif step_complete(app_state.world):
+                step_done = True
 
-            if objective_done:
-                print(f"\n✓ {current_objective_label} Objective Complete! (after {cycle_count} cycles)")
-                app_state.logger.log_keyframe("OBJ_SUCCESS", current_objective_label)
+            if step_done:
+                print(f"\n✓ {current_step_label} Step Complete! (after {cycle_count} cycles)")
+                app_state.logger.log_keyframe("OBJ_SUCCESS", current_step_label)
                 app_state.robot.stop()
-                if objective_index < len(objectives) - 1:
-                    next_obj = objectives[objective_index + 1]
+                if step_index < len(steps) - 1:
+                    next_obj = steps[step_index + 1]
                     start_eval = evaluate_start_gates(app_state.world, next_obj, app_state.world.learned_rules)
                     if not start_eval["ok"]:
                         reason = _format_start_gate_reasons(start_eval["reasons"])
                         failure_reason = f"start gate blocked: {reason}"
-                        failure_objective = next_obj.value
-                        print(f"Start gate blocked for {objective_display_label(next_obj)}: {reason}")
+                        failure_step = next_obj.value
+                        print(f"Start gate blocked for {step_display_label(next_obj)}: {reason}")
                         break
-                    objective_index += 1
-                    app_state.active_objective = next_obj.value
-                    app_state.status_msg = f"Objective: {next_obj.value}"
-                    app_state.world.objective_state = next_obj
-                    if next_obj == ObjectiveState.SCOOP:
+                    step_index += 1
+                    app_state.active_step = next_obj.value
+                    app_state.status_msg = f"Step: {next_obj.value}"
+                    app_state.world.step_state = next_obj
+                    if next_obj == StepState.SCOOP:
                         app_state.world.brick["seated"] = False
                         app_state.world.verification_stage = "IDLE"
                         app_state.world.verify_dist_mm = 0.0
                         app_state.world.verify_turn_deg = 0.0
                         app_state.world.verify_vision_hits = 0
-                    elif next_obj == ObjectiveState.PLACE:
+                    elif next_obj == StepState.PLACE:
                         app_state.world.brick["seated"] = True
                     app_state.logger.log_keyframe("OBJ_START", next_obj.value)
-                    objective_start = time.time()
+                    step_start = time.time()
                     current_velocity = {'linear': 0.0, 'angular': 0.1 * TURN_SIGN}
                     continue
                 break
@@ -1590,23 +1590,23 @@ def continuous_autoplay(learned_rules):
         correction_mode = gate_eval.get("correction", False)
         if gate_eval.get("fail"):
             readable_reason = humanize_failure_reason(gate_eval.get("reason"))
-            print(f"Failure detected for {objective_display_label(current_objective)}: {readable_reason} (elapsed {elapsed:.1f}s)")
-            for detail in format_failure_details(app_state.world, current_objective, gate_eval, app_state.world.learned_rules, elapsed):
+            print(f"Failure detected for {step_display_label(current_step)}: {readable_reason} (elapsed {elapsed:.1f}s)")
+            for detail in format_failure_details(app_state.world, current_step, gate_eval, app_state.world.learned_rules, elapsed):
                 print(f"  - {detail}")
             failure_reason = readable_reason
-            failure_objective = current_objective_label
+            failure_step = current_step_label
             break
         
-        if current_objective in (ObjectiveState.LIFT, ObjectiveState.PLACE):
-            cmd = 'u' if current_objective == ObjectiveState.LIFT else 'd'
-            speed = LIFT_ACTION_SPEED if current_objective == ObjectiveState.LIFT else PLACE_ACTION_SPEED
+        if current_step in (StepState.LIFT, StepState.PLACE):
+            cmd = 'u' if current_step == StepState.LIFT else 'd'
+            speed = LIFT_ACTION_SPEED if current_step == StepState.LIFT else PLACE_ACTION_SPEED
             app_state.robot.send_command(cmd, speed)
             evt = MotionEvent(cmd_to_motion_type(cmd), int(speed * 255), int(CONTROL_DT * 1000))
             with app_state.lock:
                 app_state.world.update_from_motion(evt)
-                action_label = "LIFTING" if current_objective == ObjectiveState.LIFT else "LOWERING"
-                app_state.status_msg = f"{current_objective_label}: {action_label}"
-            app_state.logger.log_event(evt, current_objective_label)
+                action_label = "LIFTING" if current_step == StepState.LIFT else "LOWERING"
+                app_state.status_msg = f"{current_step_label}: {action_label}"
+            app_state.logger.log_event(evt, current_step_label)
         elif verification_cmd:
             cmd, speed, reason = verification_cmd
             actual_speed = GEAR_1_SPEED * speed
@@ -1615,10 +1615,10 @@ def continuous_autoplay(learned_rules):
             with app_state.lock:
                 app_state.world.update_from_motion(evt)
                 app_state.status_msg = f"SCOOP {reason}"
-            app_state.logger.log_event(evt, current_objective_label)
+            app_state.logger.log_event(evt, current_step_label)
         else:
             # 2. COMPUTE TARGET VELOCITY VECTOR
-            target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, current_objective, app_state.world, correction=correction_mode)
+            target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, current_step, app_state.world, correction=correction_mode)
             
             # 3. SMOOTH VELOCITY (blend with previous)
             smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
@@ -1633,17 +1633,17 @@ def continuous_autoplay(learned_rules):
             with app_state.lock:
                 app_state.world.update_from_motion(evt)
                 app_state.status_msg = "ALIGNING" if brick_visible else "SCANNING"
-            app_state.logger.log_event(evt, current_objective_label)
+            app_state.logger.log_event(evt, current_step_label)
         
         # Update state
-        if current_objective not in (ObjectiveState.LIFT, ObjectiveState.PLACE) and not verification_cmd:
+        if current_step not in (StepState.LIFT, StepState.PLACE) and not verification_cmd:
             current_velocity = smoothed_velocity
         cycle_count += 1
         
         # Periodic logging (every 2 seconds)
         if time.time() - last_log_time > 2.0:
-            if current_objective in (ObjectiveState.LIFT, ObjectiveState.PLACE):
-                status = "LIFTING" if current_objective == ObjectiveState.LIFT else "LOWERING"
+            if current_step in (StepState.LIFT, StepState.PLACE):
+                status = "LIFTING" if current_step == StepState.LIFT else "LOWERING"
                 vel_str = f"cmd={cmd}@{speed:.2f}"
             elif verification_cmd:
                 status = "VERIFYING"
@@ -1666,11 +1666,11 @@ def continuous_autoplay(learned_rules):
     app_state.robot.stop()
     
     if failure_reason:
-        print(f"\n✗ {failure_objective} Objective FAILED: {failure_reason}")
-        app_state.logger.log_keyframe("FAIL_START", failure_objective)
-        app_state.logger.log_keyframe("FAIL_END", failure_objective)
+        print(f"\n✗ {failure_step} Step FAILED: {failure_reason}")
+        app_state.logger.log_keyframe("FAIL_START", failure_step)
+        app_state.logger.log_keyframe("FAIL_END", failure_step)
     
-    app_state.logger.log_keyframe("JOB_SUCCESS")  # Job completes even if objective failed
+    app_state.logger.log_keyframe("JOB_SUCCESS")  # Job completes even if step failed
     
     avg_hz = cycle_count / total_time if total_time > 0 else 0
     status_icon = "✗" if failure_reason else "✓"
@@ -1701,13 +1701,13 @@ def main_autoplay(session_name, scenarios=None):
         if needs_recover:
             demo_recover = pick_best_attempt(demo_attempts, "RECOVER")
         if (needs_success or needs_recover) and demo_attempts:
-            for obj in (ObjectiveState.FIND, ObjectiveState.SCOOP, ObjectiveState.LIFT, ObjectiveState.PLACE):
-                demo_success_by_obj[obj.value] = pick_best_attempt_for_objective(
+            for obj in (StepState.FIND, StepState.SCOOP, StepState.LIFT, StepState.PLACE):
+                demo_success_by_obj[obj.value] = pick_best_attempt_for_step(
                     demo_attempts,
                     "SUCCESS",
                     obj.value
                 )
-                demo_recover_by_obj[obj.value] = pick_best_attempt_for_objective(
+                demo_recover_by_obj[obj.value] = pick_best_attempt_for_step(
                     demo_attempts,
                     "RECOVER",
                     obj.value
@@ -1728,7 +1728,7 @@ def main_autoplay(session_name, scenarios=None):
             if app_state.current_frame is not None: break
         time.sleep(0.1)
 
-    def run_recover_for_objective(obj_enum):
+    def run_recover_for_step(obj_enum):
         print(f"  → Recovery for {obj_enum.value} (timeout={RECOVER_TIMEOUT}s)")
         demo_recover_seq = demo_recover_by_obj.get(obj_enum.value) or demo_recover
         if demo_recover_seq:
@@ -1745,23 +1745,23 @@ def main_autoplay(session_name, scenarios=None):
 
         app_state.logger.log_keyframe("RECOVER_START", obj_enum.value)
         with app_state.lock:
-            app_state.world.objective_state = obj_enum
-            app_state.active_objective = obj_enum.value
-            app_state.status_msg = f"Objective: {obj_enum.value} (RECOVERY)"
+            app_state.world.step_state = obj_enum
+            app_state.active_step = obj_enum.value
+            app_state.status_msg = f"Step: {obj_enum.value} (RECOVERY)"
             app_state.world.attempt_status = "RECOVERY"
-            if obj_enum == ObjectiveState.SCOOP:
+            if obj_enum == StepState.SCOOP:
                 app_state.world.brick["seated"] = False
                 app_state.world.verification_stage = "IDLE"
                 app_state.world.verify_dist_mm = 0.0
                 app_state.world.verify_turn_deg = 0.0
                 app_state.world.verify_vision_hits = 0
-            elif obj_enum == ObjectiveState.PLACE:
+            elif obj_enum == StepState.PLACE:
                 app_state.world.brick["seated"] = True
 
-        if obj_enum in (ObjectiveState.LIFT, ObjectiveState.PLACE):
-            action_cmd = 'u' if obj_enum == ObjectiveState.LIFT else 'd'
-            action_speed = LIFT_ACTION_SPEED if obj_enum == ObjectiveState.LIFT else PLACE_ACTION_SPEED
-            action_duration = LIFT_ACTION_DURATION if obj_enum == ObjectiveState.LIFT else PLACE_ACTION_DURATION
+        if obj_enum in (StepState.LIFT, StepState.PLACE):
+            action_cmd = 'u' if obj_enum == StepState.LIFT else 'd'
+            action_speed = LIFT_ACTION_SPEED if obj_enum == StepState.LIFT else PLACE_ACTION_SPEED
+            action_duration = LIFT_ACTION_DURATION if obj_enum == StepState.LIFT else PLACE_ACTION_DURATION
             action_start = time.time()
 
             while time.time() - action_start < action_duration:
@@ -1769,7 +1769,7 @@ def main_autoplay(session_name, scenarios=None):
                 evt = MotionEvent(cmd_to_motion_type(action_cmd), int(action_speed * 255), 50)
                 with app_state.lock:
                     app_state.world.update_from_motion(evt)
-                    action_label = "LIFTING" if obj_enum == ObjectiveState.LIFT else "LOWERING"
+                    action_label = "LIFTING" if obj_enum == StepState.LIFT else "LOWERING"
                     app_state.status_msg = f"{obj_enum.value}: {action_label}"
                 app_state.logger.log_event(evt, obj_enum.value)
                 time.sleep(0.05)
@@ -1786,7 +1786,7 @@ def main_autoplay(session_name, scenarios=None):
         cycles = 0
         while time.time() - recover_start < RECOVER_TIMEOUT:
             with app_state.lock:
-                if objective_complete(app_state.world):
+                if step_complete(app_state.world):
                     app_state.logger.log_keyframe("OBJ_SUCCESS", obj_enum.value)
                     app_state.logger.log_keyframe("RECOVER_END", obj_enum.value)
                     with app_state.lock:
@@ -1797,7 +1797,7 @@ def main_autoplay(session_name, scenarios=None):
                 angle = app_state.world.brick['angle']
                 offset_x = app_state.world.brick['offset_x']
                 dist = app_state.world.brick['dist']
-                objective_state = app_state.world.objective_state
+                step_state = app_state.world.step_state
                 verification_cmd = get_scoop_verification_command(app_state.world)
 
             if verification_cmd:
@@ -1809,7 +1809,7 @@ def main_autoplay(session_name, scenarios=None):
                     app_state.status_msg = f"SCOOP {reason}"
                 app_state.logger.log_event(evt, obj_enum.value)
             else:
-                target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, objective_state, app_state.world)
+                target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, step_state, app_state.world)
                 smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
                 cmd, speed = velocity_to_command(smoothed_velocity)
                 app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
@@ -1824,7 +1824,7 @@ def main_autoplay(session_name, scenarios=None):
             time.sleep(0.05)
 
         app_state.robot.stop()
-        print(f"Recovery timed out for {objective_display_label(obj_enum)} after {RECOVER_TIMEOUT:.1f}s")
+        print(f"Recovery timed out for {step_display_label(obj_enum)} after {RECOVER_TIMEOUT:.1f}s")
         app_state.logger.log_keyframe("FAIL_START", obj_enum.value)
         app_state.logger.log_keyframe("FAIL_END", obj_enum.value)
         with app_state.lock:
@@ -1860,9 +1860,9 @@ def main_autoplay(session_name, scenarios=None):
         
         with app_state.lock:
             app_state.world.reset_mission()
-            app_state.world.objective_state = ObjectiveState.FIND
-            app_state.active_objective = ObjectiveState.FIND.value
-            app_state.status_msg = f"Objective: {ObjectiveState.FIND.value}"
+            app_state.world.step_state = StepState.FIND
+            app_state.active_step = StepState.FIND.value
+            app_state.status_msg = f"Step: {StepState.FIND.value}"
             app_state.world.attempt_status = "NORMAL"
             if use_demo_fail:
                 app_state.world.attempt_status = "FAIL"
@@ -1881,42 +1881,42 @@ def main_autoplay(session_name, scenarios=None):
             scenario_deadline = run_start + timeout
             cycle_count = 0
             success_flag = True
-            failed_objective = None
+            failed_step = None
             failed_reason = None
             failure_logged = False
 
             if scenario_type == "normal":
-                objectives = [ObjectiveState.FIND, ObjectiveState.SCOOP, ObjectiveState.LIFT, ObjectiveState.PLACE]
-                for obj in objectives:
+                steps = [StepState.FIND, StepState.SCOOP, StepState.LIFT, StepState.PLACE]
+                for obj in steps:
                     attempts = 0
-                    objective_success = False
+                    step_success = False
                     last_failure_reason = None
-                    obj_label = "CARRY" if obj == ObjectiveState.LIFT else obj.value
-                    while attempts < MAX_OBJECTIVE_ATTEMPTS and not objective_success:
+                    obj_label = "CARRY" if obj == StepState.LIFT else obj.value
+                    while attempts < MAX_STEP_ATTEMPTS and not step_success:
                         attempts += 1
                         with app_state.lock:
-                            app_state.world.objective_state = obj
-                            app_state.active_objective = obj.value
-                            app_state.status_msg = f"Objective: {obj_label} (attempt {attempts}/{MAX_OBJECTIVE_ATTEMPTS})"
-                            if obj == ObjectiveState.SCOOP:
+                            app_state.world.step_state = obj
+                            app_state.active_step = obj.value
+                            app_state.status_msg = f"Step: {obj_label} (attempt {attempts}/{MAX_STEP_ATTEMPTS})"
+                            if obj == StepState.SCOOP:
                                 app_state.world.brick["seated"] = False
                                 app_state.world.verification_stage = "IDLE"
                                 app_state.world.verify_dist_mm = 0.0
                                 app_state.world.verify_turn_deg = 0.0
                                 app_state.world.verify_vision_hits = 0
-                            elif obj == ObjectiveState.PLACE:
+                            elif obj == StepState.PLACE:
                                 app_state.world.brick["seated"] = True
 
-                        print(f"{obj_label} (attempt {attempts}/{MAX_OBJECTIVE_ATTEMPTS})")
+                        print(f"{obj_label} (attempt {attempts}/{MAX_STEP_ATTEMPTS})")
                         start_eval = evaluate_start_gates(app_state.world, obj, app_state.world.learned_rules)
                         if not start_eval["ok"]:
                             reason = _format_start_gate_reasons(start_eval["reasons"])
-                            print(f"Start gate blocked for {objective_display_label(obj)}: {reason}")
+                            print(f"Start gate blocked for {step_display_label(obj)}: {reason}")
                             app_state.logger.log_keyframe("FAIL_START", obj.value)
                             app_state.logger.log_keyframe("FAIL_END", obj.value)
                             failure_logged = True
                             last_failure_reason = f"start gate: {reason}"
-                            run_recover_for_objective(obj)
+                            run_recover_for_step(obj)
                             continue
                         app_state.logger.log_keyframe("OBJ_START", obj.value)
                         current_velocity = {'linear': 0.0, 'angular': 0.1 * TURN_SIGN}
@@ -1925,17 +1925,17 @@ def main_autoplay(session_name, scenarios=None):
                         demo_success = demo_success_by_obj.get(obj.value)
 
                         while True:
-                            if demo_success and obj in (ObjectiveState.LIFT, ObjectiveState.PLACE):
+                            if demo_success and obj in (StepState.LIFT, StepState.PLACE):
                                 print(f"  → Replaying SUCCESS demo for {obj.value}")
                                 if replay_demo_attempt(demo_success, obj.value, "NORMAL", "SUCCESS_START", "SUCCESS_END"):
                                     app_state.logger.log_keyframe("OBJ_SUCCESS", obj.value)
-                                    objective_success = True
+                                    step_success = True
                                 break
 
-                            if obj in (ObjectiveState.LIFT, ObjectiveState.PLACE):
-                                action_cmd = 'u' if obj == ObjectiveState.LIFT else 'd'
-                                action_speed = LIFT_ACTION_SPEED if obj == ObjectiveState.LIFT else PLACE_ACTION_SPEED
-                                action_duration = LIFT_ACTION_DURATION if obj == ObjectiveState.LIFT else PLACE_ACTION_DURATION
+                            if obj in (StepState.LIFT, StepState.PLACE):
+                                action_cmd = 'u' if obj == StepState.LIFT else 'd'
+                                action_speed = LIFT_ACTION_SPEED if obj == StepState.LIFT else PLACE_ACTION_SPEED
+                                action_duration = LIFT_ACTION_DURATION if obj == StepState.LIFT else PLACE_ACTION_DURATION
                                 action_start = time.time()
 
                                 while time.time() - action_start < action_duration:
@@ -1943,7 +1943,7 @@ def main_autoplay(session_name, scenarios=None):
                                     evt = MotionEvent(cmd_to_motion_type(action_cmd), int(action_speed * 255), 50)
                                     with app_state.lock:
                                         app_state.world.update_from_motion(evt)
-                                        action_label = "LIFTING" if obj == ObjectiveState.LIFT else "LOWERING"
+                                        action_label = "LIFTING" if obj == StepState.LIFT else "LOWERING"
                                         app_state.status_msg = f"{obj.value}: {action_label}"
                                     app_state.logger.log_event(evt, obj.value)
                                     time.sleep(0.05)
@@ -1951,29 +1951,29 @@ def main_autoplay(session_name, scenarios=None):
                                 app_state.robot.stop()
                                 if time.time() - action_start >= action_duration:
                                     app_state.logger.log_keyframe("OBJ_SUCCESS", obj.value)
-                                    objective_success = True
+                                    step_success = True
                                 break
 
                             with app_state.lock:
                                 elapsed = time.time() - obj_start
                                 gate_eval = evaluate_phase_gates(app_state.world, obj, elapsed, app_state.world.learned_rules)
-                                if objective_complete(app_state.world):
-                                    print(f"  ✓ {obj.value} Objective complete! ({obj_cycles} cycles)\n")
+                                if step_complete(app_state.world):
+                                    print(f"  ✓ {obj.value} Step complete! ({obj_cycles} cycles)\n")
                                     app_state.logger.log_keyframe("OBJ_SUCCESS", obj.value)
-                                    objective_success = True
+                                    step_success = True
                                     break
 
                                 brick_visible = app_state.world.brick['visible']
                                 angle = app_state.world.brick['angle']
                                 offset_x = app_state.world.brick['offset_x']
                                 dist = app_state.world.brick['dist']
-                                objective_state = app_state.world.objective_state
+                                step_state = app_state.world.step_state
                                 verification_cmd = get_scoop_verification_command(app_state.world)
 
                             correction_mode = gate_eval.get("correction", False)
                             if gate_eval.get("fail"):
                                 readable_reason = humanize_failure_reason(gate_eval.get("reason"))
-                                print(f"Failure detected for {objective_display_label(obj)}: {readable_reason} (attempt {attempts}/{MAX_OBJECTIVE_ATTEMPTS}, elapsed {elapsed:.1f}s)")
+                                print(f"Failure detected for {step_display_label(obj)}: {readable_reason} (attempt {attempts}/{MAX_STEP_ATTEMPTS}, elapsed {elapsed:.1f}s)")
                                 for detail in format_failure_details(app_state.world, obj, gate_eval, app_state.world.learned_rules, elapsed):
                                     print(f"  - {detail}")
                                 last_failure_reason = readable_reason
@@ -1988,7 +1988,7 @@ def main_autoplay(session_name, scenarios=None):
                                     app_state.status_msg = f"SCOOP {reason}"
                                 app_state.logger.log_event(evt, obj.value)
                             else:
-                                target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, objective_state, app_state.world, correction=correction_mode)
+                                target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, step_state, app_state.world, correction=correction_mode)
                                 smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
                                 cmd, speed = velocity_to_command(smoothed_velocity)
                                 app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
@@ -2005,7 +2005,7 @@ def main_autoplay(session_name, scenarios=None):
 
                         app_state.robot.stop()
 
-                        if objective_success:
+                        if step_success:
                             break
 
                         app_state.logger.log_keyframe("FAIL_START", obj.value)
@@ -2013,12 +2013,12 @@ def main_autoplay(session_name, scenarios=None):
                         failure_logged = True
                         if not last_failure_reason:
                             last_failure_reason = "Failure condition met"
-                        run_recover_for_objective(obj)
+                        run_recover_for_step(obj)
 
-                    if not objective_success:
+                    if not step_success:
                         success_flag = False
-                        failed_objective = obj.value
-                        failed_reason = f"Exceeded {MAX_OBJECTIVE_ATTEMPTS} attempts"
+                        failed_step = obj.value
+                        failed_reason = f"Exceeded {MAX_STEP_ATTEMPTS} attempts"
                         if last_failure_reason:
                             failed_reason += f" (last: {last_failure_reason})"
                         break
@@ -2028,9 +2028,9 @@ def main_autoplay(session_name, scenarios=None):
                 while time.time() < scenario_deadline:
                     with app_state.lock:
                         elapsed = time.time() - run_start
-                        gate_eval = evaluate_phase_gates(app_state.world, app_state.world.objective_state, elapsed, app_state.world.learned_rules)
-                        if objective_complete(app_state.world):
-                            print(f"  ✓ Objective complete! ({cycle_count} cycles)\n")
+                        gate_eval = evaluate_phase_gates(app_state.world, app_state.world.step_state, elapsed, app_state.world.learned_rules)
+                        if step_complete(app_state.world):
+                            print(f"  ✓ Step complete! ({cycle_count} cycles)\n")
                             app_state.logger.log_keyframe("OBJ_SUCCESS", "FIND")
                             success_flag = True
                             break
@@ -2039,14 +2039,14 @@ def main_autoplay(session_name, scenarios=None):
                         angle = app_state.world.brick['angle']
                         offset_x = app_state.world.brick['offset_x']
                         dist = app_state.world.brick['dist']
-                        objective_state = app_state.world.objective_state
+                        step_state = app_state.world.step_state
                         verification_cmd = get_scoop_verification_command(app_state.world)
 
                     correction_mode = gate_eval.get("correction", False)
                     if gate_eval.get("fail"):
                         readable_reason = humanize_failure_reason(gate_eval.get("reason"))
-                        print(f"Failure detected for {objective_display_label(app_state.world.objective_state)}: {readable_reason} (elapsed {elapsed:.1f}s)")
-                        for detail in format_failure_details(app_state.world, app_state.world.objective_state, gate_eval, app_state.world.learned_rules, elapsed):
+                        print(f"Failure detected for {step_display_label(app_state.world.step_state)}: {readable_reason} (elapsed {elapsed:.1f}s)")
+                        for detail in format_failure_details(app_state.world, app_state.world.step_state, gate_eval, app_state.world.learned_rules, elapsed):
                             print(f"  - {detail}")
                         break
                     if verification_cmd:
@@ -2056,9 +2056,9 @@ def main_autoplay(session_name, scenarios=None):
                         with app_state.lock:
                             app_state.world.update_from_motion(evt)
                             app_state.status_msg = f"SCOOP {reason}"
-                        app_state.logger.log_event(evt, objective_state.value)
+                        app_state.logger.log_event(evt, step_state.value)
                     else:
-                        target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, objective_state, app_state.world, correction=correction_mode)
+                        target_velocity = compute_target_velocity(brick_visible, angle, offset_x, dist, step_state, app_state.world, correction=correction_mode)
                         smoothed_velocity = smooth_velocity(current_velocity, target_velocity, alpha=0.3)
                         cmd, speed = velocity_to_command(smoothed_velocity)
                         app_state.robot.send_command(cmd, GEAR_1_SPEED * speed)
@@ -2066,7 +2066,7 @@ def main_autoplay(session_name, scenarios=None):
                         with app_state.lock:
                             app_state.world.update_from_motion(evt)
                             app_state.status_msg = "ALIGNING" if brick_visible else "SCANNING"
-                        app_state.logger.log_event(evt, objective_state.value)
+                        app_state.logger.log_event(evt, step_state.value)
                         current_velocity = smoothed_velocity
 
                     cycle_count += 1
@@ -2082,7 +2082,7 @@ def main_autoplay(session_name, scenarios=None):
                     failed_reason = "Failure conditions not met"
                 print(f"  ✗ Failed: {failed_reason}\n")
                 if not failure_logged:
-                    fail_obj = failed_objective or "FIND"
+                    fail_obj = failed_step or "FIND"
                     app_state.logger.log_keyframe("FAIL_START", fail_obj)
                     app_state.logger.log_keyframe("FAIL_END", fail_obj)
             elif scenario_type == "recover":

@@ -9,12 +9,12 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from helper_demo_log_utils import extract_attempt_segments, load_demo_logs, normalize_objective_label
+from helper_demo_log_utils import extract_attempt_segments, load_demo_logs, normalize_step_label
 from helper_robot_control import Robot
 import telemetry_brick
 import telemetry_robot as telemetry_robot_module
 import telemetry_wall
-from telemetry_robot import WorldModel, MotionEvent, ObjectiveState
+from telemetry_robot import WorldModel, MotionEvent, StepState
 from helper_stream_server import StreamServer
 from helper_vision_aruco import ArucoBrickVision
 
@@ -51,13 +51,13 @@ def load_process_sequence(model_path=WORLD_MODEL_PROCESS_FILE):
             model = json.load(f)
     except (OSError, json.JSONDecodeError):
         return list(PHASE_SEQUENCE)
-    objectives = model.get("objectives")
-    if not isinstance(objectives, dict) or not objectives:
+    steps = model.get("steps")
+    if not isinstance(steps, dict) or not steps:
         return list(PHASE_SEQUENCE)
     sequence = []
     seen = set()
-    for name in objectives.keys():
-        normalized = normalize_objective_label(name)
+    for name in steps.keys():
+        normalized = normalize_step_label(name)
         if not normalized or normalized in seen:
             continue
         sequence.append(normalized)
@@ -298,40 +298,40 @@ def _normalize_attempt_type(attempt_type):
     return None
 
 
-def _normalize_objective_label(objective):
-    if objective is None:
+def _normalize_step_label(step):
+    if step is None:
         return None
-    if isinstance(objective, ObjectiveState):
-        return objective.value
-    return normalize_objective_label(objective)
+    if isinstance(step, StepState):
+        return step.value
+    return normalize_step_label(step)
 
 
-def _objective_state_from_label(label):
+def _step_state_from_label(label):
     if not label:
         return None
-    label = normalize_objective_label(label)
+    label = normalize_step_label(label)
     try:
-        return ObjectiveState(label)
+        return StepState(label)
     except ValueError:
         return None
 
 
-def select_demo_attempt_segment(logs, objective, attempt_type):
-    target_obj = _normalize_objective_label(objective)
+def select_demo_attempt_segment(logs, step, attempt_type):
+    target_obj = _normalize_step_label(step)
     target_type = _normalize_attempt_type(attempt_type)
     if not target_obj or not target_type:
         return None, None
 
-    def collect_matches(allow_objective_span):
+    def collect_matches(allow_step_span):
         found = []
         for path, data in logs:
             for seg in extract_attempt_segments(data):
-                seg_obj = normalize_objective_label(seg.get("objective"))
+                seg_obj = normalize_step_label(seg.get("step"))
                 if seg_obj != target_obj:
                     continue
                 if seg.get("type") != target_type:
                     continue
-                if not allow_objective_span and seg.get("source") == "objective":
+                if not allow_step_span and seg.get("source") == "step":
                     continue
                 events = seg.get("events") or []
                 event_count = len(events)
@@ -341,9 +341,9 @@ def select_demo_attempt_segment(logs, objective, attempt_type):
                 found.append((event_count, duration, seg, path))
         return found
 
-    matches = collect_matches(allow_objective_span=False)
+    matches = collect_matches(allow_step_span=False)
     if not matches and target_type == "SUCCESS":
-        matches = collect_matches(allow_objective_span=True)
+        matches = collect_matches(allow_step_span=True)
 
     if not matches:
         return None, None
@@ -391,7 +391,7 @@ def merge_motion_sequence(sequence, speed_tol=0.02):
     return merged
 
 
-def replay_motion_sequence(sequence, objective, robot, vision, world, telemetry_logger=None,
+def replay_motion_sequence(sequence, step, robot, vision, world, telemetry_logger=None,
                            stream_state=None, frame_callback=None, log_rate_hz=10, stop_flag=None):
     if not sequence:
         return False
@@ -409,7 +409,7 @@ def replay_motion_sequence(sequence, objective, robot, vision, world, telemetry_
             evt = MotionEvent(_cmd_to_motion_type(primitive.cmd), int(primitive.speed * 255), int(step * 1000))
             world.update_from_motion(evt)
             if telemetry_logger:
-                telemetry_logger.log_event(evt, objective)
+                telemetry_logger.log_event(evt, step)
                 telemetry_logger.log_state(world)
             time.sleep(step)
             elapsed += step
@@ -418,13 +418,13 @@ def replay_motion_sequence(sequence, objective, robot, vision, world, telemetry_
     return True
 
 
-def run_demo_attempt(objective, attempt_type, session_name=None, robot=None, vision=None, world=None,
+def run_demo_attempt(step, attempt_type, session_name=None, robot=None, vision=None, world=None,
                      telemetry_logger=None, stream_state=None, frame_callback=None,
                      log_rate_hz=10, stop_flag=None):
-    target_obj = _normalize_objective_label(objective)
+    target_obj = _normalize_step_label(step)
     target_type = _normalize_attempt_type(attempt_type)
     if not target_obj or not target_type:
-        return False, f"Unknown objective or attempt: {objective} / {attempt_type}"
+        return False, f"Unknown step or attempt: {step} / {attempt_type}"
 
     logs = load_demo_logs(DEMO_DIR, session_name)
     segment, source = select_demo_attempt_segment(logs, target_obj, target_type)
@@ -446,9 +446,9 @@ def run_demo_attempt(objective, attempt_type, session_name=None, robot=None, vis
     if world is None:
         world = WorldModel()
 
-    obj_state = _objective_state_from_label(target_obj)
+    obj_state = _step_state_from_label(target_obj)
     if obj_state:
-        world.objective_state = obj_state
+        world.step_state = obj_state
 
     try:
         ok = replay_motion_sequence(
@@ -486,7 +486,7 @@ def summarize_demo_stats(logs):
         segments = extract_attempt_segments(data)
         total_segments += len(segments)
         for seg in segments:
-            obj = normalize_objective_label(seg.get("objective")) or "UNKNOWN"
+            obj = normalize_step_label(seg.get("step")) or "UNKNOWN"
             seg_type = seg.get("type") or "UNKNOWN"
             counts.setdefault(obj, {}).setdefault(seg_type, 0)
             counts[obj][seg_type] += 1
@@ -582,11 +582,11 @@ def collect_attempt_segments(logs, attempt_type):
     return segments
 
 
-def collect_attempt_types_by_objective(logs):
+def collect_attempt_types_by_step(logs):
     attempt_types = {}
     for _, data in logs:
         for seg in extract_attempt_segments(data):
-            obj = normalize_objective_label(seg.get("objective"))
+            obj = normalize_step_label(seg.get("step"))
             if not obj:
                 continue
             seg_type = _normalize_attempt_type(seg.get("type"))
@@ -602,7 +602,7 @@ def learn_scan_preferences(logs, attempt_types=("SUCCESS", "NOMINAL")):
         for seg in extract_attempt_segments(data):
             if seg.get("type") not in attempt_types:
                 continue
-            obj = normalize_objective_label(seg.get("objective"))
+            obj = normalize_step_label(seg.get("step"))
             if not obj:
                 continue
             summary = _segment_motion_summary(seg.get("events") or [])
@@ -654,7 +654,7 @@ def learn_gates_from_logs(logs):
     for _, data in logs:
         segments = extract_attempt_segments(data)
         for seg in segments:
-            obj = normalize_objective_label(seg.get("objective"))
+            obj = normalize_step_label(seg.get("step"))
             seg_type = seg.get("type")
             if not obj or not seg_type:
                 continue
@@ -815,7 +815,7 @@ def resolve_phase_gates(phase, learned):
 
 def resolve_runtime_gates(phase, learned, process_rules):
     gates = resolve_phase_gates(phase, learned)
-    obj_name = normalize_objective_label(phase)
+    obj_name = normalize_step_label(phase)
     process_cfg = (process_rules or {}).get(obj_name) or {}
     if not isinstance(process_cfg, dict):
         return gates
@@ -888,8 +888,8 @@ def format_gate_summary(phase, gates):
     return f"success gate: {success_desc}; fail gate: {fail_desc}; time gate: {time_desc}"
 
 
-def _objective_process_config(phase_name, process_rules):
-    obj_name = normalize_objective_label(phase_name)
+def _step_process_config(phase_name, process_rules):
+    obj_name = normalize_step_label(phase_name)
     cfg = (process_rules or {}).get(obj_name)
     if isinstance(cfg, dict):
         return cfg
@@ -943,7 +943,7 @@ def format_gate_metrics(phase_name, metrics, kind):
 
 
 def format_process_gate_lines(phase_name, process_rules):
-    process_cfg = _objective_process_config(phase_name, process_rules)
+    process_cfg = _step_process_config(phase_name, process_rules)
     success_metrics = process_cfg.get("success_gates") or {}
     failure_metrics = process_cfg.get("fail_gates") or {}
     return (
@@ -1022,14 +1022,14 @@ def _normalize_scan_direction(value):
 def _lookup_scan_pref(process_rules, phase_name):
     if not process_rules:
         return None
-    obj_name = normalize_objective_label(phase_name)
+    obj_name = normalize_step_label(phase_name)
     cfg = process_rules.get(obj_name)
     if isinstance(cfg, dict):
         scan_pref = _normalize_scan_direction(cfg.get("scan_direction"))
         if scan_pref:
             return scan_pref
     for key, cfg in process_rules.items():
-        if normalize_objective_label(key) != obj_name:
+        if normalize_step_label(key) != obj_name:
             continue
         if not isinstance(cfg, dict):
             continue
@@ -1044,7 +1044,7 @@ def resolve_scan_direction(world, phase):
     scan_pref = _lookup_scan_pref(getattr(world, "process_rules", None), phase_name)
     if scan_pref:
         return scan_pref
-    if normalize_objective_label(phase_name) == "FIND_WALL":
+    if normalize_step_label(phase_name) == "FIND_WALL":
         return "r"
     return "l"
 
@@ -1156,7 +1156,7 @@ def build_commit_profile(success_segments, success_gates):
     speed_vals = []
 
     for seg in success_segments:
-        obj = normalize_objective_label(seg.get("objective"))
+        obj = normalize_step_label(seg.get("step"))
         if obj not in ("SCOOP", "ALIGN_BRICK", "ALIGN"):
             continue
         last_aligned = None
@@ -1208,7 +1208,7 @@ def _within_success(brick, success_gates):
 def learn_blind_window(success_segments):
     times = []
     for seg in success_segments:
-        obj = normalize_objective_label(seg.get("objective"))
+        obj = normalize_step_label(seg.get("step"))
         if obj != "SCOOP":
             continue
         last_visible = None
@@ -1296,7 +1296,7 @@ def _learn_nominal_profiles(nominal_segments):
 
     per_obj = {}
     for seg in nominal_segments:
-        obj = normalize_objective_label(seg.get("objective"))
+        obj = normalize_step_label(seg.get("step"))
         if not obj:
             continue
         summary = _segment_motion_summary(seg.get("events") or [])
@@ -1369,7 +1369,7 @@ def learn_motion_profiles(success_segments, commit_profile, nominal_segments=Non
     duration_acc = {}
 
     for seg in success_segments:
-        obj = normalize_objective_label(seg.get("objective"))
+        obj = normalize_step_label(seg.get("step"))
         if not obj or seg.get("start") is None or seg.get("end") is None:
             continue
         duration = seg["end"] - seg["start"]
@@ -1395,32 +1395,32 @@ def learn_motion_profiles(success_segments, commit_profile, nominal_segments=Non
     return profiles
 
 
-def map_phase_to_objective(phase):
+def map_phase_to_step(phase):
     phase_name = phase.value if isinstance(phase, Phase) else str(phase)
     if phase_name == "FIND_WALL":
-        return ObjectiveState.FIND_WALL
+        return StepState.FIND_WALL
     if phase_name == "EXIT_WALL":
-        return ObjectiveState.EXIT_WALL
+        return StepState.EXIT_WALL
     if phase_name == "FIND_BRICK":
-        return ObjectiveState.FIND_BRICK
+        return StepState.FIND_BRICK
     if phase_name == "ALIGN_BRICK":
-        return ObjectiveState.SCOOP
+        return StepState.SCOOP
     if phase_name == "SCOOP":
-        return ObjectiveState.SCOOP
+        return StepState.SCOOP
     if phase_name == "LIFT":
-        return ObjectiveState.LIFT
+        return StepState.LIFT
     if phase_name == "PLACE":
-        return ObjectiveState.PLACE
+        return StepState.PLACE
     if phase_name == "FIND_WALL2":
-        return ObjectiveState.LIFT
+        return StepState.LIFT
     if phase_name == "POSITION_BRICK":
-        return ObjectiveState.LIFT
+        return StepState.LIFT
     if phase_name == "RETREAT":
-        return ObjectiveState.PLACE
+        return StepState.PLACE
     try:
-        return ObjectiveState(phase_name)
+        return StepState(phase_name)
     except ValueError:
-        return ObjectiveState.FIND_BRICK
+        return StepState.FIND_BRICK
 
 
 def _frame_label(count):
@@ -1559,7 +1559,7 @@ def run_phase_motion(phase, world, robot, vision, stream_state, logger, learned_
     return PhaseResult(True, "", time.time() - start)
 
 
-def save_gates_to_process_model(learned_gates, success_segments=None, filepath=None, attempt_types_by_objective=None, scan_prefs_by_objective=None):
+def save_gates_to_process_model(learned_gates, success_segments=None, filepath=None, attempt_types_by_step=None, scan_prefs_by_step=None):
     """Save learned gates to world_model_process.json for persistence and reuse."""
     if filepath is None:
         filepath = Path(__file__).parent / "world_model_process.json"
@@ -1570,9 +1570,9 @@ def save_gates_to_process_model(learned_gates, success_segments=None, filepath=N
             with open(filepath, 'r') as f:
                 model = json.load(f)
         except:
-            model = {"objectives": {}}
+            model = {"steps": {}}
     else:
-        model = {"objectives": {}}
+        model = {"steps": {}}
     
     # Helpers to round values and coerce visibility gates to boolean
     def round_value(value):
@@ -1624,7 +1624,7 @@ def save_gates_to_process_model(learned_gates, success_segments=None, filepath=N
     start_conditions = {}
     if success_segments:
         for seg in success_segments:
-            obj = normalize_objective_label(seg.get("objective"))
+            obj = normalize_step_label(seg.get("step"))
             if not obj:
                 continue
             states = seg.get("states", [])
@@ -1646,24 +1646,24 @@ def save_gates_to_process_model(learned_gates, success_segments=None, filepath=N
         visible_ratio = cond.get("visible_count", 0) / total
         if visible_ratio >= 0.5:
             derived_start_gates[obj_name] = {"visible": {"min": True}}
-    if attempt_types_by_objective is None:
-        attempt_types_by_objective = {}
-    if scan_prefs_by_objective is None:
-        scan_prefs_by_objective = {}
+    if attempt_types_by_step is None:
+        attempt_types_by_step = {}
+    if scan_prefs_by_step is None:
+        scan_prefs_by_step = {}
 
-    objective_order = list(model["objectives"].keys()) if model["objectives"] else list(PHASE_SEQUENCE)
+    step_order = list(model["steps"].keys()) if model["steps"] else list(PHASE_SEQUENCE)
     
-    # Update each objective with learned gates
-    objectives = set(model["objectives"].keys())
-    objectives.update(obj for obj in learned_gates.keys() if obj != "profiles")
-    objectives.update(derived_start_gates.keys())
-    for obj_name in objectives:
+    # Update each step with learned gates
+    steps = set(model["steps"].keys())
+    steps.update(obj for obj in learned_gates.keys() if obj != "profiles")
+    steps.update(derived_start_gates.keys())
+    for obj_name in steps:
         gates = learned_gates.get(obj_name, {})
         
-        if obj_name not in model["objectives"]:
-            model["objectives"][obj_name] = {}
+        if obj_name not in model["steps"]:
+            model["steps"][obj_name] = {}
         
-        obj_config = model["objectives"][obj_name]
+        obj_config = model["steps"][obj_name]
         
         # Convert learned gates to process model format
         success_metrics = gates.get("success", {}) if gates else {}
@@ -1715,15 +1715,15 @@ def save_gates_to_process_model(learned_gates, success_segments=None, filepath=N
         obj_config["fail_gates"] = prune_metrics_when_invisible(obj_config.get("fail_gates", {}))
         obj_config["start_gates"] = prune_metrics_when_invisible(obj_config.get("start_gates", {}))
 
-        if obj_name in attempt_types_by_objective:
-            attempt_types = attempt_types_by_objective[obj_name]
+        if obj_name in attempt_types_by_step:
+            attempt_types = attempt_types_by_step[obj_name]
             nominal_only = attempt_types == {"NOMINAL"}
             if nominal_only:
                 obj_config["nominalDemosOnly"] = True
             else:
                 obj_config.pop("nominalDemosOnly", None)
-        if scan_prefs_by_objective is not None and obj_name in scan_prefs_by_objective:
-            scan_dir = scan_prefs_by_objective.get(obj_name)
+        if scan_prefs_by_step is not None and obj_name in scan_prefs_by_step:
+            scan_dir = scan_prefs_by_step.get(obj_name)
             if scan_dir in ("l", "r"):
                 obj_config["scan_direction"] = scan_dir
 
@@ -1731,14 +1731,14 @@ def save_gates_to_process_model(learned_gates, success_segments=None, filepath=N
             if key in obj_config and not obj_config[key]:
                 obj_config.pop(key)
 
-    ordered_objectives = {}
-    for name in objective_order:
-        if name in model["objectives"]:
-            ordered_objectives[name] = model["objectives"][name]
-    for name in sorted(model["objectives"]):
-        if name not in ordered_objectives:
-            ordered_objectives[name] = model["objectives"][name]
-    model["objectives"] = ordered_objectives
+    ordered_steps = {}
+    for name in step_order:
+        if name in model["steps"]:
+            ordered_steps[name] = model["steps"][name]
+    for name in sorted(model["steps"]):
+        if name not in ordered_steps:
+            ordered_steps[name] = model["steps"][name]
+    model["steps"] = ordered_steps
     
     # Save to file
     with open(filepath, 'w') as f:
@@ -1752,15 +1752,15 @@ def run_autostack(session_name=None, stream=True):
     summarize_demo_stats(logs)
     learned_gates, success_segments = learn_gates_from_logs(logs)
     nominal_segments = collect_attempt_segments(logs, "NOMINAL")
-    attempt_types_by_objective = collect_attempt_types_by_objective(logs)
-    scan_prefs_by_objective = learn_scan_preferences(logs)
+    attempt_types_by_step = collect_attempt_types_by_step(logs)
+    scan_prefs_by_step = learn_scan_preferences(logs)
     
     # Save learned gates to world_model_process.json for persistence
     save_gates_to_process_model(
         learned_gates,
         success_segments,
-        attempt_types_by_objective=attempt_types_by_objective,
-        scan_prefs_by_objective=scan_prefs_by_objective,
+        attempt_types_by_step=attempt_types_by_step,
+        scan_prefs_by_step=scan_prefs_by_step,
     )
     
     align_gates = resolve_phase_gates("ALIGN_BRICK", learned_gates)
@@ -1802,7 +1802,7 @@ def run_autostack(session_name=None, stream=True):
                 phase = Phase(phase_name)
             except ValueError:
                 phase = phase_name
-            world.objective_state = map_phase_to_objective(phase)
+            world.step_state = map_phase_to_step(phase)
             attempts = 0
             while attempts < MAX_PHASE_ATTEMPTS:
                 success_desc, fail_desc = format_process_gate_lines(phase_name, world.process_rules)

@@ -17,7 +17,7 @@ from flask import Flask, Response
 
 from helper_robot_control import Robot
 from helper_brick_vision import BrickDetector
-from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
+from robot_leia_telemetry import WorldModel, TelemetryLogger, MotionEvent, StepState, draw_telemetry_overlay
 
 # --- CONFIG ---
 HOST_IP = '0.0.0.0'
@@ -133,7 +133,7 @@ def handle_command(cmd_str):
         app_state.job_start = True
         app_state.job_start_timer = time.time()
         
-        # Reset Objective
+        # Reset Step
         app_state.world.reset_mission()
         
         # Log Event
@@ -157,7 +157,7 @@ def handle_command(cmd_str):
         app_state.job_abort = True
         app_state.job_abort_timer = time.time()
         
-        # Reset Objective
+        # Reset Step
         app_state.world.reset_mission()
         
         # Log Event
@@ -167,9 +167,9 @@ def handle_command(cmd_str):
         return
         
     if cmd == "BTN_X":
-        # Cycle Objective
-        new_state = app_state.world.next_objective()
-        print(f"[DEMO] Objective Set: {new_state}")
+        # Cycle Step
+        new_state = app_state.world.next_step()
+        print(f"[DEMO] Step Set: {new_state}")
         return
 
     # MOVEMENT
@@ -238,7 +238,7 @@ def control_loop():
             pwr = int(app_state.active_speed * 255)
             evt = MotionEvent(atype, pwr, int(dt*1000))
             app_state.world.update_from_motion(evt)
-            app_state.logger.log_event(evt, app_state.world.objective_state.value)
+            app_state.logger.log_event(evt, app_state.world.step_state.value)
 
         # 5. Log
         app_state.logger.log_state(app_state.world)

@@ -5,7 +5,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
-from helper_demo_log_utils import read_demo_log, normalize_objective_label
+from helper_demo_log_utils import read_demo_log, normalize_step_label
 # ANSI Colors
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -23,7 +23,7 @@ class LogEntry:
         self.wall = d.get('wall_origin')
         self.brick = d.get('brick', {})
         self.lift = d.get('lift_height', 0)
-        self.obj = normalize_objective_label(d.get('objective')) if d.get('objective') else "UNKNOWN"
+        self.obj = normalize_step_label(d.get('step')) if d.get('step') else "UNKNOWN"
         self.img = d.get('image_file')
 
 DEMOS_DIR = Path(__file__).resolve().parent / "demos"
@@ -126,7 +126,7 @@ def summarize_log(path):
         elif e.obj == "PLACE":
             base_desc = "Putting down brick..."
         else:
-            base_desc = f"Objective: {e.obj}"
+            base_desc = f"Step: {e.obj}"
             
         return base_desc
 
@@ -156,7 +156,7 @@ def summarize_log(path):
         dist = e.brick.get('dist', 0) if e.brick.get('visible') else None
         held = e.brick.get('held', False)
         
-        # Merge if Objective AND State Flags are same
+        # Merge if Step AND State Flags are same
         state_match = (e.obj == current_p['obj'] and 
                        held == current_p['held'])
         
@@ -204,7 +204,7 @@ def summarize_log(path):
     GREEN_M = "\033[32m"
     
     for p in periods:
-        desc = obj_map.get(p['obj'], f"Objective: {p['obj']}")
+        desc = obj_map.get(p['obj'], f"Step: {p['obj']}")
         
         # Add state markers
         if p['held']:

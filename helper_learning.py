@@ -118,11 +118,11 @@ class BehavioralCloningPolicy:
                 }
                 print(f"[LEARN] {obj_name}: Trained on {len(points)} samples.")
 
-    def query(self, objective, world):
+    def query(self, step, world):
         """
         Returns (cmd, speed, confidence) based on k-NN
         """
-        model = self.policy_by_obj.get(objective)
+        model = self.policy_by_obj.get(step)
         if not model:
             return None, 0.0, 0.0
             

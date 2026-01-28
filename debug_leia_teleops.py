@@ -18,7 +18,7 @@ from flask import Flask, Response
 # Import our capabilities
 from helper_robot_control import Robot
 from helper_brick_vision import BrickDetector
-from telemetry_robot import WorldModel, TelemetryLogger, MotionEvent, ObjectiveState, draw_telemetry_overlay
+from telemetry_robot import WorldModel, TelemetryLogger, MotionEvent, StepState, draw_telemetry_overlay
 
 # --- CONFIG ---
 WEB_PORT = 5000
@@ -111,7 +111,7 @@ class TeleopManager:
                 if action:
                     event = MotionEvent(action, pwr, duration_ms)
                     self.world.update_from_motion(event)
-                    self.logger.log_event(event, self.world.objective_state.value)
+                    self.logger.log_event(event, self.world.step_state.value)
                 
             elif self.state == RobotState.AUTONOMOUS:
                 pass

@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import sys
 
-from helper_demo_log_utils import read_demo_log, resolve_session_log, normalize_objective_label
+from helper_demo_log_utils import read_demo_log, resolve_session_log, normalize_step_label
 
 
 def validate_session(session_path):
@@ -19,26 +19,26 @@ def validate_session(session_path):
     if not entries:
         return False, "Empty log"
 
-    # Track objective transitions to detect runs
-    objectives_sequence = []
+    # Track step transitions to detect runs
+    steps_sequence = []
     for e in entries:
-        obj = normalize_objective_label(e.get('objective', '')) if e.get('objective') else ''
-        if not objectives_sequence or objectives_sequence[-1] != obj:
-            objectives_sequence.append(obj)
+        obj = normalize_step_label(e.get('step', '')) if e.get('step') else ''
+        if not steps_sequence or steps_sequence[-1] != obj:
+            steps_sequence.append(obj)
     
-    # Check for all required objectives across the entire session
-    found_objs = set(objectives_sequence)
+    # Check for all required steps across the entire session
+    found_objs = set(steps_sequence)
     required_objs = {"FIND_BRICK", "ALIGN_BRICK", "SCOOP", "LIFT", "POSITION_BRICK", "PLACE"}
     missing = required_objs - found_objs
     if missing:
-        return False, f"Missing Objectives: {missing}"
+        return False, f"Missing Steps: {missing}"
 
     # Detect complete runs (cycles that reach PLACE)
     # A run is complete if we see the sequence reach PLACE
     complete_runs = 0
     current_run_objs = []
     
-    for obj in objectives_sequence:
+    for obj in steps_sequence:
         if obj == "FIND_BRICK" and current_run_objs:
             # Starting a new run, check if previous was complete
             if "PLACE" in current_run_objs:
@@ -52,13 +52,13 @@ def validate_session(session_path):
         complete_runs += 1
     
     if complete_runs == 0:
-        return False, f"No complete runs (sequence: {' -> '.join(objectives_sequence)})"
+        return False, f"No complete runs (sequence: {' -> '.join(steps_sequence)})"
 
     # Check for Vision Stability in ALIGN_BRICK/SCOOP
     align_vision_hits = 0
     scoop_vision_hits = 0
     for e in entries:
-        obj = normalize_objective_label(e.get('objective'))
+        obj = normalize_step_label(e.get('step'))
         visible = e.get('brick', {}).get('visible', False)
         if visible:
             if obj == "ALIGN_BRICK": align_vision_hits += 1
@@ -68,7 +68,7 @@ def validate_session(session_path):
         return False, f"Poor ALIGN_BRICK vision ({align_vision_hits} hits)"
     
     # Success!
-    total_runs = objectives_sequence.count("FIND_BRICK")
+    total_runs = steps_sequence.count("FIND_BRICK")
     return True, f"READY: {complete_runs}/{total_runs} runs, {len(entries)} entries"
 
 def main():

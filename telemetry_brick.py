@@ -1,34 +1,50 @@
 import math
 import time
 from dataclasses import dataclass, field
-from typing import List
-
+from pathlib import Path
+from typing import List, Optional, Tuple
+from helper_demo_log_utils import extract_attempt_segments, load_demo_logs
+from telemetry_robot import (
+    manual_speed_for_cmd,
+    SPEED_SCORE_DEFAULT,
+    SPEED_SCORE_MIN,
+    SPEED_SCORE_MAX,
+    normalize_speed_score,
+    ALIGN_MIN_SPEED,
+    ALIGN_MAX_SPEED,
+    ALIGN_MICRO_SPEED,
+    ALIGN_FIXED_SPEED,
+    ALIGN_SPEED_MIN_POWER,
+    ALIGN_SPEED_SLOW,
+    ALIGN_SPEED_NORMAL,
+    ALIGN_SPEED_FAST,
+    ALIGN_SPEED_SLOW_MM,
+    ALIGN_SPEED_FAST_MM,
+    ALIGN_MICRO_OFFSET_MM,
+    ALIGN_MICRO_ANGLE_DEG,
+    COMBINED_MOVEMENTS,
+)
 START_GATE_MIN_CONFIDENCE = 25.0
 ALIGN_CONFIDENCE_MIN = 25.0
+COMBINED_MOVEMENT_THRESHOLD_MM = 5.0  # Use combined movements when lateral offset > 5mm
+COMBINED_MOVEMENT_FAST_THRESHOLD_MM = 20.0  # Use fast combined movements when distance > 20mm
 VISIBILITY_LOST_GRACE_S = 0.5
-ALIGN_MIN_SPEED = 0.2
-ALIGN_MAX_SPEED = 0.28
-ALIGN_MICRO_SPEED = 0.21
-ALIGN_FIXED_SPEED = 0.19
-ALIGN_SPEED_MIN_POWER = 0.288
-ALIGN_SPEED_SLOW = ALIGN_SPEED_MIN_POWER
-ALIGN_SPEED_NORMAL = 0.28
-ALIGN_SPEED_FAST = 0.392
-ALIGN_SPEED_SLOW_MM = 8.0
-ALIGN_SPEED_FAST_MM = 18.0
-ALIGN_MICRO_OFFSET_MM = 10.0
-ALIGN_MICRO_ANGLE_DEG = 5.0
-VISIBLE_FALSE_GRACE_S_BY_OBJECTIVE = {
+BRICK_SMOOTH_FRAMES = 3
+BRICK_SMOOTH_OUTLIER_MM = 12.0
+BRICK_SMOOTH_OUTLIER_DEG = 6.0
+VISIBLE_FALSE_GRACE_S_BY_STEP = {
     "EXIT_WALL": 1.0,
 }
 
-OBJECTIVE_ALIASES = {
+MANUAL_TURN_SPEED = manual_speed_for_cmd("l", SPEED_SCORE_DEFAULT)
+
+STEP_ALIASES = {
     "FIND": "FIND_BRICK",
     "ALIGN": "ALIGN_BRICK",
     "CARRY": "FIND_WALL2",
 }
 
-METRICS_BY_OBJECTIVE = {
+METRICS_BY_STEP = {
     "FIND_WALL": ("angle_abs", "xAxis_offset_abs", "dist", "visible"),
     "EXIT_WALL": ("angle_abs", "xAxis_offset_abs", "dist", "visible"),
     "FIND_BRICK": ("angle_abs", "xAxis_offset_abs", "dist", "visible"),
@@ -46,6 +62,83 @@ METRIC_DIRECTIONS = {
 }
 
 VISIBILITY_REQUIRED_METRICS = {"angle_abs", "xAxis_offset_abs", "dist"}
+
+
+def _average_brick_frames(frames):
+    def mean(values):
+        return sum(values) / len(values) if values else 0.0
+
+    def majority(values):
+        return sum(1 for v in values if v) >= (len(values) / 2.0)
+
+    return {
+        "found": majority([f["found"] for f in frames]),
+        "dist": mean([f["dist"] for f in frames]),
+        "angle": mean([f["angle"] for f in frames]),
+        "offset_x": mean([f["offset_x"] for f in frames]),
+        "conf": mean([f["conf"] for f in frames]),
+        "cam_h": mean([f["cam_h"] for f in frames]),
+        "brick_above": majority([f["brick_above"] for f in frames]),
+        "brick_below": majority([f["brick_below"] for f in frames]),
+    }
+
+
+def _filtered_brick_frame_average(frames, min_frames=BRICK_SMOOTH_FRAMES):
+    if len(frames) < min_frames:
+        return None, False, None
+
+    dist_vals = [f["dist"] for f in frames]
+    offset_vals = [f["offset_x"] for f in frames]
+    angle_vals = [f["angle"] for f in frames]
+    med_dist = percentile(dist_vals, 0.5)
+    med_offset = percentile(offset_vals, 0.5)
+    med_angle = percentile(angle_vals, 0.5)
+
+    keep = []
+    for frame in frames:
+        if not frame["found"]:
+            continue
+        if (
+            abs(frame["dist"] - med_dist) > BRICK_SMOOTH_OUTLIER_MM
+            or abs(frame["offset_x"] - med_offset) > BRICK_SMOOTH_OUTLIER_MM
+            or abs(frame["angle"] - med_angle) > BRICK_SMOOTH_OUTLIER_DEG
+        ):
+            continue
+        keep.append(frame)
+
+    if len(keep) < min_frames:
+        return None, True, f"{len(keep)}/{min_frames} tight variance frames (inconsistent)"
+    return _average_brick_frames(keep), True, None
+
+
+def _score_from_mm(mm_off, slow_mm, fast_mm):
+    if mm_off is None:
+        return SPEED_SCORE_DEFAULT
+    if mm_off <= slow_mm:
+        return SPEED_SCORE_MIN
+    if mm_off >= fast_mm:
+        return SPEED_SCORE_MAX
+    return SPEED_SCORE_DEFAULT
+
+
+def smoothed_brick_snapshot(world):
+    brick = world.brick or {}
+    buffer = getattr(world, "_brick_frame_buffer", None)
+    if not buffer:
+        return brick
+    avg, _, _ = _filtered_brick_frame_average(buffer)
+    if avg is None:
+        return brick
+    return {
+        "visible": bool(avg.get("found")),
+        "dist": float(avg.get("dist", 0.0)),
+        "angle": float(avg.get("angle", 0.0)),
+        "confidence": float(avg.get("conf", 0.0)),
+        "offset_x": float(avg.get("offset_x", 0.0)),
+        "x_axis": float(avg.get("offset_x", 0.0)),
+        "brickAbove": bool(avg.get("brick_above")),
+        "brickBelow": bool(avg.get("brick_below")),
+    }
 
 
 @dataclass
@@ -69,18 +162,27 @@ def combine_gate_checks(*checks):
     return GateCheck(ok=ok, reasons=reasons)
 
 
-def _objective_name(objective):
-    if hasattr(objective, "value"):
-        name = objective.value
+def _step_name(step):
+    if hasattr(step, "value"):
+        name = step.value
     else:
-        name = str(objective)
+        name = str(step)
     key = name.strip().upper()
-    return OBJECTIVE_ALIASES.get(key, key)
+    return STEP_ALIASES.get(key, key)
 
 
-def metric_direction_for_objective(metric, objective):
+def percentile(values, pct):
+    if not values:
+        return None
+    values = sorted(values)
+    pct = max(0.0, min(1.0, pct))
+    idx = int(round(pct * (len(values) - 1)))
+    return values[idx]
+
+
+def metric_direction_for_step(metric, step):
     direction = METRIC_DIRECTIONS.get(metric)
-    obj_name = _objective_name(objective)
+    obj_name = _step_name(step)
     if obj_name == "FIND_BRICK" and metric == "dist":
         return None
     return direction
@@ -189,8 +291,8 @@ def get_scoop_corridor_limits(world, dist):
     return corridor[-1]
 
 
-def build_envelope(process_rules, learned_rules, objective):
-    obj_name = _objective_name(objective)
+def build_envelope(process_rules, learned_rules, step):
+    obj_name = _step_name(step)
     process = (process_rules or {}).get(obj_name, {})
     learned = learned_rules.get(obj_name, {}) if learned_rules else {}
     learned_gates = learned.get("gates", {})
@@ -199,21 +301,58 @@ def build_envelope(process_rules, learned_rules, objective):
     return {"success": success, "failure": failure}
 
 
-def success_gate_bounds(process_rules, learned_rules, objective):
-    envelope = build_envelope(process_rules or {}, learned_rules or {}, objective)
+def success_gate_bounds(process_rules, learned_rules, step):
+    envelope = build_envelope(process_rules or {}, learned_rules or {}, step)
     success_metrics = envelope.get("success") or {}
     bounds = {}
     for metric, stats in success_metrics.items():
-        direction = metric_direction_for_objective(metric, objective)
+        direction = metric_direction_for_step(metric, step)
         min_val, max_val = success_metric_bounds(stats, direction)
         bounds[metric] = {"min": min_val, "max": max_val}
     return bounds
 
 
-def compute_alignment_analytics(world, process_rules, learned_rules, objective, duration_s=0.05):
-    obj_name = _objective_name(objective)
+def success_gates_visible_only(process_rules, step):
+    obj_name = _step_name(step)
+    success_metrics = (process_rules or {}).get(obj_name, {}).get("success_gates") or {}
+    if not success_metrics:
+        return False
+    keys = {key for key in success_metrics.keys() if key is not None}
+    return keys == {"visible"}
+
+
+def stream_status_lines(world, step, process_rules=None, learned_rules=None):
+    obj_name = _step_name(step)
+    analytics = compute_brick_analytics(
+        world,
+        process_rules or {},
+        learned_rules or {},
+        obj_name,
+        duration_s=getattr(world, "_last_dt", 0.05),
+    )
+    gate_progress = analytics.get("gate_progress") or []
+    pct = None
+    for name, val in gate_progress:
+        if _step_name(name) == obj_name:
+            pct = val
+            break
+    if pct is None:
+        success_check = evaluate_success_gates(world, obj_name, learned_rules or {}, process_rules or {})
+        pct = 100.0 if success_check.ok else 0.0
+    pct_display = int(max(0.0, min(100.0, pct)))
+    suggestion = getattr(world, "_last_action_line", None) or analytics.get("suggestion") or "HOLD"
+    return [
+        f"OBJ: {obj_name}",
+        f"SUCCESS: {pct_display}%",
+        f"ACT: {suggestion}",
+    ]
+
+
+def compute_alignment_analytics(world, process_rules, learned_rules, step, duration_s=0.05):
+    obj_name = _step_name(step)
     success_metrics = (process_rules or {}).get(obj_name, {}).get("success_gates") or {}
     brick = world.brick or {}
+    visible = bool(brick.get("visible"))
     x_axis = brick.get("x_axis")
     if x_axis is None:
         x_axis = 0.0
@@ -261,7 +400,7 @@ def compute_alignment_analytics(world, process_rules, learned_rules, objective, 
 
     for metric, value in metrics.items():
         stats = success_metrics.get(metric) or fallback_stats(metric)
-        direction = metric_direction_for_objective(metric, obj_name)
+        direction = metric_direction_for_step(metric, obj_name)
         if direction is None:
             continue
         target = stats.get("target")
@@ -332,7 +471,7 @@ def compute_alignment_analytics(world, process_rules, learned_rules, objective, 
                 continue
             if not isinstance(stats, dict):
                 continue
-            direction = metric_direction_for_objective(metric, obj_name)
+            direction = metric_direction_for_step(metric, obj_name)
             if metric == "angle_abs":
                 value = abs(angle)
             elif metric == "xAxis_offset_abs":
@@ -424,6 +563,28 @@ def compute_alignment_analytics(world, process_rules, learned_rules, objective, 
                 cmd = "f"
             elif dist_min is not None and dist < dist_min:
                 cmd = "b"
+        
+        # Check if we should use combined movement (diagonal correction)
+        # Use combined movement when we need both distance AND lateral correction
+        if cmd is not None and not x_axis_ok:
+            x_offset = signed_values.get("xAxis_offset_abs", 0.0)
+            # Only use combined movements if lateral offset is significant
+            if abs(x_offset) > COMBINED_MOVEMENT_THRESHOLD_MM:
+                # Determine speed variant
+                suffix = "_fast" if dist > COMBINED_MOVEMENT_FAST_THRESHOLD_MM else "_slow"
+                
+                # Forward and left -- only if far enough away
+                if cmd == "f" and x_offset < 0 and dist > 70.0:
+                    cmd = f"fl{suffix}"
+                # Forward and right -- only if far enough away
+                elif cmd == "f" and x_offset > 0 and dist > 70.0:
+                    cmd = f"fr{suffix}"
+                # Backward and left
+                elif cmd == "b" and x_offset < 0:
+                    cmd = f"bl{suffix}"
+                # Backward and right
+                elif cmd == "b" and x_offset > 0:
+                    cmd = f"br{suffix}"
     elif worst_metric == "xAxis_offset_abs":
         signed = signed_values.get("xAxis_offset_abs", 0.0)
         stats = success_metrics.get("xAxis_offset_abs") or fallback_stats("xAxis_offset_abs")
@@ -436,6 +597,48 @@ def compute_alignment_analytics(world, process_rules, learned_rules, objective, 
             cmd = "r" if signed_error > 0 else "l"
         if abs(signed_error) < micro_offset_mm:
             speed = min(speed, micro_speed)
+        
+        # Check if we should use combined movement when lateral is worst metric
+        # Use combined movement when we need both lateral AND distance correction
+        if cmd is not None:
+            dist_offset = offsets.get("dist", 0.0)
+            dist_stats = success_metrics.get("dist") or fallback_stats("dist")
+            dist_min = dist_stats.get("min")
+            dist_max = dist_stats.get("max")
+            target_dist = dist_stats.get("target")
+            tol_dist = dist_stats.get("tol")
+            
+            # Determine if distance needs correction
+            needs_forward = False
+            needs_backward = False
+            if target_dist is not None and tol_dist is not None:
+                if dist > target_dist + tol_dist:
+                    needs_forward = True
+                elif dist < target_dist - tol_dist:
+                    needs_backward = True
+            else:
+                if dist_max is not None and dist > dist_max:
+                    needs_forward = True
+                elif dist_min is not None and dist < dist_min:
+                    needs_backward = True
+            
+            # Use combined movements if distance offset is significant
+            if abs(dist_offset) > COMBINED_MOVEMENT_THRESHOLD_MM:
+                # Determine speed variant
+                suffix = "_fast" if dist > COMBINED_MOVEMENT_FAST_THRESHOLD_MM else "_slow"
+                
+                # Left and forward -- only if far enough away
+                if cmd == "l" and needs_forward and dist > 70.0:
+                    cmd = f"fl{suffix}"
+                # Right and forward -- only if far enough away
+                elif cmd == "r" and needs_forward and dist > 70.0:
+                    cmd = f"fr{suffix}"
+                # Left and backward
+                elif cmd == "l" and needs_backward:
+                    cmd = f"bl{suffix}"
+                # Right and backward
+                elif cmd == "r" and needs_backward:
+                    cmd = f"br{suffix}"
     elif worst_metric == "angle_abs":
         signed = signed_values.get("angle_abs", 0.0)
         stats = success_metrics.get("angle_abs") or fallback_stats("angle_abs")
@@ -450,29 +653,45 @@ def compute_alignment_analytics(world, process_rules, learned_rules, objective, 
         if abs(signed) < micro_angle_deg:
             speed = min(speed, micro_speed)
 
-    speed_label = None
-    if obj_name == "ALIGN_BRICK":
-        mm_off = mm_errors.get("xAxis_offset_abs")
+    visible_only = success_gates_visible_only(process_rules, obj_name)
+    if visible_only:
+        speed_score = SPEED_SCORE_DEFAULT
+        speed_score = normalize_speed_score(speed_score)
+    else:
+        mm_off = None
+        if cmd in ("l", "r"):
+            mm_off = mm_errors.get("xAxis_offset_abs")
+        elif cmd in ("f", "b"):
+            mm_off = mm_errors.get("dist")
         if (mm_off is None or mm_off <= 0.0) and worst_metric == "angle_abs":
             mm_off = None
-        speed_label = "n"
-        speed = ALIGN_SPEED_NORMAL
-        if mm_off is not None:
-            if mm_off <= ALIGN_SPEED_SLOW_MM:
-                speed_label = "s"
-                speed = ALIGN_SPEED_SLOW
-            elif mm_off >= ALIGN_SPEED_FAST_MM:
-                speed_label = "f"
-                speed = ALIGN_SPEED_FAST
-        if cmd in ("f", "b"):
-            speed = min(1.0, speed * 2.0)
+        slow_mm = ALIGN_SPEED_SLOW_MM
+        fast_mm = ALIGN_SPEED_FAST_MM
+        if obj_name != "ALIGN_BRICK":
+            slow_mm = ALIGN_SPEED_SLOW_MM / 4.0
+            fast_mm = ALIGN_SPEED_FAST_MM / 4.0
+        speed_score = _score_from_mm(mm_off, slow_mm, fast_mm)
+        speed_score = normalize_speed_score(speed_score)
+
+    if not visible:
+        speed_score = SPEED_SCORE_DEFAULT
+        speed_score = normalize_speed_score(speed_score)
+
+    # Override for combined movements
+    if cmd in COMBINED_MOVEMENTS:
+        speed_score = COMBINED_MOVEMENTS[cmd].get("score", speed_score)
+
+    if cmd:
+        speed = manual_speed_for_cmd(cmd, speed_score)
+    else:
+        speed = 0.0
 
     return {
         "progress": progress,
         "worst_metric": worst_metric,
         "cmd": cmd,
         "speed": speed,
-        "speed_label": speed_label,
+        "speed_score": speed_score,
         "duration_s": duration_s,
         "x_axis": x_axis,
         "angle": angle,
@@ -481,9 +700,9 @@ def compute_alignment_analytics(world, process_rules, learned_rules, objective, 
     }
 
 
-def compute_brick_analytics(world, process_rules, learned_rules, objective, duration_s=0.05):
+def compute_brick_analytics(world, process_rules, learned_rules, step, duration_s=0.05):
     process_rules = process_rules or {}
-    align = compute_alignment_analytics(world, process_rules, learned_rules, objective, duration_s=duration_s)
+    align = compute_alignment_analytics(world, process_rules, learned_rules, step, duration_s=duration_s)
     gate_status = []
     gate_progress = []
     suggestion = None
@@ -497,7 +716,7 @@ def compute_brick_analytics(world, process_rules, learned_rules, objective, dura
         progress_values = []
         ok = True
         for metric, stats in success_gates.items():
-            direction = metric_direction_for_objective(metric, obj_name)
+            direction = metric_direction_for_step(metric, obj_name)
             value = metric_value(world.brick or {}, metric)
             if value is None or direction is None or not isinstance(stats, dict):
                 ok = False
@@ -550,7 +769,7 @@ def compute_brick_analytics(world, process_rules, learned_rules, objective, dura
             elif max_val is not None:
                 progress_values.append(1.0 if value <= max_val else max(0.0, 1.0 - (value - max_val) / max(max_val, 1e-3)))
 
-        if obj_name == _objective_name(objective) and align.get("progress") is not None:
+        if obj_name == _step_name(step) and align.get("progress") is not None:
             gate_progress.append((obj_name, align.get("progress") * 100))
         elif progress_values:
             gate_progress.append((obj_name, sum(progress_values) / len(progress_values) * 100))
@@ -560,9 +779,9 @@ def compute_brick_analytics(world, process_rules, learned_rules, objective, dura
     cmd = align.get("cmd")
     if cmd is not None:
         speed = align.get("speed") or 0.0
-        speed_label = align.get("speed_label")
-        suffix = f" {speed_label}" if speed_label else ""
-        suggestion = f"{cmd.upper()} {duration_s:.2f}s {speed:.2f}p{suffix}"
+        speed_score = align.get("speed_score")
+        suffix = f" {int(speed_score)}%" if speed_score is not None else ""
+        suggestion = f"{cmd.upper()} {speed:.2f}p{suffix}"
 
     return {
         "gate_status": gate_status,
@@ -594,7 +813,7 @@ def update_from_vision(world, found, dist, angle, conf, offset_x=0, cam_h=0, bri
         world.last_seen_dist = float(dist)
         world.last_seen_confidence = float(conf)
 
-    if world.objective_state.value == "SCOOP":
+    if world.step_state.value == "SCOOP":
         world.scoop_forward_preferred = True
         world.scoop_desired_offset_x = 0.0
         world.scoop_lateral_drift = world.brick["offset_x"] - world.scoop_desired_offset_x
@@ -616,7 +835,7 @@ def update_from_vision(world, found, dist, angle, conf, offset_x=0, cam_h=0, bri
         tol_off = align_rules.get("max_offset_x", world.align_tol_offset)
         tol_ang = align_rules.get("max_angle", world.align_tol_angle)
 
-        if world.objective_state.value == "SCOOP":
+        if world.step_state.value == "SCOOP":
             corridor = get_scoop_corridor_limits(world, dist)
             if corridor:
                 tol_off = corridor.get("max_offset_x", tol_off)
@@ -624,7 +843,7 @@ def update_from_vision(world, found, dist, angle, conf, offset_x=0, cam_h=0, bri
 
         tol_off *= 1.1
         tol_ang *= 1.1
-        if world.objective_state.value == "SCOOP":
+        if world.step_state.value == "SCOOP":
             tol_off *= world.scoop_success_offset_factor
 
         angle_ok = abs(angle) <= tol_ang
@@ -641,14 +860,14 @@ def update_from_vision(world, found, dist, angle, conf, offset_x=0, cam_h=0, bri
     return brick_height
 
 
-def evaluate_start_gates(world, objective, learned_rules, process_rules=None):
-    obj_name = _objective_name(objective)
+def evaluate_start_gates(world, step, learned_rules, process_rules=None):
+    obj_name = _step_name(step)
     reasons = []
-    brick = world.brick or {}
+    brick = smoothed_brick_snapshot(world)
     visible = bool(brick.get("visible"))
     confidence = brick.get("confidence", 0.0) or 0.0
 
-    if obj_name in ("ALIGN_BRICK", "SCOOP"):
+    if obj_name in ("ALIGN_BRICK", "SCOOP", "POSITION_BRICK"):
         if not visible:
             reasons.append("brick not visible")
         elif confidence < START_GATE_MIN_CONFIDENCE:
@@ -717,9 +936,9 @@ def evaluate_start_gates(world, objective, learned_rules, process_rules=None):
     return GateCheck(ok=not reasons, reasons=reasons)
 
 
-def evaluate_success_gates(world, objective, learned_rules, process_rules=None, visibility_grace_s=None):
-    obj_name = _objective_name(objective)
-    if obj_name not in METRICS_BY_OBJECTIVE:
+def evaluate_success_gates(world, step, learned_rules, process_rules=None, visibility_grace_s=None):
+    obj_name = _step_name(step)
+    if obj_name not in METRICS_BY_STEP:
         return GateCheck(ok=True)
 
     envelope = build_envelope(process_rules or {}, learned_rules or {}, obj_name)
@@ -727,13 +946,13 @@ def evaluate_success_gates(world, objective, learned_rules, process_rules=None, 
     if not success_metrics:
         return GateCheck(ok=False, reasons=["no success envelope"])
 
-    brick = world.brick or {}
+    brick = smoothed_brick_snapshot(world)
     visible = bool(brick.get("visible"))
     visible_gate = success_metrics.get("visible") or {}
     if visibility_grace_s is None:
         visible_grace_s = VISIBILITY_LOST_GRACE_S
         if isinstance(visible_gate, dict) and visible_gate.get("min") is False:
-            visible_grace_s = VISIBLE_FALSE_GRACE_S_BY_OBJECTIVE.get(
+            visible_grace_s = VISIBLE_FALSE_GRACE_S_BY_STEP.get(
                 obj_name,
                 VISIBILITY_LOST_GRACE_S,
             )
@@ -749,7 +968,7 @@ def evaluate_success_gates(world, objective, learned_rules, process_rules=None, 
             return GateCheck(ok=False, reasons=reasons)
     
     for metric, stats in success_metrics.items():
-        direction = metric_direction_for_objective(metric, obj_name)
+        direction = metric_direction_for_step(metric, obj_name)
         if metric in ("angle_abs", "xAxis_offset_abs", "dist", "confidence") and not visible:
             reasons.append("brick not visible")
             continue
@@ -802,16 +1021,16 @@ def evaluate_success_gates(world, objective, learned_rules, process_rules=None, 
     return GateCheck(ok=not reasons, reasons=reasons)
 
 
-def evaluate_failure_gates(world, objective, learned_rules, process_rules=None):
-    obj_name = _objective_name(objective)
-    if obj_name not in METRICS_BY_OBJECTIVE:
+def evaluate_failure_gates(world, step, learned_rules, process_rules=None):
+    obj_name = _step_name(step)
+    if obj_name not in METRICS_BY_STEP:
         return GateCheck(ok=True)
     envelope = build_envelope(process_rules or {}, learned_rules or {}, obj_name)
     failure_metrics = envelope.get("failure") or {}
     if not failure_metrics:
         return GateCheck(ok=True)
     
-    brick = world.brick or {}
+    brick = smoothed_brick_snapshot(world)
     visible = bool(brick.get("visible"))
     effective_visible = _effective_visible(world, visible)
     reasons = []
@@ -829,7 +1048,7 @@ def evaluate_failure_gates(world, objective, learned_rules, process_rules=None):
         if value is None:
             continue
         
-        direction = metric_direction_for_objective(metric, obj_name)
+        direction = metric_direction_for_step(metric, obj_name)
         
         # If we have learned failure mu/sigma, check if we're in the failure zone
         if "mu" in stats and "sigma" in stats:
@@ -858,3 +1077,367 @@ def evaluate_failure_gates(world, objective, learned_rules, process_rules=None):
                 reasons.append(f"{metric} gate")
     
     return GateCheck(ok=not reasons, reasons=reasons)
+
+"""
+Brick alignment telemetry helpers and correction suggestions.
+"""
+
+
+DEFAULT_DEMOS_DIR = Path(__file__).resolve().parent / "demos"
+
+
+def offset_side_label(offset_x):
+    if offset_x is None:
+        return ""
+    if offset_x > 0:
+        return "right"
+    if offset_x < 0:
+        return "left"
+    return "center"
+
+
+def offset_marker_direction(offset_x):
+    side = offset_side_label(offset_x)
+    if side == "left":
+        return "left of the marker"
+    if side == "right":
+        return "right of the marker"
+    return ""
+
+
+def offset_gap_phrase(offset_x):
+    side = offset_side_label(offset_x)
+    if side == "right":
+        return "between the right side of the robot and the aruco marker"
+    if side == "left":
+        return "between the left side of the robot and the aruco marker"
+    return "between the robot and the aruco marker"
+
+
+def offset_cmd_from_offset_x(offset_x):
+    if offset_x is None:
+        return None
+    if offset_x > 0:
+        return "r"
+    if offset_x < 0:
+        return "l"
+    return None
+
+
+def distance_marker_direction(dist, gates):
+    if dist is None:
+        return ""
+    stats = (gates or {}).get("dist") or {}
+    target = stats.get("target")
+    tol = stats.get("tol")
+    min_val = stats.get("min")
+    max_val = stats.get("max")
+    if target is not None and tol is not None:
+        if dist > target + tol:
+            return "in front of the marker"
+        if dist < target - tol:
+            return "behind the marker"
+        return ""
+    if max_val is not None and dist > max_val:
+        return "in front of the marker"
+    if min_val is not None and dist < min_val:
+        return "behind the marker"
+    return ""
+
+
+def worst_offset_direction(metric, measurement, gates):
+    if not measurement:
+        return ""
+    if metric == "xAxis_offset_abs":
+        x_axis = measurement.get("x_axis")
+        if x_axis is None:
+            x_axis = measurement.get("offset_x")
+        return offset_marker_direction(x_axis)
+    if metric == "dist":
+        return distance_marker_direction(measurement.get("dist"), gates)
+    return ""
+
+
+def gap_direction_from_cmd(axis, cmd):
+    if axis == "angle":
+        return "to the right" if cmd == "l" else "to the left"
+    if axis == "offset":
+        return ""
+    if axis == "distance":
+        return "in front" if cmd == "f" else "behind"
+    return ""
+
+
+def distance_correction_cmd(measurement, gates):
+    if not measurement:
+        return None
+    dist = measurement.get("dist")
+    if dist is None:
+        return None
+    stats = (gates or {}).get("dist") or {}
+    target = stats.get("target")
+    tol = stats.get("tol")
+    min_val = stats.get("min")
+    max_val = stats.get("max")
+    if target is not None and tol is not None:
+        if dist > target + tol:
+            return "f"
+        if dist < target - tol:
+            return "b"
+        return None
+    if max_val is not None and dist > max_val:
+        return "f"
+    if min_val is not None and dist < min_val:
+        return "b"
+    return None
+
+
+def distance_gap_value(dist, gates):
+    if dist is None:
+        return None
+    stats = (gates or {}).get("dist") or {}
+    target = stats.get("target")
+    tol = stats.get("tol")
+    min_val = stats.get("min")
+    max_val = stats.get("max")
+    if target is not None and tol is not None:
+        return abs(dist - target)
+    if max_val is not None and dist > max_val:
+        return dist - max_val
+    if min_val is not None and dist < min_val:
+        return min_val - dist
+    return None
+
+
+def offset_correction_cmd(measurement, gates):
+    if not measurement:
+        return None
+    offset = measurement.get("offset_x")
+    if offset is None:
+        return None
+    stats = (gates or {}).get("xAxis_offset_abs") or {}
+    target = stats.get("target")
+    tol = stats.get("tol")
+    min_val = stats.get("min")
+    max_val = stats.get("max")
+    abs_offset = abs(offset)
+    if target is not None and tol is not None:
+        if abs_offset > target + tol:
+            return "r" if offset > 0 else "l"
+        if abs_offset < target - tol:
+            return "l" if offset > 0 else "r"
+        return None
+    if max_val is not None and abs_offset > max_val:
+        return "r" if offset > 0 else "l"
+    if min_val is not None and abs_offset < min_val:
+        return "l" if offset > 0 else "r"
+    return None
+
+
+def offset_gap_value(offset, gates):
+    if offset is None:
+        return None
+    stats = (gates or {}).get("xAxis_offset_abs") or {}
+    target = stats.get("target")
+    tol = stats.get("tol")
+    min_val = stats.get("min")
+    max_val = stats.get("max")
+    abs_offset = abs(offset)
+    if target is not None and tol is not None:
+        return abs(abs_offset - target)
+    if max_val is not None and abs_offset > max_val:
+        return abs_offset - max_val
+    if min_val is not None and abs_offset < min_val:
+        return min_val - abs_offset
+    return None
+
+
+def suggested_minor_correction(brick, success_gates):
+    if not brick or not brick.get("visible"):
+        return None
+    cmd = offset_correction_cmd(brick, success_gates)
+    if cmd:
+        return "turn right" if cmd == "r" else "turn left"
+    cmd = distance_correction_cmd(brick, success_gates)
+    if cmd:
+        return "forward" if cmd == "f" else "backward"
+    return None
+
+
+@dataclass
+class BrickAlignmentState:
+    dist: float
+    offset: float
+    angle: float
+    visible: bool
+
+    @classmethod
+    def from_brick(cls, brick: Optional[dict]) -> "BrickAlignmentState":
+        if not brick:
+            return cls(0.0, 0.0, 0.0, False)
+        dist = brick.get("dist")
+        offset = brick.get("offset_x")
+        angle = brick.get("angle")
+        return cls(
+            dist=float(dist) if dist is not None else 0.0,
+            offset=float(offset) if offset is not None else 0.0,
+            angle=float(angle) if angle is not None else 0.0,
+            visible=bool(brick.get("visible")),
+        )
+
+
+@dataclass
+class BrickAdjustment:
+    mode: str
+    distance_delta: float
+    offset_delta: float
+    angle_delta: float
+    confidence: float = 0.0
+
+
+class AlignmentEnvelope:
+    def __init__(self, max_samples: int = 2048, neighbors: int = 6):
+        self.max_samples = max_samples
+        self.neighbors = max(1, neighbors)
+        self.samples: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]] = []
+
+    def _normalize(self, state: BrickAlignmentState) -> Tuple[float, float, float]:
+        dist = max(0.0, min(500.0, state.dist)) / 500.0
+        offset = max(-200.0, min(200.0, state.offset)) / 200.0
+        angle = max(-180.0, min(180.0, state.angle)) / 180.0
+        return dist, offset, angle
+
+    def record_transition(self, previous: BrickAlignmentState, current: BrickAlignmentState) -> None:
+        if not (previous.visible and current.visible):
+            return
+        delta_dist = current.dist - previous.dist
+        delta_offset = current.offset - previous.offset
+        delta_angle = current.angle - previous.angle
+        if (
+            abs(delta_dist) < 0.3
+            and abs(delta_offset) < 0.3
+            and abs(delta_angle) < 0.25
+        ):
+            return
+        features = self._normalize(previous)
+        delta = (delta_dist, delta_offset, delta_angle)
+        self.samples.append((features, delta))
+        if len(self.samples) > self.max_samples:
+            self.samples.pop(0)
+
+    def _distance(self, a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
+        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+    def predict(
+        self, state: BrickAlignmentState
+    ) -> Optional[Tuple[float, float, float, float]]:
+        if not self.samples or not state.visible:
+            return None
+        query = self._normalize(state)
+        scored = []
+        for features, delta in self.samples:
+            dist = self._distance(query, features)
+            scored.append((dist, delta))
+        scored.sort(key=lambda pair: pair[0])
+        top = scored[: min(self.neighbors, len(scored))]
+        total_weight = 0.0
+        weighted_dist = 0.0
+        weighted_offset = 0.0
+        weighted_angle = 0.0
+        for dist, delta in top:
+            weight = 1.0 / (dist + 1e-3)
+            total_weight += weight
+            weighted_dist += delta[0] * weight
+            weighted_offset += delta[1] * weight
+            weighted_angle += delta[2] * weight
+        if total_weight == 0.0:
+            return None
+        confidence = min(1.0, len(top) / self.neighbors)
+        return (
+            weighted_dist / total_weight,
+            weighted_offset / total_weight,
+            weighted_angle / total_weight,
+            confidence,
+        )
+
+    def learn_from_demos(self, demos_dir: Optional[Path] = None, session: Optional[str] = None) -> None:
+        demos_dir = Path(demos_dir) if demos_dir else DEFAULT_DEMOS_DIR
+        if not demos_dir.exists():
+            return
+        logs = load_demo_logs(demos_dir, session)
+        for _, rows in logs:
+            segments = extract_attempt_segments(rows)
+            for seg in segments:
+                states = seg.get("states") or []
+                sorted_states = sorted(states, key=lambda row: row.get("timestamp", 0.0))
+                for prev, curr in zip(sorted_states, sorted_states[1:]):
+                    prev_state = BrickAlignmentState.from_brick(prev.get("brick"))
+                    curr_state = BrickAlignmentState.from_brick(curr.get("brick"))
+                    self.record_transition(prev_state, curr_state)
+
+
+class BrickAlignmentController:
+    APPROACH_DISTANCE_THRESHOLD = 70.0
+    APPROACH_OFFSET_THRESHOLD = 40.0
+    APPROACH_FALLBACK_DISTANCE_GAIN = 0.3
+    APPROACH_FALLBACK_OFFSET_GAIN = 0.35
+    APPROACH_FALLBACK_ANGLE_GAIN = 0.6
+    MICRO_DISTANCE_GAIN = 0.4
+    MICRO_OFFSET_GAIN = 0.45
+
+    def __init__(self, demos_dir: Optional[Path] = None):
+        self.demos_dir = Path(demos_dir) if demos_dir else DEFAULT_DEMOS_DIR
+        self.envelope = AlignmentEnvelope()
+        self._last_state: Optional[BrickAlignmentState] = None
+        self.envelope.learn_from_demos(self.demos_dir)
+
+    def _choose_mode(self, state: BrickAlignmentState) -> str:
+        if not state.visible:
+            return "unknown"
+        if state.dist > self.APPROACH_DISTANCE_THRESHOLD or abs(state.offset) > self.APPROACH_OFFSET_THRESHOLD:
+            return "approach"
+        return "micro"
+
+    def _register_telemetry(self, state: BrickAlignmentState) -> None:
+        if self._last_state:
+            self.envelope.record_transition(self._last_state, state)
+        self._last_state = state
+
+    def next_adjustment(self, brick: Optional[dict]) -> Optional[BrickAdjustment]:
+        state = BrickAlignmentState.from_brick(brick)
+        if not state.visible:
+            self._register_telemetry(state)
+            return None
+        self._register_telemetry(state)
+        mode = self._choose_mode(state)
+        if mode == "approach":
+            return self._approach_adjustment(state)
+        return self._micro_adjustment(state)
+
+    def _approach_adjustment(self, state: BrickAlignmentState) -> BrickAdjustment:
+        prediction = self.envelope.predict(state)
+        if prediction:
+            dist_delta, offset_delta, angle_delta, confidence = prediction
+        else:
+            dist_delta = -state.dist * self.APPROACH_FALLBACK_DISTANCE_GAIN
+            offset_delta = -state.offset * self.APPROACH_FALLBACK_OFFSET_GAIN
+            angle_delta = -state.angle * self.APPROACH_FALLBACK_ANGLE_GAIN
+            confidence = 0.0
+        if abs(angle_delta) < 1e-3:
+            angle_delta = -state.angle * self.APPROACH_FALLBACK_ANGLE_GAIN
+        return BrickAdjustment(
+            mode="approach",
+            distance_delta=dist_delta,
+            offset_delta=offset_delta,
+            angle_delta=angle_delta,
+            confidence=confidence,
+        )
+
+    def _micro_adjustment(self, state: BrickAlignmentState) -> BrickAdjustment:
+        return BrickAdjustment(
+            mode="micro",
+            distance_delta=-state.dist * self.MICRO_DISTANCE_GAIN,
+            offset_delta=-state.offset * self.MICRO_OFFSET_GAIN,
+            angle_delta=0.0,
+            confidence=1.0,
+        )

@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 DEMO_LOG_FILENAMES = ("a_log.json", "log.json")
-OBJECTIVE_ALIASES = {
+STEP_ALIASES = {
     "FIND": "FIND_BRICK",
     "ALIGN": "ALIGN_BRICK",
     "CARRY": "FIND_WALL2",
@@ -27,13 +27,13 @@ ALWAYS_KEEP_KEYFRAMES = {
 }
 
 
-def normalize_objective_label(label):
+def normalize_step_label(label):
     if label is None:
         return None
     if hasattr(label, "value"):
         label = label.value
     key = str(label).strip().upper()
-    return OBJECTIVE_ALIASES.get(key, key)
+    return STEP_ALIASES.get(key, key)
 
 
 def resolve_session_log(session_path):
@@ -145,15 +145,15 @@ def extract_attempt_segments(log_data):
 
     for entry in log_data:
         if entry.get("type") == "keyframe":
-            if entry.get("objective"):
-                current_obj = normalize_objective_label(entry.get("objective"))
+            if entry.get("step"):
+                current_obj = normalize_step_label(entry.get("step"))
             marker = entry.get("marker")
             ts = entry.get("timestamp")
             if marker == "OBJ_START":
                 obj_span = {
                     "type": "SUCCESS",
-                    "source": "objective",
-                    "objective": current_obj,
+                    "source": "step",
+                    "step": current_obj,
                     "start": ts,
                     "states": [],
                     "events": [],
@@ -163,7 +163,7 @@ def extract_attempt_segments(log_data):
                 active[seg_type] = {
                     "type": seg_type,
                     "source": "attempt",
-                    "objective": current_obj,
+                    "step": current_obj,
                     "start": ts,
                     "states": [],
                     "events": [],
@@ -176,14 +176,14 @@ def extract_attempt_segments(log_data):
                     segments.append(seg)
             if marker in discard_markers:
                 seg_type = discard_markers[marker]
-                target_obj = normalize_objective_label(entry.get("objective") or current_obj)
+                target_obj = normalize_step_label(entry.get("step") or current_obj)
                 to_mark = 2 if seg_type == "SUCCESS" else 1
                 for seg in reversed(segments):
                     if to_mark <= 0:
                         break
                     if seg.get("discarded"):
                         continue
-                    if seg.get("objective") != target_obj:
+                    if seg.get("step") != target_obj:
                         continue
                     if seg.get("type") != seg_type:
                         continue

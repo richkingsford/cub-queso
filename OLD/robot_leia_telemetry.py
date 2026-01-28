@@ -13,7 +13,7 @@ import telemetry_brick
 import telemetry_robot
 import telemetry_wall
 
-class ObjectiveState(Enum):
+class StepState(Enum):
     FIND_WALL = "FIND_WALL"
     FIND = "FIND"
     ALIGN = "ALIGN"
@@ -58,7 +58,7 @@ class WorldModel:
         if WORLD_MODEL_PROCESS_FILE.exists():
             try:
                 with open(WORLD_MODEL_PROCESS_FILE, 'r') as f:
-                    self.process_rules = json.load(f).get("objectives", {})
+                    self.process_rules = json.load(f).get("steps", {})
             except: pass
         self.rules = self.process_rules
             
@@ -93,10 +93,10 @@ class WorldModel:
         self.lift_height = 0.0 # mm (estimated)
         self.camera_height_anchor = None
 
-        # Objective
-        self._objective_state = None
-        self._objective_start_time = 0
-        self.objective_state = ObjectiveState.FIND
+        # Step
+        self._step_state = None
+        self._step_start_time = 0
+        self.step_state = StepState.FIND
         self.attempt_status = "NORMAL" # NORMAL, FAIL, RECOVERY
         self.run_id = "unset"
         self.attempt_id = 0
@@ -135,19 +135,19 @@ class WorldModel:
         self.lift_height_anchor = None # The Vision height at Mast=0mm
 
     @property
-    def objective_state(self):
-        return self._objective_state
+    def step_state(self):
+        return self._step_state
 
-    @objective_state.setter
-    def objective_state(self, value):
-        if self._objective_state == value:
+    @step_state.setter
+    def step_state(self, value):
+        if self._step_state == value:
             return
-        self._objective_state = value
-        self._objective_start_time = time.time()
+        self._step_state = value
+        self._step_start_time = time.time()
         self.last_align_time = None
         self.last_align_dist = None
         self.last_visible_time = None
-        # print(f"[WORLD] Objective changed to {value}, timer reset.", flush=True)
+        # print(f"[WORLD] Step changed to {value}, timer reset.", flush=True)
 
     @property
     def wall_origin(self):
@@ -191,13 +191,13 @@ class WorldModel:
         """Returns True if metrics have been stable and centered."""
         return self.stability_count >= self.stability_threshold
 
-    def check_objective_complete(self):
+    def check_step_complete(self):
         """Checks if success criteria are met using learned rules from demos."""
-        wall_check = telemetry_wall.evaluate_success_gates(self, self.objective_state, self.wall_envelope)
+        wall_check = telemetry_wall.evaluate_success_gates(self, self.step_state, self.wall_envelope)
         if not wall_check.ok:
             return False
-        obj_name = self.objective_state.value
-        if obj_name == ObjectiveState.SCOOP.value:
+        obj_name = self.step_state.value
+        if obj_name == StepState.SCOOP.value:
             return bool(self.brick.get("seated")) and self.verification_stage == "IDLE"
 
         gates = self.learned_rules.get(obj_name, {}).get("gates", {})
@@ -247,38 +247,38 @@ class WorldModel:
 
         return True
 
-    def next_objective(self):
+    def next_step(self):
         """Cycles through the mission: FIND -> ALIGN -> SCOOP -> LIFT -> CARRY -> PLACE -> RETREAT"""
-        if self.objective_state == ObjectiveState.FIND:
-            self.objective_state = ObjectiveState.ALIGN
-        elif self.objective_state == ObjectiveState.ALIGN:
-            self.objective_state = ObjectiveState.SCOOP
-        elif self.objective_state == ObjectiveState.SCOOP:
-            self.objective_state = ObjectiveState.LIFT
-        elif self.objective_state == ObjectiveState.LIFT:
-            self.objective_state = ObjectiveState.CARRY
-        elif self.objective_state == ObjectiveState.CARRY:
-            self.objective_state = ObjectiveState.PLACE
-        elif self.objective_state == ObjectiveState.PLACE:
-            self.objective_state = ObjectiveState.RETREAT
+        if self.step_state == StepState.FIND:
+            self.step_state = StepState.ALIGN
+        elif self.step_state == StepState.ALIGN:
+            self.step_state = StepState.SCOOP
+        elif self.step_state == StepState.SCOOP:
+            self.step_state = StepState.LIFT
+        elif self.step_state == StepState.LIFT:
+            self.step_state = StepState.CARRY
+        elif self.step_state == StepState.CARRY:
+            self.step_state = StepState.PLACE
+        elif self.step_state == StepState.PLACE:
+            self.step_state = StepState.RETREAT
         else:
-            self.objective_state = ObjectiveState.FIND
+            self.step_state = StepState.FIND
             self.brick["seated"] = False # Reset on new cycle
             self.brick["held"] = False
             self.verification_stage = "IDLE"
 
-        return self.objective_state.value
+        return self.step_state.value
 
-    def get_next_objective_label(self):
-        """Returns the string label of the next objective in sequence."""
-        objs = [o.value for o in ObjectiveState]
-        curr_idx = objs.index(self.objective_state.value)
+    def get_next_step_label(self):
+        """Returns the string label of the next step in sequence."""
+        objs = [o.value for o in StepState]
+        curr_idx = objs.index(self.step_state.value)
         next_idx = (curr_idx + 1) % len(objs)
         return objs[next_idx]
 
     def reset_mission(self):
-        """Resets the objective state and all mission-specific flags."""
-        self.objective_state = ObjectiveState.FIND
+        """Resets the step state and all mission-specific flags."""
+        self.step_state = StepState.FIND
         self.brick["seated"] = False
         self.brick["held"] = False
         self.stability_count = 0
@@ -287,7 +287,7 @@ class WorldModel:
         self.verify_turn_deg = 0.0
         self.verify_vision_hits = 0
         self.last_visible_time = None
-        return self.objective_state.value
+        return self.step_state.value
 
     def to_dict(self):
         # Format Brick Data
@@ -357,7 +357,7 @@ class TelemetryLogger:
         data = world_model.to_dict()
         self._write_row(data)
 
-    def log_keyframe(self, marker, objective=None, timestamp=None):
+    def log_keyframe(self, marker, step=None, timestamp=None):
         self.enabled = True # Start recording state once we have a semantic marker
         if timestamp is None:
             timestamp = time.time()
@@ -367,8 +367,8 @@ class TelemetryLogger:
             "timestamp": round(timestamp, 3),
             "marker": marker
         }
-        if objective:
-            data["objective"] = objective
+        if step:
+            data["step"] = step
             
         self._write_row(data)
 
@@ -380,10 +380,10 @@ class TelemetryLogger:
                 json.dump(data, f)
                 self.first_entry = False
 
-    def log_event(self, event: MotionEvent, objective=None):
-        semantic_events = ['FAIL', 'RECOVERY_START', 'OBJECTIVE_SUCCESS', 'JOB_SUCCESS', 'JOB_START']
+    def log_event(self, event: MotionEvent, step=None):
+        semantic_events = ['FAIL', 'RECOVERY_START', 'STEP_SUCCESS', 'JOB_SUCCESS', 'JOB_START']
         if event.action_type in semantic_events:
-            self.log_keyframe(event.action_type, objective, event.timestamp)
+            self.log_keyframe(event.action_type, step, event.timestamp)
             return
 
         if not self.enabled:
@@ -456,8 +456,8 @@ class TelemetryLogger:
         wall = "SET" if data.get('wall_origin') else "UNSET"
         print(f"{'='*40}")
         print(f"TIME: {data.get('timestamp', 0):.2f}s")
-        if 'objective' in data:
-            print(f"OBJECTIVE: {data['objective']}")
+        if 'step' in data:
+            print(f"STEP: {data['step']}")
         print(f"WALL: {wall}")
         print(f"{'-'*40}")
         print(f"POSE:")
@@ -483,7 +483,7 @@ import cv2
 def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders=None, gear=None, show_prompt=True):
     """
     Simplified HUD renderer.
-    - Merged objective/checklist/status into single-line prompt.
+    - Merged step/checklist/status into single-line prompt.
     - Unified CONTROLS section (White).
     - Removed gear logic.
     """
@@ -525,9 +525,9 @@ def draw_telemetry_overlay(frame, wm: WorldModel, extra_messages=None, reminders
         y_cur += line_h
 
     # 3. MERGED STATE & PROMPT
-    state_label = wm.objective_state.value
+    state_label = wm.step_state.value
     status_label = f" ({wm.attempt_status})" if wm.attempt_status != "NORMAL" else ""
-    put_line(f"OBJ: {state_label}{status_label}", GREEN, 0.45, 1) # Objective Header
+    put_line(f"OBJ: {state_label}{status_label}", GREEN, 0.45, 1) # Step Header
     
     if show_prompt:
         # Prompts based on attempt status and recording state

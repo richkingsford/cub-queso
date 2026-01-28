@@ -9,20 +9,25 @@ import statistics
 from pathlib import Path
 
 from helper_robot_control import Robot
-from helper_demo_log_utils import load_demo_logs, normalize_objective_label, prune_log_file
-from helper_gate_utils import load_process_objectives
-from helper_stream_server import StreamServer, format_stream_url
+from helper_demo_log_utils import load_demo_logs, normalize_step_label, prune_log_file
+from helper_gate_utils import load_process_steps
+from helper_streaming import start_stream_server
 from helper_vision_aruco import ArucoBrickVision
 from helper_manual_config import load_manual_training_config
 from telemetry_robot import (
     WorldModel,
     TelemetryLogger,
     MotionEvent,
-    ObjectiveState,
+    StepState,
     draw_telemetry_overlay,
-    objective_sequence,
+    manual_key_action,
+    manual_speed_for_cmd,
+    HOTKEY_SPEED_SCORES,
+    SCORE_POWER_PWM,
+    step_sequence,
 )
-from helper_autobuild import (
+from telemetry_process import compute_stream_gate_summary
+from autobuild import (
     collect_segments,
     CONTROL_DT,
     format_gate_lines,
@@ -82,8 +87,7 @@ sys.stderr = LineStartWriter(sys.stderr, _line_start_tracker)
 # --- CONFIG ---
 _MANUAL_CONFIG = load_manual_training_config()
 LOG_RATE_HZ = float(_MANUAL_CONFIG.get("log_rate_hz", 10))
-GEAR_1_SPEED = float(_MANUAL_CONFIG.get("gear_1_speed", 0.32))
-GEAR_9_SPEED = float(_MANUAL_CONFIG.get("gear_9_speed", 1.0))
+COMMAND_RATE_HZ = float(_MANUAL_CONFIG.get("command_rate_hz", 30))
 HEARTBEAT_TIMEOUT = float(_MANUAL_CONFIG.get("heartbeat_timeout", 0.3))
 STREAM_HOST = _MANUAL_CONFIG.get("stream_host", "127.0.0.1")
 STREAM_PORT = int(_MANUAL_CONFIG.get("stream_port", 5000))
@@ -91,14 +95,7 @@ STREAM_FPS = int(_MANUAL_CONFIG.get("stream_fps", 10))
 STREAM_JPEG_QUALITY = int(_MANUAL_CONFIG.get("stream_jpeg_quality", 85))
 DEMOS_DIR = Path(__file__).resolve().parent / "demos"
 PROCESS_MODEL_FILE = Path(__file__).resolve().parent / "world_model_process.json"
-DEMO_OBJECTIVES = objective_sequence()
-TURN_SPEED_NORMAL = 1.0
-TURN_SPEED_SLOW = 1.0 / 3.0
-TURN_SPEED_FAST = 2.0
-DRIVE_SPEED_NORMAL = TURN_SPEED_NORMAL * 0.25
-DRIVE_SPEED_SLOW = TURN_SPEED_SLOW * 0.25
-DRIVE_SPEED_FAST = TURN_SPEED_FAST * 0.25
-DRIVE_POWER_MULTIPLIER = 2.0
+DEMO_STEPS = step_sequence()
 
 MM_METRICS = {
     "xAxis_offset_abs",
@@ -117,15 +114,15 @@ BRICK_STUDY_STD_LOW_DEG = 2.0
 BRICK_STUDY_STD_HIGH_MM = 8.0
 BRICK_STUDY_STD_HIGH_DEG = 4.0
 
-OBJECTIVE_CODES = {str(idx + 1): obj for idx, obj in enumerate(DEMO_OBJECTIVES)}
+STEP_CODES = {str(idx + 1): obj for idx, obj in enumerate(DEMO_STEPS)}
 
-OBJECTIVE_NAMES = {obj.value.lower(): obj for obj in DEMO_OBJECTIVES}
-OBJECTIVE_NAMES["wall"] = ObjectiveState.FIND_WALL
-OBJECTIVE_NAMES["find"] = ObjectiveState.FIND_BRICK
-OBJECTIVE_NAMES["align"] = ObjectiveState.ALIGN_BRICK
-OBJECTIVE_NAMES["carry"] = ObjectiveState.FIND_WALL2
-OBJECTIVE_NAMES["wall2"] = ObjectiveState.FIND_WALL2
-OBJECTIVE_NAMES["position"] = ObjectiveState.POSITION_BRICK
+STEP_NAMES = {obj.value.lower(): obj for obj in DEMO_STEPS}
+STEP_NAMES["wall"] = StepState.FIND_WALL
+STEP_NAMES["find"] = StepState.FIND_BRICK
+STEP_NAMES["align"] = StepState.ALIGN_BRICK
+STEP_NAMES["carry"] = StepState.FIND_WALL2
+STEP_NAMES["wall2"] = StepState.FIND_WALL2
+STEP_NAMES["position"] = StepState.POSITION_BRICK
 
 ATTEMPT_CODES = {
     "f": "FAIL",
@@ -158,7 +155,7 @@ ATTEMPT_STATUS = {
     "NOMINAL": "NOMINAL",
 }
 
-def objective_label(obj_enum):
+def step_label(obj_enum):
     return obj_enum.value
 
 def log_line(message):
@@ -193,8 +190,8 @@ def close_log(app_state, marker=None):
 def trash_current_session(app_state):
     log_path = app_state.log_path
     app_state.active_attempt = None
-    app_state.objective_open = False
-    app_state.open_objective = None
+    app_state.step_open = False
+    app_state.open_step = None
     app_state.world.recording_active = False
     app_state.world.attempt_status = "NORMAL"
     if app_state.logger is not None and not app_state.logger_closed:
@@ -209,7 +206,7 @@ def trash_current_session(app_state):
             return log_path, False
     return log_path, True
 
-def run_auto_objective(app_state, obj_enum):
+def run_auto_step(app_state, obj_enum):
     logs = load_demo_logs(app_state.demos_dir)
     update_process_model_from_demos(logs, PROCESS_MODEL_FILE)
     refresh_autobuild_config(PROCESS_MODEL_FILE)
@@ -219,35 +216,35 @@ def run_auto_objective(app_state, obj_enum):
 
     segments_by_obj, _ = collect_segments(logs)
     model = load_process_model(PROCESS_MODEL_FILE)
-    process_rules = model.get("objectives") if isinstance(model, dict) else {}
+    process_rules = model.get("steps") if isinstance(model, dict) else {}
     if not isinstance(process_rules, dict):
         process_rules = {}
 
     app_state.world.process_rules = process_rules
     app_state.world.rules = process_rules
 
-    objective_key = normalize_objective_label(obj_enum.value)
-    app_state.world.objective_state = obj_enum
+    step_key = normalize_step_label(obj_enum.value)
+    app_state.world.step_state = obj_enum
 
-    cfg = process_rules.get(objective_key, {}) if process_rules else {}
+    cfg = process_rules.get(step_key, {}) if process_rules else {}
     nominal_only = bool(cfg.get("nominalDemosOnly"))
-    segment, seg_type = select_demo_segment(segments_by_obj, objective_key, nominal_only)
+    segment, seg_type = select_demo_segment(segments_by_obj, step_key, nominal_only)
     if not segment:
-        log_line(f"[AUTO] No demo segment found for {objective_key}.")
+        log_line(f"[AUTO] No demo segment found for {step_key}.")
         return False
 
-    quiet_align = objective_key == "ALIGN_BRICK"
+    quiet_align = step_key == "ALIGN_BRICK"
     if not quiet_align:
         start_desc, success_desc = format_gate_lines(cfg)
-        log_line(f"[AUTO] {objective_key} demo={seg_type} start gates: {start_desc}")
-        log_line(f"[AUTO] {objective_key} demo={seg_type} success gates: {success_desc}")
+        log_line(f"[AUTO] {step_key} demo={seg_type} start gates: {start_desc}")
+        log_line(f"[AUTO] {step_key} demo={seg_type} success gates: {success_desc}")
     if app_state.robot:
         app_state.robot.stop()
-    observer = make_auto_observer(app_state) if quiet_align else None
+    observer = make_auto_observer(app_state)
     confirm_callback = None
     ok, reason = replay_segment(
         segment,
-        objective_key,
+        step_key,
         app_state.robot,
         app_state.vision,
         app_state.world,
@@ -257,18 +254,18 @@ def run_auto_objective(app_state, obj_enum):
         align_silent=quiet_align,
     )
     if ok:
-        log_line(f"[AUTO] {objective_key} success ({reason}).")
+        log_line(f"[AUTO] {step_key} success ({reason}).")
     else:
         if not quiet_align:
-            log_line(f"[AUTO] {objective_key} failed ({reason}).")
+            log_line(f"[AUTO] {step_key} failed ({reason}).")
     return ok
 
 
 def update_brick_analytics(app_state):
-    objectives = app_state.world.process_rules or load_process_objectives()
+    steps = app_state.world.process_rules or load_process_steps()
     analytics = telemetry_brick.compute_brick_analytics(
         app_state.world,
-        objectives,
+        steps,
         app_state.world.learned_rules,
         "ALIGN_BRICK",
         duration_s=CONTROL_DT,
@@ -310,11 +307,12 @@ def update_brick_analytics(app_state):
     app_state.world._align_metrics_trend = metrics_trend
     suggestion = analytics.get("suggestion")
     if suggestion:
-        app_state.objective_suggestions = [("ALIGN_BRICK", suggestion)]
+        app_state.step_suggestions = [("ALIGN_BRICK", suggestion)]
     else:
-        app_state.objective_suggestions = []
+        app_state.step_suggestions = []
 
 def refresh_brick_telemetry(app_state):
+    update_world_from_vision(app_state.world, app_state.vision, log=False)
     update_brick_analytics(app_state)
     update_stream_frame(app_state)
 
@@ -445,20 +443,32 @@ def update_stream_frame(app_state):
         return
     frame = app_state.vision.current_frame.copy()
     with app_state.lock:
-        objective_suggestions = []
-        if app_state.objective_suggestions:
-            objective_suggestions.extend(app_state.objective_suggestions)
+        step_suggestions = []
+        if app_state.step_suggestions:
+            step_suggestions.extend(app_state.step_suggestions)
+        active = bool(app_state.active_attempt or app_state.step_open or app_state.auto_running)
+        gate_summary, analytics = compute_stream_gate_summary(
+            app_state.world,
+            app_state.world.step_state.value,
+            active=active,
+        )
+        if analytics:
+            app_state.brick_highlight_metric = analytics.get("highlight_metric")
         draw_telemetry_overlay(
             frame,
             app_state.world,
             show_prompt=False,
-            gate_status=app_state.gate_status,
-            gate_progress=app_state.gate_progress,
-            objective_suggestions=objective_suggestions,
+            gate_status=None,
+            gate_progress=None,
+            step_suggestions=None,
             highlight_metric=app_state.brick_highlight_metric,
             loop_id=getattr(app_state.world, "loop_id", None),
+            gate_summary=gate_summary if gate_summary is not None else [],
         )
         app_state.current_frame = frame
+    if app_state.stream_state:
+        with app_state.stream_state["lock"]:
+            app_state.stream_state["frame"] = frame
 
 
 def make_auto_observer(app_state):
@@ -496,15 +506,6 @@ def make_auto_confirm(app_state):
         return False
     return _confirm
 
-def build_stream_provider(app_state):
-    def _provider():
-        with app_state.lock:
-            frame = app_state.current_frame
-            if frame is None:
-                return None
-            return frame
-    return _provider
-
 def prompt_for_stage(stage, obj_label):
     if stage == "FAIL":
         return f"Press f to start failed {obj_label} demo."
@@ -514,15 +515,15 @@ def prompt_for_stage(stage, obj_label):
         return f"Press f to start clean {obj_label} demo."
     return None
 
-def resolve_objective_token(token):
+def resolve_step_token(token):
     if not token:
         return None
     key = token.strip().lower()
-    if key in OBJECTIVE_CODES:
-        return OBJECTIVE_CODES[key]
-    if key in OBJECTIVE_NAMES:
-        return OBJECTIVE_NAMES[key]
-    for name, obj in OBJECTIVE_NAMES.items():
+    if key in STEP_CODES:
+        return STEP_CODES[key]
+    if key in STEP_NAMES:
+        return STEP_NAMES[key]
+    for name, obj in STEP_NAMES.items():
         if name.startswith(key):
             return obj
     return None
@@ -549,7 +550,7 @@ def parse_text_command(text):
         auto_mode = True
         tokens = tokens[1:]
     if not tokens:
-        return auto_mode, None, None, "Missing objective/attempt."
+        return auto_mode, None, None, "Missing step/attempt."
     if len(tokens) == 1 and len(tokens[0]) >= 2:
         token = tokens[0]
         if token[0].isdigit():
@@ -571,25 +572,74 @@ def parse_text_command(text):
         attempt_token = tokens[1]
     else:
         return auto_mode, None, None, "Missing attempt."
-    obj_enum = resolve_objective_token(obj_token)
+    obj_enum = resolve_step_token(obj_token)
     attempt = resolve_attempt_token(attempt_token)
     if not obj_enum or not attempt:
-        return auto_mode, obj_enum, attempt, "Unknown objective or attempt."
+        return auto_mode, obj_enum, attempt, "Unknown step or attempt."
     return auto_mode, obj_enum, attempt, None
 
 def print_command_help(app_state=None):
     log_line("[CMD] Enter command mode with ':'")
     codes = ", ".join(
-        f"{idx + 1}={obj.value.lower()}" for idx, obj in enumerate(DEMO_OBJECTIVES)
+        f"{idx + 1}={obj.value.lower()}" for idx, obj in enumerate(DEMO_STEPS)
     )
-    log_line(f"[CMD] Objective codes: {codes}")
+    log_line(f"[CMD] Step codes: {codes}")
     log_line("[CMD] Attempt codes: f=fail, s=success, r=recover, n=nominal")
     log_line("[CMD] Example: :4s (scoop success), :4n (scoop nominal)")
-    log_line("[CMD] Auto mode: press 'p' then an objective code.")
-    log_line("[CMD] Trash current session log: press '1' during recording.")
-    log_line("[CMD] Auto-run: use 'p' + objective code.")
+    log_line("[CMD] Auto mode: press step number to auto-run.")
+    log_line("[CMD] Auto-run: press step number.")
     log_line("[CMD] End attempt: press ':' to finish and return to the command prompt.")
-    log_line("[KEYS] Drive: W/S normal, R/F slow, T/G fast. Turn: A/D normal, Q/E slow, Z/C fast. Lift: U/L.")
+    hotkey_line = format_hotkey_speeds()
+    if hotkey_line:
+        log_line(hotkey_line)
+
+
+def format_hotkey_speeds():
+    categories = {
+        "f": "Drive",
+        "b": "Drive",
+        "l": "Turn",
+        "r": "Turn",
+        "u": "Lift",
+        "d": "Lift",
+    }
+    key_order = {key: idx for idx, key in enumerate([
+        "W", "S", "R", "F", "T", "G",
+        "A", "D", "Q", "E", "Z", "C",
+        "U", "L",
+    ])}
+    grouped = {}
+    for key, info in HOTKEY_SPEED_SCORES.items():
+        cmd = info.get("cmd")
+        score = info.get("score")
+        if cmd not in categories or score is None:
+            continue
+        grouped.setdefault(categories[cmd], {}).setdefault(score, []).append(key.upper())
+    def score_display(score):
+        entry = SCORE_POWER_PWM.get(int(score), {})
+        power = entry.get("power")
+        pwm = entry.get("pwm")
+        if power is None or pwm is None:
+            return f"{int(score)}%"
+        if abs(power) < 0.1:
+            power_str = f"{power:.3f}"
+        else:
+            power_str = f"{power:.2f}"
+        return f"{int(score)}% ({power_str}p/{int(pwm)})"
+
+    parts = []
+    for label in ("Drive", "Turn", "Lift"):
+        score_map = grouped.get(label, {})
+        if not score_map:
+            continue
+        segments = []
+        for score in sorted(score_map.keys()):
+            keys = "/".join(sorted(score_map[score], key=lambda k: key_order.get(k, 999)))
+            segments.append(f"{keys} {score_display(score)}")
+        parts.append(f"{label}: " + ", ".join(segments))
+    if not parts:
+        return ""
+    return "[KEYS] " + ". ".join(parts) + "."
 
 def command_mode_exit_messages(app_state):
     if app_state.active_attempt:
@@ -620,9 +670,9 @@ def handle_command_line(app_state, cmd):
         if cmd_lower in ("help", "h", "?"):
             do_help = True
         elif cmd_lower in ("status", "state"):
-            obj = app_state.world.objective_state
+            obj = app_state.world.step_state
             attempt = app_state.active_attempt or "NONE"
-            messages.append(f"[STATE] Objective={objective_label(obj)} Attempt={attempt}")
+            messages.append(f"[STATE] Step={step_label(obj)} Attempt={attempt}")
         elif cmd_lower in ("end", "stop", "done"):
             ok, msg, obj_enum, attempt_type, should_close = end_attempt(app_state)
             messages.append(msg)
@@ -651,14 +701,14 @@ def handle_command_line(app_state, cmd):
 
 
 def start_attempt(app_state, obj_enum, attempt_type):
-    obj_label = objective_label(obj_enum)
-    if app_state.objective_open and app_state.open_objective != obj_enum:
-        return False, f"[OBJ] Finish {objective_label(app_state.open_objective)} before switching objectives."
+    obj_label = step_label(obj_enum)
+    if app_state.step_open and app_state.open_step != obj_enum:
+        return False, f"[STEP] Finish {step_label(app_state.open_step)} before switching steps."
     ensure_log_open(app_state)
-    if not app_state.objective_open:
-        app_state.objective_open = True
-        app_state.open_objective = obj_enum
-    app_state.world.objective_state = obj_enum
+    if not app_state.step_open:
+        app_state.step_open = True
+        app_state.open_step = obj_enum
+    app_state.world.step_state = obj_enum
     marker = ATTEMPT_MARKERS[attempt_type][0]
     app_state.logger.log_keyframe(marker, obj_label)
     app_state.active_attempt = attempt_type
@@ -666,30 +716,30 @@ def start_attempt(app_state, obj_enum, attempt_type):
     app_state.world.recording_active = True
     return True, f"[OBJ] {obj_label} {attempt_type} started."
 
-def end_attempt(app_state, complete_objective=True):
+def end_attempt(app_state, complete_step=True):
     if not app_state.active_attempt:
         return False, "[OBJ] No active attempt.", None, None, False
-    obj_enum = app_state.world.objective_state
-    obj_label = objective_label(obj_enum)
+    obj_enum = app_state.world.step_state
+    obj_label = step_label(obj_enum)
     attempt_type = app_state.active_attempt
     marker = ATTEMPT_MARKERS[attempt_type][1]
     app_state.logger.log_keyframe(marker, obj_label)
     should_close = False
 
     if attempt_type == "SUCCESS":
-        if complete_objective:
-            app_state.objective_open = False
-            app_state.open_objective = None
-            current_obj = app_state.world.objective_state
+        if complete_step:
+            app_state.step_open = False
+            app_state.open_step = None
+            current_obj = app_state.world.step_state
             app_state.world.reset_mission()
-            app_state.world.objective_state = current_obj
+            app_state.world.step_state = current_obj
         app_state.world.recording_active = False
     else:
         # For FAIL/RECOVER, we keep it open by default to allow retry,
-        # UNLESS we are explicitly closing the objective.
-        if complete_objective:
-            app_state.objective_open = False
-            app_state.open_objective = None
+        # UNLESS we are explicitly closing the step.
+        if complete_step:
+            app_state.step_open = False
+            app_state.open_step = None
         app_state.world.recording_active = False
 
     app_state.world.attempt_status = "NORMAL"
@@ -698,21 +748,21 @@ def end_attempt(app_state, complete_objective=True):
     return True, f"[OBJ] {obj_label} {attempt_type} finished.", obj_enum, attempt_type, False
 
 def handle_attempt_command(app_state, obj_enum, attempt_type):
-    obj_label = objective_label(obj_enum)
+    obj_label = step_label(obj_enum)
     ended_info = None
     ended_close = False
 
     # 1. If ANY recording is active, end it first.
     if app_state.active_attempt:
-        ok, msg, ended_obj, ended_attempt, should_close = end_attempt(app_state, complete_objective=(app_state.active_attempt == attempt_type))
+        ok, msg, ended_obj, ended_attempt, should_close = end_attempt(app_state, complete_step=(app_state.active_attempt == attempt_type))
         if ok:
             ended_info = (ended_obj, ended_attempt)
             ended_close = should_close
             log_line(msg)
 
-    # 2. Check Objective Constraints for the NEW attempt
-    if app_state.objective_open and app_state.open_objective != obj_enum:
-        return False, f"[OBJ] Finish {objective_label(app_state.open_objective)} before switching objectives.", ended_info, ended_close
+    # 2. Check Step Constraints for the NEW attempt
+    if app_state.step_open and app_state.open_step != obj_enum:
+        return False, f"[STEP] Finish {step_label(app_state.open_step)} before switching steps.", ended_info, ended_close
 
     # 3. If they were just toggling OFF the same thing, we are done.
     if ended_info and ended_info[0] == obj_enum and ended_info[1] == attempt_type:
@@ -727,9 +777,8 @@ class AppState:
         self.running = True
         self.active_command = None
         self.active_speed = 0.0
+        self.active_speed_score = None
         self.last_key_time = 0
-        self.turn_speed_multiplier = TURN_SPEED_NORMAL
-        self.drive_speed_multiplier = DRIVE_SPEED_NORMAL
         
         # Job Status
         self.job_success = False
@@ -743,8 +792,8 @@ class AppState:
         
         self.lock = threading.Lock()
         self.current_frame = None
-        self.objective_open = False
-        self.open_objective = None
+        self.step_open = False
+        self.open_step = None
         self.active_attempt = None
         
         # Session Setup
@@ -757,7 +806,7 @@ class AppState:
         open_new_log(self)
         
         # ID Init
-        self.world.objective_state = DEMO_OBJECTIVES[0]
+        self.world.step_state = DEMO_STEPS[0]
 
         self.vision = None
         self.robot = None
@@ -771,9 +820,10 @@ class AppState:
 
         self.gate_status = []
         self.gate_progress = []
-        self.objective_suggestions = []
+        self.step_suggestions = []
         self.brick_highlight_metric = None
         self.brick_frame_buffer = []
+        self.stream_state = {"frame": None, "lock": threading.Lock()}
 
         self.config_mtime = 0
         self.last_config_check = 0
@@ -788,6 +838,8 @@ def getch():
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     return ch
+
+
 
 def keyboard_thread(app_state):
     while app_state.running:
@@ -814,43 +866,59 @@ def keyboard_thread(app_state):
                     app_state.auto_confirm_event.set()
             if auto_confirm_needed:
                 messages.append("[AUTO] Action confirmed.")
-        elif ch_lower == '1':
-            with app_state.lock:
-                app_state.last_key_time = time.time()
-                trashed_path, ok = trash_current_session(app_state)
-            if trashed_path:
-                if ok:
-                    messages.append(f"[SESSION] Trashed log: {trashed_path}")
-                else:
-                    messages.append(f"[SESSION] Failed to delete log: {trashed_path}")
+        elif ch_lower.isdigit():
+            obj_enum = resolve_step_token(ch_lower)
+            if not obj_enum:
+                messages.append("[AUTO] Unknown step code.")
             else:
-                messages.append("[SESSION] No active log to trash.")
+                logs = load_demo_logs(app_state.demos_dir)
+                if not logs:
+                    messages.append("[AUTO] No demo logs found. Record a demo first.")
+                else:
+                    update_process_model_from_demos(logs, PROCESS_MODEL_FILE)
+                    refresh_autobuild_config(PROCESS_MODEL_FILE)
+                    model = load_process_model(PROCESS_MODEL_FILE)
+                    obj_key = normalize_step_label(obj_enum.value)
+                    obj_cfg = (model.get("steps") or {}).get(obj_key, {})
+                    success_gates = obj_cfg.get("success_gates") if isinstance(obj_cfg, dict) else None
+                    if not success_gates:
+                        messages.append(f"[AUTO] No success gates for {obj_key}. Record a success demo first.")
+                    else:
+                        with app_state.lock:
+                            app_state.last_key_time = time.time()
+                            app_state.auto_request = obj_enum
+                            app_state.active_command = None
+                            app_state.active_speed = 0.0
+                            app_state.active_speed_score = None
+                        messages.append(f"[AUTO] Queued {step_label(obj_enum)}.")
         elif auto_prompt:
             with app_state.lock:
                 app_state.last_key_time = time.time()
-                if ch_lower == 'p':
+                if ch_lower == 'm':
                     app_state.auto_prompt = False
                     messages.append("[AUTO] Auto mode cancelled.")
                 else:
-                    obj_enum = resolve_objective_token(ch_lower)
+                    obj_enum = resolve_step_token(ch_lower)
                     if obj_enum:
                         app_state.auto_prompt = False
                         app_state.auto_request = obj_enum
                         app_state.active_command = None
                         app_state.active_speed = 0.0
-                        messages.append(f"[AUTO] Queued {objective_label(obj_enum)}.")
+                        app_state.active_speed_score = None
+                        messages.append(f"[AUTO] Queued {step_label(obj_enum)}.")
                     else:
-                        messages.append("[AUTO] Unknown objective code.")
+                        messages.append("[AUTO] Unknown step code.")
         elif ch_lower == ':':
             with app_state.lock:
                 app_state.last_key_time = time.time()
                 end_msg = None
                 if app_state.active_attempt:
-                    ok, msg, _, _, _ = end_attempt(app_state, complete_objective=True)
+                    ok, msg, _, _, _ = end_attempt(app_state, complete_step=True)
                     end_msg = msg
 
                 app_state.active_command = None
                 app_state.active_speed = 0.0
+                app_state.active_speed_score = None
             if end_msg:
                 log_line(end_msg)
             log_line("[CMD] Enter command (ex: 4s, 4f, help). Use ':' or blank to exit.")
@@ -883,57 +951,23 @@ def keyboard_thread(app_state):
                     except:
                         pass
                     break
-        elif ch_lower == 'p':
+        elif ch_lower == 'm':
             with app_state.lock:
                 app_state.last_key_time = time.time()
                 app_state.auto_prompt = True
                 app_state.active_command = None
                 app_state.active_speed = 0.0
-            messages.append("[AUTO] Select an objective code to run autonomously (press 'p' again to cancel).")
+                app_state.active_speed_score = None
+            messages.append("[AUTO] Select a step code to run autonomously (press 'm' again to cancel).")
         else:
             with app_state.lock:
                 app_state.last_key_time = time.time()
                 # MOVEMENT (Heartbeat triggers)
-                if ch_lower == 'w':
-                    app_state.active_command = 'f'
-                    app_state.drive_speed_multiplier = DRIVE_SPEED_NORMAL
-                elif ch_lower == 's':
-                    app_state.active_command = 'b'
-                    app_state.drive_speed_multiplier = DRIVE_SPEED_NORMAL
-                elif ch_lower == 'r':
-                    app_state.active_command = 'f'
-                    app_state.drive_speed_multiplier = DRIVE_SPEED_SLOW
-                elif ch_lower == 'f':
-                    app_state.active_command = 'b'
-                    app_state.drive_speed_multiplier = DRIVE_SPEED_SLOW
-                elif ch_lower == 't':
-                    app_state.active_command = 'f'
-                    app_state.drive_speed_multiplier = DRIVE_SPEED_FAST
-                elif ch_lower == 'g':
-                    app_state.active_command = 'b'
-                    app_state.drive_speed_multiplier = DRIVE_SPEED_FAST
-                elif ch_lower == 'a':
-                    app_state.active_command = 'l'
-                    app_state.turn_speed_multiplier = TURN_SPEED_NORMAL
-                elif ch_lower == 'd':
-                    app_state.active_command = 'r'
-                    app_state.turn_speed_multiplier = TURN_SPEED_NORMAL
-                elif ch_lower == 'q':
-                    app_state.active_command = 'l'
-                    app_state.turn_speed_multiplier = TURN_SPEED_SLOW
-                elif ch_lower == 'e':
-                    app_state.active_command = 'r'
-                    app_state.turn_speed_multiplier = TURN_SPEED_SLOW
-                elif ch_lower == 'z':
-                    app_state.active_command = 'l'
-                    app_state.turn_speed_multiplier = TURN_SPEED_FAST
-                elif ch_lower == 'c':
-                    app_state.active_command = 'r'
-                    app_state.turn_speed_multiplier = TURN_SPEED_FAST
-                elif ch_lower == 'u':
-                    app_state.active_command = 'u'
-                elif ch_lower == 'l':
-                    app_state.active_command = 'd'
+                action = manual_key_action(ch_lower)
+                if action:
+                    cmd, score = action
+                    app_state.active_command = cmd
+                    app_state.active_speed_score = score
                 elif ch_lower in ('h', '?'):
                     print_command_help(app_state)
 
@@ -948,9 +982,11 @@ def control_loop(app_state):
     # speed_optimize=False so we get the debug markers drawn on the frame
     app_state.vision = ArucoBrickVision(debug=True)
     print_command_help(app_state)
+
+    cmd_t = threading.Thread(target=command_loop, args=(app_state,), daemon=True)
+    cmd_t.start()
     
     dt = 1.0 / LOG_RATE_HZ
-    was_moving = False
     
     while app_state.running:
         loop_start = time.time()
@@ -962,53 +998,22 @@ def control_loop(app_state):
                 app_state.auto_running = True
                 app_state.active_command = None
                 app_state.active_speed = 0.0
+                app_state.active_speed_score = None
 
         if auto_obj:
-            log_line(f"[AUTO] Starting {objective_label(auto_obj)}...")
-            run_auto_objective(app_state, auto_obj)
+            log_line(f"[AUTO] Starting {step_label(auto_obj)}...")
+            run_auto_step(app_state, auto_obj)
             with app_state.lock:
                 app_state.auto_running = False
                 app_state.active_command = None
                 app_state.active_speed = 0.0
+                app_state.active_speed_score = None
             continue
-
-        # 1. Heartbeat Check
-        with app_state.lock:
-            if time.time() - app_state.last_key_time > HEARTBEAT_TIMEOUT:
-                app_state.active_command = None
-                app_state.active_speed = 0.0
             
-            # Fixed speed based on Gear 1
-            gear_speed = GEAR_1_SPEED
-            
-            cmd = app_state.active_command
-            if cmd:
-                speed = gear_speed
-                if cmd in ('l', 'r'):
-                    speed = min(1.0, speed * app_state.turn_speed_multiplier)
-                elif cmd in ('f', 'b'):
-                    speed = min(1.0, speed * app_state.drive_speed_multiplier)
-                elif cmd in ('u', 'd'):
-                    speed = min(1.0, speed * 4.0)
-                app_state.active_speed = speed
-            else:
-                speed = 0.0
-                app_state.active_speed = 0.0
-            
-        send_speed = speed
-        if cmd in ('f', 'b'):
-            send_speed = min(1.0, speed * DRIVE_POWER_MULTIPLIER)
-        if cmd and send_speed > 0:
-            app_state.robot.send_command(cmd, send_speed)
-            was_moving = True
-        elif was_moving:
-            app_state.robot.stop()
-            was_moving = False
-            
-        # 2. Vision
+        # 1. Vision
         found, angle, dist, offset_x, conf, cam_h, brick_above, brick_below = app_state.vision.read()
         
-        # 3. Telemetry Update
+        # 2. Telemetry Update
         study = None
         with app_state.lock:
             app_state.brick_frame_buffer.append({
@@ -1042,7 +1047,10 @@ def control_loop(app_state):
         refresh_brick_telemetry(app_state)
         
         # Track Motion
-        if cmd and send_speed > 0:
+        with app_state.lock:
+            cmd = app_state.active_command
+            speed = app_state.active_speed
+        if cmd and speed > 0:
             atype = "unknown"
             if cmd == 'f': atype = "forward"
             elif cmd == 'b': atype = "backward"
@@ -1051,18 +1059,55 @@ def control_loop(app_state):
             elif cmd == 'u': atype = "mast_up"
             elif cmd == 'd': atype = "mast_down"
             
-            pwr = int(send_speed * 255)
+            pwr = int(speed * 255)
             evt = MotionEvent(atype, pwr, int(dt*1000))
             app_state.world.update_from_motion(evt)
             if app_state.active_attempt:
-                app_state.logger.log_event(evt, app_state.world.objective_state.value)
+                app_state.logger.log_event(evt, app_state.world.step_state.value)
             
-        # 5. Save Log (Image saving removed)
+        # 4. Save Log (Image saving removed)
         with app_state.lock:
             if app_state.active_attempt:
                 app_state.logger.log_state(app_state.world)
         
-        # 6. Rate Limiting
+        # 5. Rate Limiting
+        elapsed = time.time() - loop_start
+        if elapsed < dt:
+            time.sleep(dt - elapsed)
+
+
+def command_loop(app_state):
+    dt = 1.0 / max(COMMAND_RATE_HZ, 1e-3)
+    was_moving = False
+    while app_state.running:
+        loop_start = time.time()
+        with app_state.lock:
+            if time.time() - app_state.last_key_time > HEARTBEAT_TIMEOUT:
+                app_state.active_command = None
+                app_state.active_speed = 0.0
+                app_state.active_speed_score = None
+
+            cmd = app_state.active_command
+            score = app_state.active_speed_score
+
+        if cmd and score is not None:
+            desired_speed = manual_speed_for_cmd(cmd, score)
+            speed, pwm = app_state.robot.normalize_speed(cmd, desired_speed)
+            with app_state.lock:
+                app_state.active_speed = speed
+        else:
+            speed = 0.0
+            pwm = 0
+            with app_state.lock:
+                app_state.active_speed = 0.0
+
+        if cmd and speed > 0:
+            app_state.robot.send_command(cmd, speed)
+            was_moving = True
+        elif was_moving:
+            app_state.robot.stop()
+            was_moving = False
+
         elapsed = time.time() - loop_start
         if elapsed < dt:
             time.sleep(dt - elapsed)
@@ -1088,24 +1133,21 @@ if __name__ == "__main__":
     
     # Web Stream thread (optional)
     if args.stream:
-        stream_server = StreamServer(
-            build_stream_provider(state),
+        stream_server, url = start_stream_server(
+            state.stream_state,
+            title="Robot Leia - Keyboard Training",
+            header="Robot Leia - Keyboard Training",
+            footer="Use the terminal for controls. Keep this window open to see the live feed.",
             host=STREAM_HOST,
             port=STREAM_PORT,
             fps=STREAM_FPS,
             jpeg_quality=STREAM_JPEG_QUALITY,
-            title="Robot Leia - Keyboard Training",
-            header="Robot Leia - Keyboard Training",
-            footer="Use the terminal for controls. Keep this window open to see the live feed.",
-            img_width=800,
-            sharpen=True,
         )
-        stream_server.start()
-        log_line(f"[VISION] Stream started at {format_stream_url(STREAM_HOST, STREAM_PORT)}")
+        log_line(f"[VISION] Stream started at {url}")
     else:
         log_line("[VISION] Stream disabled")
 
-    log_line("[CTRL] W/S drive, A/D turn, q/e slow turns, z/c fast turns, U/L mast, F action, ':' command, p auto, 1 trash log, Q quit")
+    log_line("[CTRL] Drive: W/S 50%, R/F 1%, T/G 100%. Turn: A/D 50%, Q/E 1%, Z/C 100%. Lift: U/L 50%. F action, ':' command, m auto, 1 trash log, Q quit")
     
     try:
         control_loop(state)

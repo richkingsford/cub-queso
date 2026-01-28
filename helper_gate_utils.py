@@ -4,14 +4,14 @@ from pathlib import Path
 PROCESS_MODEL_FILE = Path(__file__).resolve().parent / "world_model_process.json"
 
 
-def load_process_objectives(path=PROCESS_MODEL_FILE):
+def load_process_steps(path=PROCESS_MODEL_FILE):
     if not Path(path).exists():
         return {}
     try:
         data = json.loads(Path(path).read_text())
     except (OSError, json.JSONDecodeError):
         return {}
-    return data.get("objectives") or {}
+    return data.get("steps") or {}
 
 
 def metric_value_from_measurement(measurement, metric):
@@ -97,7 +97,7 @@ def metric_progress(value, stats):
     return None
 
 
-def objective_progress(measurement, success_gates):
+def step_progress(measurement, success_gates):
     if not success_gates:
         return None
     progress_values = []
@@ -126,10 +126,10 @@ def gate_satisfied(measurement, gates):
     return saw_value
 
 
-def satisfied_objectives(measurement, objectives):
+def satisfied_steps(measurement, steps):
     satisfied = []
-    for objective_name, data in objectives.items():
+    for step_name, data in steps.items():
         success_gates = (data or {}).get("success_gates") or {}
         if gate_satisfied(measurement, success_gates):
-            satisfied.append(objective_name)
+            satisfied.append(step_name)
     return satisfied

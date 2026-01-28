@@ -13,12 +13,212 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from telemetry_brick import GateCheck, _objective_name, build_envelope
+# Speed/PWM tuning (single source of truth)
+MIN_PWM = 36
+MAX_PWM = 255
+MIN_TURN_POWER = 0.064
 
-import telemetry_brick
-import telemetry_wall
+ALIGN_MIN_SPEED = 0.2
+ALIGN_MAX_SPEED = 0.28
+ALIGN_MICRO_SPEED = 0.21
+ALIGN_FIXED_SPEED = 0.19
+ALIGN_SPEED_MIN_POWER = 0.288
+ALIGN_SPEED_SLOW = ALIGN_SPEED_MIN_POWER
+ALIGN_SPEED_NORMAL = 0.28
+ALIGN_SPEED_FAST = 0.392
+ALIGN_SPEED_SLOW_MM = 8.0
+ALIGN_SPEED_FAST_MM = 18.0
+ALIGN_MICRO_OFFSET_MM = 10.0
+ALIGN_MICRO_ANGLE_DEG = 5.0
 
-METRICS_BY_OBJECTIVE = {
+SPEED_SCORE_MIN = 1
+SPEED_SCORE_DEFAULT = 50
+SPEED_SCORE_MAX = 100
+SPEED_SCORE_LEVELS = (SPEED_SCORE_MIN, SPEED_SCORE_DEFAULT, SPEED_SCORE_MAX)
+
+ROBOT_MODEL_FILE = Path(__file__).resolve().parent / "world_model_robot.json"
+DEFAULT_SPEED_MODEL = {
+    "hotkey_speed_scores": {
+        "w": {"cmd": "f", "score": 50},
+        "s": {"cmd": "b", "score": 50},
+        "r": {"cmd": "f", "score": 1},
+        "f": {"cmd": "b", "score": 1},
+        "t": {"cmd": "f", "score": 100},
+        "g": {"cmd": "b", "score": 100},
+        "q": {"cmd": "l", "score": 1},
+        "a": {"cmd": "l", "score": 50},
+        "z": {"cmd": "l", "score": 100},
+        "e": {"cmd": "r", "score": 1},
+        "d": {"cmd": "r", "score": 50},
+        "c": {"cmd": "r", "score": 100},
+        "u": {"cmd": "u", "score": 50},
+        "l": {"cmd": "d", "score": 50},
+    },
+    "score_power_pwm": {
+        "1": {"power": 0.064, "pwm": 50},
+        "50": {"power": 0.5, "pwm": 145},
+        "100": {"power": 1.0, "pwm": 255},
+    },
+}
+
+def _brick_module():
+    import telemetry_brick
+    return telemetry_brick
+
+
+def _wall_module():
+    import telemetry_wall
+    return telemetry_wall
+    
+
+def _load_speed_model(path=None):
+    if path is None:
+        path = ROBOT_MODEL_FILE
+    
+    print(f"[SYSTEM] Loading speed model from {path}...")
+    model = DEFAULT_SPEED_MODEL
+    if path.exists():
+        try:
+            text = path.read_text()
+            data = json.loads(text)
+            if isinstance(data, dict):
+                model = data
+                print(f"[SYSTEM] Loaded {len(model.get('combined_movements', {}))} combined movements.")
+            else:
+                print(f"[ERROR] JSON root is not a dict: {type(data)}")
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[ERROR] Failed to load speed model: {e}")
+            model = DEFAULT_SPEED_MODEL
+    else:
+        print(f"[WARNING] Speed model file not found: {path}")
+
+
+def _closest_score(score, levels, default=SPEED_SCORE_DEFAULT):
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        return int(default)
+    closest = None
+    for candidate in levels:
+        if closest is None or abs(candidate - score) < abs(closest - score):
+            closest = candidate
+    return int(closest if closest is not None else default)
+
+
+def normalize_speed_score(score, default=SPEED_SCORE_DEFAULT):
+    levels = SPEED_SCORE_LEVELS or (SPEED_SCORE_MIN, SPEED_SCORE_DEFAULT, SPEED_SCORE_MAX)
+    return _closest_score(score, levels, default=default)
+
+
+def _coerce_score_power_pwm(raw, fallback):
+    if not isinstance(raw, dict):
+        raw = fallback
+    cleaned = {}
+    for key, value in raw.items():
+        try:
+            score_key = int(float(key))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        power = value.get("power")
+        pwm = value.get("pwm")
+        try:
+            power = float(power)
+            pwm = int(pwm)
+        except (TypeError, ValueError):
+            continue
+        cleaned[score_key] = {"power": power, "pwm": pwm}
+    return cleaned
+
+
+def _coerce_hotkeys(raw, fallback, score_levels):
+    if not isinstance(raw, dict):
+        raw = fallback
+    cleaned = {}
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        cmd = value.get("cmd")
+        if not cmd:
+            continue
+        score = _closest_score(value.get("score"), score_levels, default=SPEED_SCORE_DEFAULT)
+        cleaned[str(key)] = {"cmd": str(cmd), "score": score}
+    return cleaned
+
+
+def _load_speed_model(path):
+    model = DEFAULT_SPEED_MODEL
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                model = data
+        except (OSError, json.JSONDecodeError):
+            model = DEFAULT_SPEED_MODEL
+    score_map = _coerce_score_power_pwm(model.get("score_power_pwm"), DEFAULT_SPEED_MODEL["score_power_pwm"])
+    if not score_map:
+        score_map = _coerce_score_power_pwm(DEFAULT_SPEED_MODEL["score_power_pwm"], {})
+    levels = tuple(sorted(score_map.keys()))
+    if not levels:
+        levels = (SPEED_SCORE_MIN, SPEED_SCORE_DEFAULT, SPEED_SCORE_MAX)
+        score_map = _coerce_score_power_pwm(DEFAULT_SPEED_MODEL["score_power_pwm"], {})
+    hotkeys = _coerce_hotkeys(model.get("hotkey_speed_scores"), DEFAULT_SPEED_MODEL["hotkey_speed_scores"], levels)
+    if not hotkeys:
+        hotkeys = _coerce_hotkeys(DEFAULT_SPEED_MODEL["hotkey_speed_scores"], {}, levels)
+    return hotkeys, score_map, levels, model.get("combined_movements", {})
+
+
+HOTKEY_SPEED_SCORES, SCORE_POWER_PWM, SPEED_SCORE_LEVELS, COMBINED_MOVEMENTS = _load_speed_model(ROBOT_MODEL_FILE)
+
+
+def speed_power_pwm_for_cmd(cmd, score):
+    score = normalize_speed_score(score)
+    entry = SCORE_POWER_PWM.get(score, {})
+    power = entry.get("power", 0.0)
+    pwm = entry.get("pwm", 0)
+    return power, pwm, score
+
+
+def quantize_speed(cmd, speed=None, score=None):
+    if score is not None:
+        power, _, score_used = speed_power_pwm_for_cmd(cmd, score)
+        return power, score_used
+    if speed is None:
+        return 0.0, None
+    candidates = []
+    for entry_score, entry in SCORE_POWER_PWM.items():
+        power = entry.get("power")
+        if power is None:
+            continue
+        candidates.append((abs(power - speed), entry_score, power))
+    if not candidates:
+        return 0.0, None
+    candidates.sort(key=lambda item: item[0])
+    _, score_used, power = candidates[0]
+    return power, int(score_used)
+
+
+def manual_speed_for_cmd(cmd, score):
+    power, _, _ = speed_power_pwm_for_cmd(cmd, score)
+    return power
+
+
+def manual_key_action(key):
+    entry = HOTKEY_SPEED_SCORES.get(key)
+    if not entry:
+        return None
+    return entry["cmd"], entry["score"]
+
+
+def _step_name(step):
+    return _brick_module()._step_name(step)
+
+
+def _build_envelope(process_rules, learned_rules, step):
+    return _brick_module().build_envelope(process_rules, learned_rules, step)
+
+METRICS_BY_STEP = {
     "LIFT": ("lift_height",),
     "PLACE": ("lift_height",),
 }
@@ -28,8 +228,8 @@ METRIC_DIRECTIONS = {
 }
 
 
-def resolve_scan_direction(process_rules, objective, fallback="l"):
-    obj_name = _objective_name(objective)
+def resolve_scan_direction(process_rules, step, fallback="l"):
+    obj_name = _step_name(step)
     rules = (process_rules or {}).get(obj_name, {})
     scan_direction = rules.get("scan_direction")
     if scan_direction in ("l", "r"):
@@ -58,15 +258,17 @@ class MotionDelta:
 
 
 
-def evaluate_start_gates(world, objective, learned_rules, process_rules=None):
+def evaluate_start_gates(world, step, learned_rules, process_rules=None):
+    GateCheck = _brick_module().GateCheck
     return GateCheck(ok=True)
 
 
-def evaluate_success_gates(world, objective, learned_rules, process_rules=None):
-    obj_name = _objective_name(objective)
-    if obj_name not in METRICS_BY_OBJECTIVE:
+def evaluate_success_gates(world, step, learned_rules, process_rules=None):
+    GateCheck = _brick_module().GateCheck
+    obj_name = _step_name(step)
+    if obj_name not in METRICS_BY_STEP:
         return GateCheck(ok=True)
-    envelope = build_envelope(process_rules or {}, learned_rules or {}, objective)
+    envelope = _build_envelope(process_rules or {}, learned_rules or {}, step)
     success_metrics = envelope.get("success") or {}
     if not success_metrics:
         return GateCheck(ok=False, reasons=["no lift success envelope"])
@@ -85,11 +287,12 @@ def evaluate_success_gates(world, objective, learned_rules, process_rules=None):
     return GateCheck(ok=True)
 
 
-def evaluate_failure_gates(world, objective, learned_rules, process_rules=None):
-    obj_name = _objective_name(objective)
-    if obj_name not in METRICS_BY_OBJECTIVE:
+def evaluate_failure_gates(world, step, learned_rules, process_rules=None):
+    GateCheck = _brick_module().GateCheck
+    obj_name = _step_name(step)
+    if obj_name not in METRICS_BY_STEP:
         return GateCheck(ok=True)
-    envelope = build_envelope(process_rules or {}, learned_rules or {}, objective)
+    envelope = _build_envelope(process_rules or {}, learned_rules or {}, step)
     failure_metrics = envelope.get("failure") or {}
     stats = failure_metrics.get("lift_height")
     if not stats:
@@ -150,7 +353,7 @@ def update_lift_from_vision(world, cam_h, brick_height, conf):
     vis_lift = cam_h - world.lift_height_anchor + brick_height
     world.lift_height = (0.9 * world.lift_height) + (0.1 * vis_lift)
 
-class ObjectiveState(Enum):
+class StepState(Enum):
     FIND_WALL = "FIND_WALL"
     EXIT_WALL = "EXIT_WALL"
     FIND_BRICK = "FIND_BRICK"
@@ -196,7 +399,6 @@ DEFAULT_MM_PER_SEC_FULL_SPEED = 200.0
 DEFAULT_DEG_PER_SEC_FULL_SPEED = 90.0
 DEFAULT_LIFT_MM_PER_SEC = 23.5
 DEFAULT_MOTION_TICK_MS = 100.0
-MIN_TURN_POWER = 0.064
 MIN_TURN_POWER_PWM = int(math.ceil(MIN_TURN_POWER * 255))
 
 
@@ -251,7 +453,7 @@ def motion_speeds_from_calibration(motion):
 
     return mm_per_sec, deg_per_sec, lift_per_sec
 
-def _load_process_objective_names():
+def _load_process_step_names():
     if not WORLD_MODEL_PROCESS_FILE.exists():
         return []
     try:
@@ -259,26 +461,26 @@ def _load_process_objective_names():
             model = json.load(f)
     except (OSError, json.JSONDecodeError):
         return []
-    objectives = model.get("objectives", {})
-    if isinstance(objectives, dict):
-        return list(objectives.keys())
+    steps = model.get("steps", {})
+    if isinstance(steps, dict):
+        return list(steps.keys())
     return []
 
-def objective_sequence():
-    names = _load_process_objective_names()
+def step_sequence():
+    names = _load_process_step_names()
     if names:
         sequence = []
         seen = set()
         for name in names:
-            normalized = _objective_name(name)
-            if normalized in ObjectiveState.__members__:
-                obj = ObjectiveState[normalized]
+            normalized = _step_name(name)
+            if normalized in StepState.__members__:
+                obj = StepState[normalized]
                 if obj not in seen:
                     sequence.append(obj)
                     seen.add(obj)
         if sequence:
             return sequence
-    return list(ObjectiveState)
+    return list(StepState)
 
 class WorldModel:
     def __init__(self):
@@ -287,7 +489,7 @@ class WorldModel:
         if WORLD_MODEL_PROCESS_FILE.exists():
             try:
                 with open(WORLD_MODEL_PROCESS_FILE, 'r') as f:
-                    self.process_rules = json.load(f).get("objectives", {})
+                    self.process_rules = json.load(f).get("steps", {})
             except: pass
         self.rules = self.process_rules
             
@@ -299,9 +501,10 @@ class WorldModel:
         self.theta = 0.0 # degrees
 
         # Wall Model
-        self.wall_model = telemetry_wall.load_wall_model()
-        self.wall_envelope = telemetry_wall.build_envelope(self.wall_model)
-        self.wall = telemetry_wall.init_wall_state(self.wall_envelope)
+        wall_module = _wall_module()
+        self.wall_model = wall_module.load_wall_model()
+        self.wall_envelope = wall_module.build_envelope(self.wall_model)
+        self.wall = wall_module.init_wall_state(self.wall_envelope)
 
         # Brick Data
         self.brick = {
@@ -322,11 +525,11 @@ class WorldModel:
         self.camera_height_anchor = None
         self.height_mm = None
 
-        # Objective
-        self._objective_state = None
-        self._objective_start_time = 0
+        # Step
+        self._step_state = None
+        self._step_start_time = 0
         self._success_start_time = None
-        self.objective_state = ObjectiveState.FIND_BRICK
+        self.step_state = StepState.FIND_BRICK
         self.attempt_status = "NORMAL" # NORMAL, FAIL, RECOVERY
         self.run_id = "unset"
         self.attempt_id = 0
@@ -369,18 +572,18 @@ class WorldModel:
         self.action_history = collections.deque(maxlen=100)
 
     @property
-    def objective_state(self):
-        return self._objective_state
+    def step_state(self):
+        return self._step_state
 
-    @objective_state.setter
-    def objective_state(self, value):
-        if self._objective_state == value:
+    @step_state.setter
+    def step_state(self, value):
+        if self._step_state == value:
             return
-        self._objective_state = value
-        self._objective_start_time = time.time()
+        self._step_state = value
+        self._step_start_time = time.time()
         self._success_start_time = None
         self.last_visible_time = None
-        # print(f"[WORLD] Objective changed to {value}, timer reset.", flush=True)
+        # print(f"[WORLD] Step changed to {value}, timer reset.", flush=True)
 
     @property
     def wall_origin(self):
@@ -396,8 +599,10 @@ class WorldModel:
         Updates pose based on motion events (Dead Reckoning).
         """
         delta = update_from_motion(self, event)
-        telemetry_brick.update_from_motion(self, event, delta)
-        telemetry_wall.update_from_motion(self, delta, self.wall_envelope)
+        brick_module = _brick_module()
+        wall_module = _wall_module()
+        brick_module.update_from_motion(self, event, delta)
+        wall_module.update_from_motion(self, delta, self.wall_envelope)
         self.action_history.append(event)
 
     def get_recent_net_forward_mm(self, window_s=5.0):
@@ -426,7 +631,9 @@ class WorldModel:
         return net_dist
 
     def update_vision(self, found, dist, angle, conf, offset_x=0, cam_h=0, brick_above=False, brick_below=False):
-        brick_height = telemetry_brick.update_from_vision(
+        brick_module = _brick_module()
+        wall_module = _wall_module()
+        brick_height = brick_module.update_from_vision(
             self,
             found,
             dist,
@@ -438,24 +645,27 @@ class WorldModel:
             brick_below,
         )
         update_lift_from_vision(self, cam_h, brick_height, conf)
-        telemetry_wall.update_from_vision(self, found, dist, angle, conf, self.wall_envelope)
+        wall_module.update_from_vision(self, found, dist, angle, conf, self.wall_envelope)
 
     def get_scoop_corridor_limits(self, dist):
-        return telemetry_brick.get_scoop_corridor_limits(self, dist)
+        brick_module = _brick_module()
+        return brick_module.get_scoop_corridor_limits(self, dist)
 
     def compute_brick_world_xy(self, dist, angle_deg):
-        return telemetry_brick.compute_brick_world_xy(self, dist, angle_deg)
+        brick_module = _brick_module()
+        return brick_module.compute_brick_world_xy(self, dist, angle_deg)
 
     def is_aligned(self):
         """Returns True if metrics have been stable and centered."""
         return self.stability_count >= self.stability_threshold
 
-    def check_objective_complete(self):
+    def check_step_complete(self):
         """Checks if success criteria are met using learned rules from demos."""
-        wall_check = telemetry_wall.evaluate_success_gates(self, self.objective_state, self.wall_envelope)
+        wall_module = _wall_module()
+        wall_check = wall_module.evaluate_success_gates(self, self.step_state, self.wall_envelope)
         if not wall_check.ok:
             return False
-        obj_name = self.objective_state.value
+        obj_name = self.step_state.value
 
         gates = self.learned_rules.get(obj_name, {}).get("gates", {})
         success_metrics = gates.get("success", {}).get("metrics", {})
@@ -504,48 +714,48 @@ class WorldModel:
 
         return True
 
-    def next_objective(self):
-        """Cycles through objectives in the process order."""
-        sequence = objective_sequence()
+    def next_step(self):
+        """Cycles through steps in the process order."""
+        sequence = step_sequence()
         if not sequence:
-            sequence = list(ObjectiveState)
+            sequence = list(StepState)
         try:
-            curr_idx = sequence.index(self.objective_state)
+            curr_idx = sequence.index(self.step_state)
         except ValueError:
-            sequence = list(ObjectiveState)
-            curr_idx = sequence.index(self.objective_state)
+            sequence = list(StepState)
+            curr_idx = sequence.index(self.step_state)
         next_idx = (curr_idx + 1) % len(sequence)
-        self.objective_state = sequence[next_idx]
+        self.step_state = sequence[next_idx]
         if next_idx == 0:
             self.brick["held"] = False
-        return self.objective_state.value
+        return self.step_state.value
 
-    def get_next_objective_label(self):
-        """Returns the string label of the next objective in sequence."""
-        sequence = objective_sequence()
+    def get_next_step_label(self):
+        """Returns the string label of the next step in sequence."""
+        sequence = step_sequence()
         if not sequence:
-            sequence = list(ObjectiveState)
+            sequence = list(StepState)
         labels = [o.value for o in sequence]
         try:
-            curr_idx = labels.index(self.objective_state.value)
+            curr_idx = labels.index(self.step_state.value)
         except ValueError:
-            labels = [o.value for o in ObjectiveState]
-            curr_idx = labels.index(self.objective_state.value)
+            labels = [o.value for o in StepState]
+            curr_idx = labels.index(self.step_state.value)
         next_idx = (curr_idx + 1) % len(labels)
         return labels[next_idx]
 
     def reset_mission(self):
-        """Resets the objective state and all mission-specific flags."""
-        self.objective_state = ObjectiveState.FIND_BRICK
+        """Resets the step state and all mission-specific flags."""
+        self.step_state = StepState.FIND_BRICK
         self.brick["held"] = False
         self.stability_count = 0
         self.last_visible_time = None
-        return self.objective_state.value
+        return self.step_state.value
 
     def to_dict(self):
         # Format Brick Data
         brick_fmt = self.brick.copy()
-        if self.objective_state == ObjectiveState.FIND_BRICK:
+        if self.step_state == StepState.FIND_BRICK:
             brick_fmt['dist'] = None
             brick_fmt['angle'] = None
             brick_fmt['offset_x'] = None
@@ -620,7 +830,7 @@ class TelemetryLogger:
         data = world_model.to_dict()
         self._write_row(data)
 
-    def log_keyframe(self, marker, objective=None, timestamp=None):
+    def log_keyframe(self, marker, step=None, timestamp=None):
         self.enabled = True # Start recording state once we have a semantic marker
         if timestamp is None:
             timestamp = time.time()
@@ -630,8 +840,8 @@ class TelemetryLogger:
             "timestamp": round(timestamp, 3),
             "marker": marker
         }
-        if objective:
-            data["objective"] = objective
+        if step:
+            data["step"] = step
             
         self._write_row(data)
 
@@ -643,10 +853,10 @@ class TelemetryLogger:
                 json.dump(data, f)
                 self.first_entry = False
 
-    def log_event(self, event: MotionEvent, objective=None):
-        semantic_events = ['FAIL', 'RECOVERY_START', 'OBJECTIVE_SUCCESS', 'JOB_SUCCESS', 'JOB_START']
+    def log_event(self, event: MotionEvent, step=None):
+        semantic_events = ['FAIL', 'RECOVERY_START', 'STEP_SUCCESS', 'JOB_SUCCESS', 'JOB_START']
         if event.action_type in semantic_events:
-            self.log_keyframe(event.action_type, objective, event.timestamp)
+            self.log_keyframe(event.action_type, step, event.timestamp)
             return
 
         if not self.enabled:
@@ -719,8 +929,8 @@ class TelemetryLogger:
         wall = "SET" if data.get('wall_origin') else "UNSET"
         print(f"{'='*40}")
         print(f"TIME: {data.get('timestamp', 0):.2f}s")
-        if 'objective' in data:
-            print(f"OBJECTIVE: {data['objective']}")
+        if 'step' in data:
+            print(f"STEP: {data['step']}")
         print(f"WALL: {wall}")
         print(f"{'-'*40}")
         print(f"POSE:")
@@ -752,13 +962,15 @@ def draw_telemetry_overlay(
     show_prompt=True,
     gate_status=None,
     gate_progress=None,
-    objective_suggestions=None,
+    step_suggestions=None,
     highlight_metric=None,
     loop_id=None,
+    header_lines=None,
+    gate_summary=None,
 ):
     """
     Simplified HUD renderer.
-    - Merged objective/checklist/status into single-line prompt.
+    - Merged step/checklist/status into single-line prompt.
     - Controls are logged in terminal, not shown on the overlay.
     - Optional gear label is handled separately.
     """
@@ -803,6 +1015,12 @@ def draw_telemetry_overlay(
     # 3. MERGED STATE & PROMPT - REMOVED per user request
     y_cur += 5
 
+    # 3b. Header lines (Step/Success/Suggested act)
+    if header_lines:
+        for line in header_lines:
+            put_line(str(line), WHITE, 0.45, 1)
+        y_cur += 5
+
     # 4. Reminders
     if reminders:
         put_line("--- REMINDERS ---", WHITE, 0.35, 1)
@@ -813,46 +1031,58 @@ def draw_telemetry_overlay(
             put_line(str(reminders), WHITE, 0.35, 1)
         y_cur += 5
 
-    # 4b. Success Gates
-    if gate_progress is not None:
+    # 4b. Success Gates (summary or current step only)
+    if gate_summary is not None:
+        put_line("--- SUCCESS GATES ---", WHITE, 0.35, 1)
+        if gate_summary:
+            for line in gate_summary:
+                if isinstance(line, tuple):
+                    text, color = line
+                    put_line(str(text), color, 0.35, 1)
+                else:
+                    put_line(str(line), WHITE, 0.35, 1)
+        else:
+            put_line("(idle)", WHITE, 0.35, 1)
+        y_cur += 5
+    elif gate_progress is not None:
         if loop_id is not None:
             put_line(f"LOOP ID: {loop_id}", WHITE, 0.35, 1)
             y_cur += 3
         put_line("--- SUCCESS GATES ---", WHITE, 0.35, 1)
-        if gate_progress:
+        current_obj = wm.step_state.value if wm.step_state else None
+        match = None
+        if gate_progress and current_obj:
             for name, pct in gate_progress:
-                pct_display = int(max(0.0, min(100.0, pct)))
-                put_line(f"{name}: {pct_display}%", WHITE, 0.35, 1)
-                if objective_suggestions:
-                    for obj_name, suggestion in objective_suggestions:
-                        if obj_name == name:
-                            sug_color = WHITE
-                            trend_map = getattr(wm, "_align_metrics_trend", {})
-                            if suggestion.startswith(("L ", "R ")):
-                                trend_val = trend_map.get("x_axis")
-                            elif suggestion.startswith(("F ", "B ")):
-                                trend_val = trend_map.get("dist")
-                            else:
-                                trend_val = 0
-                            if trend_val == 1:
-                                sug_color = GREEN
-                            elif trend_val == -1:
-                                sug_color = RED
-                            put_line(f"  {suggestion}", sug_color, 0.35, 1)
-        else:
-            put_line("(none)", WHITE, 0.35, 1)
-        y_cur += 5
-    elif gate_status is not None:
-        put_line("--- SUCCESS GATES ---", WHITE, 0.35, 1)
-        if gate_status:
-            for name in gate_status:
-                put_line(str(name), WHITE, 0.35, 1)
+                if str(name) == str(current_obj):
+                    match = (name, pct)
+                    break
+        if match:
+            name, pct = match
+            pct_display = int(max(0.0, min(100.0, pct)))
+            put_line(f"{name}: {pct_display}%", WHITE, 0.35, 1)
+            if step_suggestions:
+                for obj_name, suggestion in step_suggestions:
+                    if str(obj_name) == str(name):
+                        sug_color = WHITE
+                        trend_map = getattr(wm, "_align_metrics_trend", {})
+                        if suggestion.startswith(("L ", "R ")):
+                            trend_val = trend_map.get("x_axis")
+                        elif suggestion.startswith(("F ", "B ")):
+                            trend_val = trend_map.get("dist")
+                        else:
+                            trend_val = 0
+                        if trend_val == 1:
+                            sug_color = GREEN
+                        elif trend_val == -1:
+                            sug_color = RED
+                        put_line(f"  {suggestion}", sug_color, 0.35, 1)
         else:
             put_line("(none)", WHITE, 0.35, 1)
         y_cur += 5
 
     # 5. Position Info
     put_line("--- BRICK[0] TELEMETRY ---", WHITE, 0.35, 1)
+    visible_now = bool(wm.brick.get("visible"))
     x_axis = wm.brick.get("x_axis", wm.brick.get("offset_x", 0.0))
     obj_rules = (wm.process_rules or {}).get("ALIGN_BRICK", {}) if wm.process_rules else {}
     success_gates = (obj_rules or {}).get("success_gates") or {}
@@ -889,17 +1119,26 @@ def draw_telemetry_overlay(
     x_prefix = "* " if highlight_metric == "xAxis_offset_abs" else ""
     angle_prefix = "* " if highlight_metric == "angle_abs" else ""
     dist_prefix = "* " if highlight_metric == "dist" else ""
-    put_line(f"{x_prefix}X-AXIS: {x_axis:.1f} mm", WHITE, 0.38, 1)
+    if visible_now:
+        put_line(f"{x_prefix}X-AXIS: {x_axis:.1f} mm", WHITE, 0.38, 1)
+    else:
+        put_line(f"{x_prefix}X-AXIS: -", WHITE, 0.38, 1)
     x_gate_line = _gate_line(x_gate, lambda v: f"{v:.1f}", "TARGET", x_axis, signed=True)
     if x_gate_line:
         x_trend = getattr(wm, "_align_metrics_trend", {}).get("x_axis")
         x_gate_color = GREEN if x_trend == 1 else RED if x_trend == -1 else WHITE
         put_line(x_gate_line, x_gate_color, 0.35, 1)
-    put_line(f"{angle_prefix}ANGLE:  {wm.brick['angle']:.1f} deg", WHITE, 0.38, 1)
+    if visible_now:
+        put_line(f"{angle_prefix}ANGLE:  {wm.brick['angle']:.1f} deg", WHITE, 0.38, 1)
+    else:
+        put_line(f"{angle_prefix}ANGLE:  -", WHITE, 0.38, 1)
     angle_gate_line = _gate_line(angle_gate, lambda v: f"{v:.1f}", "TARGET", wm.brick["angle"])
     if angle_gate_line:
         put_line(angle_gate_line, WHITE, 0.35, 1)
-    put_line(f"{dist_prefix}DIST:   {wm.brick['dist']:.0f} mm", WHITE, 0.38, 1)
+    if visible_now:
+        put_line(f"{dist_prefix}DIST:   {wm.brick['dist']:.0f} mm", WHITE, 0.38, 1)
+    else:
+        put_line(f"{dist_prefix}DIST:   -", WHITE, 0.38, 1)
     dist_gate_line = _gate_line(dist_gate, lambda v: f"{v:.1f}", "TARGET", wm.brick["dist"])
     if dist_gate_line:
         dist_trend = getattr(wm, "_align_metrics_trend", {}).get("dist")
@@ -908,9 +1147,14 @@ def draw_telemetry_overlay(
     brick_conf = wm.brick.get("confidence")
     if brick_conf is None:
         brick_conf = 0.0
-    put_line(f"CONF:   {brick_conf:.0f}%", WHITE, 0.38, 1)
-    above_txt = "YES" if wm.brick.get("brickAbove") else "NO"
-    below_txt = "YES" if wm.brick.get("brickBelow") else "NO"
+    if visible_now:
+        put_line(f"CONF:   {brick_conf:.0f}%", WHITE, 0.38, 1)
+        above_txt = "YES" if wm.brick.get("brickAbove") else "NO"
+        below_txt = "YES" if wm.brick.get("brickBelow") else "NO"
+    else:
+        put_line("CONF:   -", WHITE, 0.38, 1)
+        above_txt = "-"
+        below_txt = "-"
     put_line(f"BRICK ABOVE: {above_txt}", WHITE, 0.38, 1)
     put_line(f"BRICK_BELOW: {below_txt}", WHITE, 0.38, 1)
     
@@ -920,6 +1164,14 @@ def draw_telemetry_overlay(
     put_line(f"Y:      {wm.y:.1f} mm", (200, 200, 255), 0.38, 1)
     put_line(f"THETA:  {wm.theta:.1f} deg", (200, 200, 255), 0.38, 1)
     put_line(f"LIFT:   {wm.lift_height:.0f} mm", (200, 200, 255), 0.38, 1)
+    cam_times = getattr(wm, "_camera_frame_times", [])
+    if cam_times:
+        cam_str = " ".join(f"{sec % 60:02d}:{ms:03d}" for sec, ms in cam_times[-3:])
+        unique_frames = getattr(wm, "_camera_unique_frames", None)
+        if isinstance(unique_frames, int):
+            cam_str = f"{cam_str} u={unique_frames}/3"
+        cam_color = RED if getattr(wm, "_camera_dupe_ms", False) else WHITE
+        put_line(f"CAMERA: {cam_str}", cam_color, 0.38, 1)
 
     # 6. Vision Info
     y_cur += 12

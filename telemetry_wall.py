@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from telemetry_brick import GateCheck, OBJECTIVE_ALIASES, _objective_name
+from telemetry_brick import GateCheck, STEP_ALIASES, _step_name
 
 WALL_MODEL_FILE = Path(__file__).parent / "world_model_walls.json"
 WALL_MODEL_FALLBACK_FILE = Path(__file__).parent / "world_model_wall.json"
@@ -19,7 +19,7 @@ class WallEnvelope:
     max_angle_drift_deg: float
     place_offset_mm: float
     allow_auto_origin: bool
-    lock_objective: str
+    lock_step: str
     origin: Optional[dict]
 
 
@@ -31,7 +31,7 @@ def load_wall_model(path=WALL_MODEL_FILE, fallback_path=WALL_MODEL_FALLBACK_FILE
             "angle_deg": 0.0,
             "immutable": True,
             "allow_auto_origin": True,
-            "lock_objective": "FIND_WALL",
+            "lock_step": "FIND_WALL",
             "min_confidence": 80.0,
             "max_origin_drift_mm": 75.0,
             "max_angle_drift_deg": 10.0,
@@ -58,10 +58,10 @@ def load_wall_model(path=WALL_MODEL_FILE, fallback_path=WALL_MODEL_FALLBACK_FILE
     return data
 
 
-def load_wall_objective_rules(path=WALL_MODEL_FILE, fallback_path=WALL_MODEL_FALLBACK_FILE):
+def load_wall_step_rules(path=WALL_MODEL_FILE, fallback_path=WALL_MODEL_FALLBACK_FILE):
     model = load_wall_model(path, fallback_path)
-    objectives = model.get("objectives")
-    return objectives if isinstance(objectives, dict) else {}
+    steps = model.get("steps")
+    return steps if isinstance(steps, dict) else {}
 
 
 def build_envelope(model):
@@ -80,7 +80,7 @@ def build_envelope(model):
         max_angle_drift_deg=float(wall.get("max_angle_drift_deg", 10.0)),
         place_offset_mm=float(wall.get("place_offset_mm", 25.0)),
         allow_auto_origin=bool(wall.get("allow_auto_origin", True)),
-        lock_objective=str(wall.get("lock_objective", "FIND_WALL")),
+        lock_step=str(wall.get("lock_step", "FIND_WALL")),
         origin=origin,
     )
 
@@ -165,8 +165,8 @@ def update_from_vision(world, found, dist, angle_deg, conf, envelope: WallEnvelo
     candidate = compute_wall_origin(world, dist, angle_deg, envelope)
 
     if wall["origin"] is None:
-        obj_name = _objective_name(world.objective_state)
-        if envelope.allow_auto_origin or obj_name == envelope.lock_objective:
+        obj_name = _step_name(world.step_state)
+        if envelope.allow_auto_origin or obj_name == envelope.lock_step:
             wall["origin"] = candidate
             wall["angle_deg"] = envelope.angle_deg
             wall["valid"] = True
@@ -198,8 +198,8 @@ def update_from_motion(world, delta, envelope: WallEnvelope):
     _update_wall_estimate(world, envelope)
 
 
-def evaluate_start_gates(world, objective, envelope: WallEnvelope):
-    obj_name = _objective_name(objective)
+def evaluate_start_gates(world, step, envelope: WallEnvelope):
+    obj_name = _step_name(step)
     if not _needs_wall_origin(obj_name):
         return GateCheck(ok=True)
     wall = world.wall
@@ -211,8 +211,8 @@ def evaluate_start_gates(world, objective, envelope: WallEnvelope):
     return GateCheck(ok=not reasons, reasons=reasons)
 
 
-def evaluate_failure_gates(world, objective, envelope: WallEnvelope):
-    obj_name = _objective_name(objective)
+def evaluate_failure_gates(world, step, envelope: WallEnvelope):
+    obj_name = _step_name(step)
     if not _needs_wall_origin(obj_name):
         return GateCheck(ok=True)
     wall = world.wall
@@ -223,8 +223,8 @@ def evaluate_failure_gates(world, objective, envelope: WallEnvelope):
     return GateCheck(ok=True)
 
 
-def evaluate_success_gates(world, objective, envelope: WallEnvelope):
-    obj_name = _objective_name(objective)
+def evaluate_success_gates(world, step, envelope: WallEnvelope):
+    obj_name = _step_name(step)
     if not _needs_wall_origin(obj_name):
         return GateCheck(ok=True)
     wall = world.wall

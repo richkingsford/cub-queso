@@ -40,8 +40,8 @@ def main():
             
         time.sleep(1)
         
-        # 2. Cycle Objective
-        print("Test: Cycling Objective (BTN_X)")
+        # 2. Cycle Step
+        print("Test: Cycling Step (BTN_X)")
         send_cmd(s, "BTN_X")
         time.sleep(1)
         
